@@ -1,0 +1,8 @@
+torch>=2.0.1
+torchvision
+transformers
+numpy
+tqdm
+pyyaml
+pillow
+clip @ git+https://github.com/openai/CLIP.git

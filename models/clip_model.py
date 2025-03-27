@@ -1,14 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import CLIPTokenizer
+
+MAXSEQLENGTH = 77
+
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
 def create_text_encoder():
     """Factory for text encoder with predefined architecture"""
     return TextEncoder(
-        vocab_size=50000, 
+        vocab_size=49408, 
         embed_dim=512, 
-        max_seq_len=128,
-        num_layers=6
+        max_seq_len=MAXSEQLENGTH,
+        num_layers=12
     )
 
 def create_image_encoder():
@@ -43,6 +48,9 @@ class TextEncoder(nn.Module):
         x = x.mean(dim=1)  # Average pooling over sequence
         x = self.final_ln(x)
         return self.projection(x)
+    
+# Text input: (1, seq_len) (max seq_len is 77)
+# Output shape: (1, 512)
 
 class ImageEncoder(nn.Module):
     def __init__(self, embed_dim, input_channels=3):
@@ -68,6 +76,9 @@ class ImageEncoder(nn.Module):
 
     def forward(self, image):
         return self.cnn(image)
+
+# Image input shape: (1, 3, Height, Width) (Height and Width can be any size greater than 16)
+# Output shape: (1, 512)
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -103,18 +114,20 @@ class CLIPWrapper(nn.Module):
         text_features = self.text_encoder(text)
         image_features = self.image_encoder(images)
         return text_features, image_features, self.logit_scale.exp()
-    
-#Usage
-# Initialize separate components
-# # Load models
-# text_encoder = create_text_encoder().load_state_dict(torch.load("text_encoder.pth"))
-# prior = create_prior().load_state_dict(torch.load("prior.pth"))
 
-# # Process text
-# text = "A red balloon floating in the sky"
-# tokenized = tokenizer(text).to(device)
+def CLIPTokenize(inputText):
+    tokens = tokenizer(inputText, padding="max_length", truncation=True, max_length=MAXSEQLENGTH, return_tensors="pt")
 
-# # Generate embeddings
-# with torch.no_grad():
-#     text_features = text_encoder(tokenized)
-#     image_features_pred = prior(text_features)
+    # tokens shape = (numSequences, 77)
+    return tokens['input_ids']
+
+def VecToText(vector):
+    return tokenizer.convert_ids_to_tokens(vector)
+
+
+# text_encoder = create_text_encoder()
+
+# input_text = "Input string"
+# tokens = CLIPTokenize(input_text)
+# encodings = text_encoder(tokens)
+# print(encodings.size())

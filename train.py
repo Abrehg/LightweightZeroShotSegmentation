@@ -1,184 +1,196 @@
-# train.py
-import os
-import argparse
+# test_pipeline.py
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils
+import os
 from torch.utils.data import DataLoader
-import torch.utils.data
-import torch.utils.data.distributed
-from models.clip_model import create_text_encoder, create_image_encoder
-from models.prior_model import create_prior
-import torchvision.transforms as T
-from data.dataset import build_datasets
+from data.custom400m import get_laion_streaming_dataset, adaptive_collate
+import argparse
 
-# Add these transforms and tokenizer
-def get_transforms():
-    return T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize((0.48145466, 0.4578275, 0.40821073), 
-                    (0.26862954, 0.26130258, 0.27577711))
-    ])
+# ======== Hyperparameters & Setup ========
+HYPERPARAMS = {
+    "CLIP_EPOCHS": 1,#10,
+    "PRIOR_EPOCHS": 1,#10,
+    "CLIP_LR": 0.0001,
+    "PRIOR_LR": 0.0001,
+    "BATCH_SIZE": 64,
+    "CHECKPOINT_DIR": "weights"  # Will be created automatically
+}
 
-def clip_loss(logits_per_text, logits_per_image, temperature):
-    labels = torch.arange(logits_per_text.size(0), device=logits_per_text.device)
-    loss_text = nn.CrossEntropyLoss()(logits_per_text, labels)
-    loss_image = nn.CrossEntropyLoss()(logits_per_image, labels)
-    return (loss_text + loss_image) / 2
+def clip_contrastive_loss(logits_per_image, logits_per_text):
+    # Contrastive loss from CLIP paper
+    labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
+    loss_img = torch.nn.functional.cross_entropy(logits_per_image, labels)
+    loss_txt = torch.nn.functional.cross_entropy(logits_per_text, labels)
+    return (loss_img + loss_txt) / 2
 
-def train_clip(
-    text_encoder,
-    image_encoder,
-    dataloader,
-    num_epochs=10,
-    lr=1e-4,
-    temperature=0.07,
-    device="cuda"
-):
-    text_encoder = text_encoder.to(device)
-    image_encoder = image_encoder.to(device)
+# ======== CLIP Training ========
+def train_clip(hf_token):
+    print("\n=== Training CLIP ===")
+    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper
     
-    optimizer = optim.Adam(
-        list(text_encoder.parameters()) + list(image_encoder.parameters()),
-        lr=lr
+    # Initialize components
+    text_encoder = create_text_encoder()
+    image_encoder = create_image_encoder()
+    clip_model = CLIPWrapper(text_encoder, image_encoder)
+    optimizer = torch.optim.Adam(clip_model.parameters(), lr=HYPERPARAMS["CLIP_LR"])
+    
+    # Streaming dataset
+    train_dataset = get_laion_streaming_dataset(
+        HUGGINGFACE = hf_token, 
+        text_processor = CLIPTokenize
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=HYPERPARAMS["BATCH_SIZE"],
+        collate_fn=adaptive_collate,
+        pin_memory=True
     )
     
-    for epoch in range(num_epochs):
-        for images, texts in dataloader:
-            images = images.to(device)
-            texts = texts.to(device)
+    # Training loop
+    for epoch in range(HYPERPARAMS["CLIP_EPOCHS"]):
+        clip_model.train()
+        total_loss = 0.0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
+            
+            images, texts = batch
+            optimizer.zero_grad()
             
             # Forward pass
-            text_features = text_encoder(texts)
-            image_features = image_encoder(images)
+            text_features, image_features, logit_scale = clip_model(texts, images)
             
-            # Normalize features
-            text_features = text_features / text_features.norm(dim=1, keepdim=True)
-            image_features = image_features / image_features.norm(dim=1, keepdim=True)
-            
-            # Compute similarity matrix
-            logit_scale = torch.tensor(1/temperature).exp().to(device)
+            # Contrastive loss
+            logits_per_image = logit_scale * image_features @ text_features.t()
             logits_per_text = logit_scale * text_features @ image_features.t()
-            logits_per_image = logits_per_text.t()
+            loss = clip_contrastive_loss(logits_per_image, logits_per_text)
             
-            # Compute loss
-            loss = clip_loss(logits_per_text, logits_per_image, temperature)
-            
-            # Backward pass
-            optimizer.zero_grad()
+            # Backprop
             loss.backward()
             optimizer.step()
             
-        print(f"Epoch {epoch+1}/{num_epochs} Loss: {loss.item():.4f}")
+            total_loss += loss.item()
+            
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch+1}/{HYPERPARAMS['CLIP_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+        
+        # Save CLIP checkpoint
+        text_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{epoch+1}.pt")
+        image_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{epoch+1}.pt")
+        torch.save(text_encoder.state_dict(), text_ckpt)
+        torch.save(image_encoder.state_dict(), image_ckpt)
+        print(f"Saved CLIP checkpoints:\n- {text_ckpt}\n- {image_ckpt}")
+    
+    print("CLIP training completed.\n")
 
-def train_prior(
-    prior,
-    text_encoder,
-    image_encoder,
-    dataloader,
-    num_epochs=5,
-    lr=1e-4,
-    device="cuda"
-):
-    prior = prior.to(device)
-    text_encoder = text_encoder.to(device).eval()
-    image_encoder = image_encoder.to(device).eval()
+# ======== Prior Training ========
+def train_prior(hf_token):
+    print("\n=== Training Prior ===")
+    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize
+    from models.prior_model import create_prior
     
-    optimizer = optim.Adam(prior.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-    
-    with torch.no_grad():  # Freeze CLIP components
-        for epoch in range(num_epochs):
-            for images, texts in dataloader:
-                images = images.to(device)
-                texts = texts.to(device)
-                
-                # Get target embeddings
-                image_features = image_encoder(images)
-                text_features = text_encoder(texts)
-                
-                # Prior prediction
-                pred_features = prior(text_features)
-                
-                # Compute loss
-                loss = criterion(pred_features, image_features)
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-            print(f"Prior Epoch {epoch+1}/{num_epochs} Loss: {loss.item():.4f}")
-
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Initialize models
+    # Load frozen CLIP
     text_encoder = create_text_encoder()
     image_encoder = create_image_encoder()
+    
+    # Load latest CLIP checkpoint
+    ckpt_files = [f for f in os.listdir(HYPERPARAMS['CHECKPOINT_DIR']) 
+                 if f.startswith("clip_text_epoch_")]
+    if not ckpt_files:
+        raise FileNotFoundError("No CLIP checkpoints found")
+    
+    latest_epoch = max([int(f.split('_')[-1].split('.')[0]) for f in ckpt_files])
+    text_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{latest_epoch}.pt")
+    image_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{latest_epoch}.pt")
+    
+    text_encoder.load_state_dict(torch.load(text_ckpt))
+    image_encoder.load_state_dict(torch.load(image_ckpt))
+    
+    # Freeze CLIP
+    for param in text_encoder.parameters():
+        param.requires_grad_(False)
+    for param in image_encoder.parameters():
+        param.requires_grad_(False)
+    
+    # Initialize Prior
     prior = create_prior()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--coco-path', type=str)
-    parser.add_argument('--cc3m-path', type=str)
-    parser.add_argument('--custom400m-path', type=str)
-    parser.add_argument('--batch-size', type=int, default=1024)
-    parser.add_argument('--epochs', type=int, default=10)
-    args = parser.parse_args()
-
-    # Initialize components
-    transform = get_transforms()
+    optimizer = torch.optim.Adam(prior.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
     
-    # Build datasets
-    config = {
-        'coco_path': args.coco_path,
-        'cc3m_path': args.cc3m_path,
-        'custom400m_path': args.custom400m_path
-    }
-    
-    full_dataset = build_datasets(config, transform)
-    
-    # Create distributed sampler
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        full_dataset,
-        num_replicas=int(os.environ.get('WORLD_SIZE', 1)),
-        rank=int(os.environ.get('RANK', 0))
+    # Streaming dataset (same as CLIP)
+    train_dataset = get_laion_streaming_dataset(
+        HUGGINGFACE=hf_token, 
+        text_processor=CLIPTokenize
     )
-
     train_loader = DataLoader(
-        full_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=8,
+        train_dataset,
+        batch_size=HYPERPARAMS["BATCH_SIZE"],
+        collate_fn=adaptive_collate,
         pin_memory=True
     )
+    
+    # Training loop
+    for epoch in range(HYPERPARAMS["PRIOR_EPOCHS"]):
+        prior.train()
+        total_loss = 0.0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
+            
+            images, texts = batch
+            optimizer.zero_grad()
+            
+            # Get frozen CLIP embeddings
+            with torch.no_grad():
+                text_emb = text_encoder(texts)
+                image_emb = image_encoder(images)
+            
+            # Prior forward
+            prior_emb = prior(text_emb)
+            loss = torch.mean((prior_emb - image_emb)**2)
+            
+            # Backprop
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch+1}/{HYPERPARAMS['PRIOR_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+        
+        # Save Prior checkpoint
+        ckpt_path = os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"prior_epoch_{epoch+1}.pt")
+        torch.save(prior.state_dict(), ckpt_path)
+        print(f"Saved Prior checkpoint to {ckpt_path}")
+    
+    print("Prior training completed.\n")
 
-    # Train CLIP
-    train_clip(
-        text_encoder,
-        image_encoder,
-        train_loader,
-        num_epochs=args.epochs
-    )
+def main(hf_token):
+    """Central training orchestration function"""
+    # Create checkpoint directory
+    os.makedirs(HYPERPARAMS["CHECKPOINT_DIR"], exist_ok=True)
     
-    # Save CLIP components
-    torch.save(text_encoder.state_dict(), "text_encoder.pth")
-    torch.save(image_encoder.state_dict(), "image_encoder.pth")
+    # Phase 1: CLIP training
+    print("\n🚀 Starting CLIP Training Phase")
+    train_clip(hf_token)
     
-    # Train Prior
-    train_prior(
-        prior,
-        text_encoder,
-        image_encoder,
-        train_loader,
-        num_epochs=5,
-        device=device
-    )
+    # Phase 2: Prior training
+    print("\n🚀 Starting Prior Training Phase")
+    train_prior(hf_token)
     
-    # Save Prior
-    torch.save(prior.state_dict(), "prior.pth")
+    print("\n✅ All training completed!")
 
+# ======== Main ========
 if __name__ == "__main__":
-    main()
+    # Configure command line interface
+    parser = argparse.ArgumentParser(description="Train CLIP and Prior models")
+    parser.add_argument("--token", type=str, required=True, help="Hugging Face API token")
+    args = parser.parse_args()
+    
+    # Setup torch environment
+    torch.multiprocessing.freeze_support()
+    torch.manual_seed(42)
+    
+    # Start training pipeline
+    main(args.token)
+

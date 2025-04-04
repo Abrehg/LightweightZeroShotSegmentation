@@ -124,6 +124,23 @@ def CLIPTokenize(inputText):
 def VecToText(vector):
     return tokenizer.convert_ids_to_tokens(vector)
 
+class CLIPWrapper(torch.nn.Module):
+    def __init__(self, text_encoder, image_encoder):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.image_encoder = image_encoder
+        self.logit_scale = torch.nn.Parameter(torch.ones([]) * torch.tensor(1/0.07).log())
+
+    def forward(self, text, images):
+        text_features = self.text_encoder(text)
+        image_features = self.image_encoder(images)
+        
+        # Normalize features
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        
+        return text_features, image_features, self.logit_scale.exp()
+
 
 # text_encoder = create_text_encoder()
 

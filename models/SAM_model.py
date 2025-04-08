@@ -2,6 +2,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def iou_loss(pred_masks, true_masks):
+    """
+    Compute average IoU loss for a batch of variable-sized masks
+    pred_masks: List of torch.Tensor (each of shape [1, H, W] with logits)
+    true_masks: List of torch.Tensor (each of shape [H, W] with values 0 or 1)
+    """
+    total_loss = 0.0
+    for pred, true in zip(pred_masks, true_masks):
+        # Convert logits to probabilities and remove channel dimension
+        pred_prob = torch.sigmoid(pred.squeeze(0))  # [H, W]
+        true = true.float()  # Convert to float for calculations
+        
+        # Flatten tensors
+        pred_flat = pred_prob.flatten()
+        true_flat = true.flatten()
+        
+        # Calculate intersection and union
+        intersection = (pred_flat * true_flat).sum()
+        union = pred_flat.sum() + true_flat.sum() - intersection
+        
+        # Avoid division by zero
+        iou = (intersection + 1e-6) / (union + 1e-6)
+        total_loss += 1.0 - iou
+    
+    return total_loss / len(pred_masks)
+
 class UnifiedPositionalEncoding(nn.Module):
     def __init__(self, embed_dim=1024, max_frames=32, spatial_size=16):
         super().__init__()

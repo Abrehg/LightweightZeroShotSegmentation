@@ -23,6 +23,13 @@ def create_image_encoder():
         input_channels=3
     )
 
+def clip_contrastive_loss(logits_per_image, logits_per_text):
+    # Contrastive loss from CLIP paper
+    labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
+    loss_img = torch.nn.functional.cross_entropy(logits_per_image, labels)
+    loss_txt = torch.nn.functional.cross_entropy(logits_per_text, labels)
+    return (loss_img + loss_txt) / 2
+
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_dim, max_seq_len, num_layers=6):
         super().__init__()

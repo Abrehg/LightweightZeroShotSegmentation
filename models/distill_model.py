@@ -3,6 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from clip_model import CLIPTokenize
 
+def iou_loss(pred_masks, true_masks):
+    """
+    Compute IoU loss for batched tensors
+    pred_masks: (B, 1, H, W) tensor of logits
+    true_masks: (B, H, W) tensor of 0/1 values
+    """
+    pred_prob = torch.sigmoid(pred_masks)
+    true = true_masks.unsqueeze(1).float()  # Add channel dimension
+    
+    intersection = (pred_prob * true).sum(dim=(2,3))
+    union = pred_prob.sum(dim=(2,3)) + true.sum(dim=(2,3)) - intersection
+    
+    iou = (intersection + 1e-6) / (union + 1e-6)
+    return (1.0 - iou).mean()
+
 class DistilledMemoryStudent(nn.Module):
     def __init__(self, 
                  text_embed_dim=256,
@@ -134,30 +149,25 @@ class DistilledMemoryStudent(nn.Module):
     def register_teacher(self, teacher_model):
         """Register teacher model for co-distillation"""
         self.teacher = teacher_model
-        for param in self.teacher.parameters():
-            param.requires_grad = False
             
-    def compute_distill_loss(self, student_out, teacher_out):
-        """KL divergence loss for co-distillation"""
-        # Align spatial dimensions
+    def compute_distill_loss(self, student_out, teacher_out, true_mask):
+        """Combined IoU loss against true masks and teacher outputs"""
+        # Loss between student predictions and ground truth
+        student_true_loss = iou_loss(student_out, true_mask)
+        
+        # Align student output to teacher resolution
         student_resized = F.interpolate(
             student_out, 
-            size=teacher_out.shape[-2:],  # Match teacher's H/W
+            size=teacher_out.shape[-2:],
             mode='bilinear', 
             align_corners=False
         )
-    
-        # Reshape to match batch-temporal dimensions
-        B, T = teacher_out.shape[0], teacher_out.shape[1]
-        student_flat = student_resized.view(B, T, -1).flatten(1)  # (B, T*H*W)
-        teacher_flat = teacher_out.flatten(1)                     # (B, T*H*W)
-
-        # Compute loss with explicit dimension
-        return F.kl_div(
-            F.log_softmax(student_flat, dim=1), 
-            F.softmax(teacher_flat.detach(), dim=1),
-            reduction='batchmean'
-        )
+        
+        # Loss between student and teacher predictions
+        student_teacher_loss = iou_loss(student_resized, teacher_out)
+        
+        # Combine losses
+        return student_true_loss + student_teacher_loss
 
 def load_student(weights_path):
     """Load trained student model"""

@@ -15,17 +15,10 @@ HYPERPARAMS = {
     "CHECKPOINT_DIR": "weights"  # Will be created automatically
 }
 
-def clip_contrastive_loss(logits_per_image, logits_per_text):
-    # Contrastive loss from CLIP paper
-    labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
-    loss_img = torch.nn.functional.cross_entropy(logits_per_image, labels)
-    loss_txt = torch.nn.functional.cross_entropy(logits_per_text, labels)
-    return (loss_img + loss_txt) / 2
-
 # ======== CLIP Training ========
 def train_clip(hf_token):
     print("\n=== Training CLIP ===")
-    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper
+    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
     
     # Initialize components
     text_encoder = create_text_encoder()

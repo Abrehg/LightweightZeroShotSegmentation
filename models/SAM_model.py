@@ -4,29 +4,22 @@ import torch.nn.functional as F
 
 def iou_loss(pred_masks, true_masks):
     """
-    Compute average IoU loss for a batch of variable-sized masks
-    pred_masks: List of torch.Tensor (each of shape [1, H, W] with logits)
-    true_masks: List of torch.Tensor (each of shape [H, W] with values 0 or 1)
+    Compute IoU loss for batched inputs.
+    pred_masks: Tensor of shape [B, H, W] (logits)
+    true_masks: Tensor of shape [B, H, W] (values 0 or 1)
     """
-    total_loss = 0.0
-    for pred, true in zip(pred_masks, true_masks):
-        # Convert logits to probabilities and remove channel dimension
-        pred_prob = torch.sigmoid(pred.squeeze(0))  # [H, W]
-        true = true.float()  # Convert to float for calculations
-        
-        # Flatten tensors
-        pred_flat = pred_prob.flatten()
-        true_flat = true.flatten()
-        
-        # Calculate intersection and union
-        intersection = (pred_flat * true_flat).sum()
-        union = pred_flat.sum() + true_flat.sum() - intersection
-        
-        # Avoid division by zero
-        iou = (intersection + 1e-6) / (union + 1e-6)
-        total_loss += 1.0 - iou
+    pred_prob = torch.sigmoid(pred_masks)  # [B, H, W]
+    true = true_masks.float()  # [B, H, W]
     
-    return total_loss / len(pred_masks)
+    # Flatten spatial dimensions
+    pred_flat = pred_prob.flatten(start_dim=1)  # [B, H*W]
+    true_flat = true.flatten(start_dim=1)       # [B, H*W]
+    
+    intersection = (pred_flat * true_flat).sum(dim=1)        # [B]
+    union = pred_flat.sum(dim=1) + true_flat.sum(dim=1) - intersection  # [B]
+    
+    iou = (intersection + 1e-6) / (union + 1e-6)  # [B]
+    return 1.0 - iou.mean()
 
 class UnifiedPositionalEncoding(nn.Module):
     def __init__(self, embed_dim=1024, max_frames=32, spatial_size=16):
@@ -141,9 +134,11 @@ class VideoSAM(nn.Module):
                 d_model=1024,
                 nhead=8,
                 dim_feedforward=2048,
-                batch_first=True
+                batch_first=True,
+                activation='gelu',
+                dropout=0.1
             ),
-            num_layers=num_transformers
+            num_layers=1
         )
         
         # Memory-enhanced decoder
@@ -156,61 +151,75 @@ class VideoSAM(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, prior_emb: torch.Tensor):
-        # x: (B, [T], C, H, W) -> force 5D
+        if isinstance(x, list) or x.dim() == 5:  # Handle both list and tensor inputs
+            return self.process_batch(x, prior_emb)
+        else:
+            return self.process_single(x, prior_emb)
+
+    
+    def process_batch(self, x: torch.Tensor, prior_emb: torch.Tensor):
+        # Original batch processing logic
         x = x.unsqueeze(1) if x.ndim == 4 else x  # (B, T, C, H, W)
         B, T = x.shape[:2]
         
-        # Encode all frames and preserve spatial dimensions
-        encoded_flat = self.image_encoder(x.flatten(0, 1))  # (B*T, C_enc, H_enc, W_enc)
+        encoded_flat = self.image_encoder(x.flatten(0, 1))
         C_enc, H_enc, W_enc = encoded_flat.shape[1], encoded_flat.shape[2], encoded_flat.shape[3]
-        encoded = encoded_flat.view(B, T, C_enc, H_enc, W_enc)  # (B, T, 512, H_enc, W_enc)
+        encoded = encoded_flat.view(B, T, C_enc, H_enc, W_enc)
         
-        # Add prior conditioning with correct spatial dims
         prior = prior_emb.view(B, 1, -1, 1, 1).expand(-1, T, -1, H_enc, W_enc)
-        encoded = torch.cat([encoded, prior], dim=2)  # (B, T, 1024, H_enc, W_enc)
+        encoded = torch.cat([encoded, prior], dim=2)
         
-        # Add unified positional encoding
         encoded = self.pos_enc(encoded)
         
-        # Process as spatio-temporal tokens
-        tokens = encoded.flatten(3).permute(0, 1, 3, 2)  # (B, T, N, C)
+        tokens = encoded.flatten(3).permute(0, 1, 3, 2)
         B, T, N, C = tokens.shape
         tokens = tokens.reshape(B, T*N, C)
         
-        # Attend to memory
-        memory = self.memory.expand(B, -1, -1)
+        memory = self.memory.expand(B, -1, -1).detach()
         tokens = torch.cat([memory, tokens], dim=1)
-        
-        # Transformer processing
+        print(f"tokens.requires_grad: {tokens.requires_grad}")  # Should be True
+    
         processed = self.transformer(tokens)
+        print(f"processed.requires_grad: {processed.requires_grad}")  # Should be True
         
-        # Decode masks
         masks = processed[:, -T*N:].view(B, T, N, C)
+        print(f"masks.requires_grad: {masks.requires_grad}")
+        masks = masks.view(B, T, H_enc, W_enc, C).permute(0, 4, 1, 2, 3)
+        masks = self.decoder(masks)
         
-        # Reshape to include spatial dimensions (H_enc, W_enc)
-        masks = masks.view(B, T, H_enc, W_enc, C)  # (B, T, H_enc, W_enc, C)
-        masks = masks.permute(0, 4, 1, 2, 3)       # (B, C, T, H_enc, W_enc)
-        
-        # Pass to decoder
-        masks = self.decoder(masks)  # Output shape: (B, 1, T, H_enc, W_enc)
-        
-        # Corrected interpolation handling
         B_dec, C_dec, T_dec, H_dec, W_dec = masks.shape
-        # Reshape for 2D interpolation (merge batch and temporal dimensions)
-        masks = masks.permute(0, 2, 1, 3, 4).reshape(-1, C_dec, H_dec, W_dec)  # (B*T_dec, C_dec, H_dec, W_dec)
+        masks = masks.permute(0, 2, 1, 3, 4).reshape(-1, C_dec, H_dec, W_dec)
         masks = F.interpolate(masks, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        # Reshape back to original dimensions
-        masks = masks.view(B, T_dec, C_dec, x.shape[-2], x.shape[-1]).permute(0, 2, 1, 3, 4)  # (B, C_dec, T_dec, H, W)
+        masks = masks.view(B, T_dec, C_dec, x.shape[-2], x.shape[-1]).permute(0, 2, 1, 3, 4)
         
-        # Update memory
         if self.training:
-            with torch.no_grad():  # Disable gradient tracking for memory update
-                new_memory = processed[:, :self.memory.size(1)].detach().mean(dim=0, keepdim=True)
-                # Clone to avoid in-place modification issues
-                updated_memory = torch.cat([new_memory, self.memory], dim=1)[:, :self.memory.size(1)]
-                self.memory.copy_(updated_memory)
+            # 1. Compute new memory WITH gradients
+            new_memory = processed[:, :self.memory.size(1)].mean(dim=0, keepdim=True)
+            
+            # 2. Detach ONLY when updating the buffer, not during computation
+            updated_memory = torch.cat([
+                new_memory.detach(),  # Detach here to prevent gradients flowing into buffer
+                self.memory
+            ], dim=1)[:, :self.memory.size(1)]
+            
+            # 3. Update buffer with detached values
+            self.memory.copy_(updated_memory)
+
         
-        return torch.sigmoid(masks.squeeze(1))  # Remove channel dim (C_dec=1)
+        return torch.sigmoid(masks.squeeze(1))
+
+    def process_single(self, x: torch.Tensor, prior_emb: torch.Tensor):
+        # Single instance processing with memory disabled
+        orig_memory = self.memory.clone()
+        self.memory.zero_()
+        
+        # Process without memory tracking
+        with torch.no_grad():
+            mask = self.process_batch(x, prior_emb)
+        
+        # Restore memory
+        self.memory.copy_(orig_memory)
+        return mask
     
 # input: (batch, num_frames (remove for images), num_channels, height, width) (height and width have to be greater than 16 and divisible by 8)
 # output: (batch, num_frames (remove for images), num_channels, height, width)

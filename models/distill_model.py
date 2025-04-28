@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from clip_model import CLIPTokenize
+from .clip_model import CLIPTokenize
 
 def iou_loss(pred_masks, true_masks):
     """
@@ -199,9 +199,9 @@ def process_video(student, frames, prompt, update_memory=False):
     
     return torch.stack(masks)
 
-from SAM_model import VideoSAM
-from clip_model import create_text_encoder
-from prior_model import create_prior
+from .SAM_model import VideoSAM
+from .clip_model import create_text_encoder
+from .prior_model import create_prior
 
 class TeacherModel(nn.Module):
     def __init__(self):
@@ -230,28 +230,28 @@ class TeacherModel(nn.Module):
         return self.sam_decoder(x, prior_emb)
 
 
-# Initialize with teacher for distillation
-student = DistilledMemoryStudent()
-teacher = TeacherModel()
-student.register_teacher(teacher)
+# # Initialize with teacher for distillation
+# student = DistilledMemoryStudent()
+# teacher = TeacherModel()
+# student.register_teacher(teacher)
 
-# Training step
-student.train()
-video_input = torch.randn(2, 5, 3, 256, 256)
+# # Training step
+# student.train()
+# video_input = torch.randn(2, 5, 3, 256, 256)
 
-inputText = ["Test Input", "Another Test Input"]
-text_input = CLIPTokenize(inputText)
+# inputText = ["Test Input", "Another Test Input"]
+# text_input = CLIPTokenize(inputText)
 
-# Forward passes
-student_out = student(video_input, text_input)
-with torch.no_grad():
-    teacher_out = teacher(video_input, text_input)
+# # Forward passes
+# student_out = student(video_input, text_input)
+# with torch.no_grad():
+#     teacher_out = teacher(video_input, text_input)
 
-# Compute loss
-loss = student.compute_distill_loss(student_out, teacher_out)
-loss.backward()
+# # Compute loss
+# loss = student.compute_distill_loss(student_out, teacher_out)
+# loss.backward()
 
-print("Completed sequence")
+# print("Completed sequence")
 
 # # Inference
 # student.eval()

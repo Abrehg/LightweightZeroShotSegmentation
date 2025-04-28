@@ -126,8 +126,8 @@ class VideoSAM(nn.Module):
         super().__init__()
         self.image_encoder = AdaptiveVisionEncoder()
         self.pos_enc = UnifiedPositionalEncoding(embed_dim=1024)
-        self.register_buffer('memory', torch.zeros(1, mem_size, 1024))
-        
+        self.memory = nn.Parameter(torch.zeros(1, mem_size, 1024))
+        self.mem_size = mem_size
         # Unified transformer
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -174,51 +174,34 @@ class VideoSAM(nn.Module):
         tokens = encoded.flatten(3).permute(0, 1, 3, 2)
         B, T, N, C = tokens.shape
         tokens = tokens.reshape(B, T*N, C)
+        print(f"tokens.requires_grad: {tokens.requires_grad}")
         
         memory = self.memory.expand(B, -1, -1).detach()
         tokens = torch.cat([memory, tokens], dim=1)
-        print(f"tokens.requires_grad: {tokens.requires_grad}")  # Should be True
-    
+        
         processed = self.transformer(tokens)
         print(f"processed.requires_grad: {processed.requires_grad}")  # Should be True
-        
         masks = processed[:, -T*N:].view(B, T, N, C)
-        print(f"masks.requires_grad: {masks.requires_grad}")
         masks = masks.view(B, T, H_enc, W_enc, C).permute(0, 4, 1, 2, 3)
         masks = self.decoder(masks)
-        
+        print(f"masks.requires_grad: {masks.requires_grad}")
+
         B_dec, C_dec, T_dec, H_dec, W_dec = masks.shape
         masks = masks.permute(0, 2, 1, 3, 4).reshape(-1, C_dec, H_dec, W_dec)
         masks = F.interpolate(masks, size=x.shape[-2:], mode='bilinear', align_corners=False)
         masks = masks.view(B, T_dec, C_dec, x.shape[-2], x.shape[-1]).permute(0, 2, 1, 3, 4)
         
         if self.training:
-            # 1. Compute new memory WITH gradients
-            new_memory = processed[:, :self.memory.size(1)].mean(dim=0, keepdim=True)
-            
-            # 2. Detach ONLY when updating the buffer, not during computation
-            updated_memory = torch.cat([
-                new_memory.detach(),  # Detach here to prevent gradients flowing into buffer
-                self.memory
-            ], dim=1)[:, :self.memory.size(1)]
-            
-            # 3. Update buffer with detached values
-            self.memory.copy_(updated_memory)
+            new_memory = processed[:, :self.mem_size].mean(dim=0, keepdim=True)
+            self.memory = nn.Parameter(new_memory.detach())
 
         
         return torch.sigmoid(masks.squeeze(1))
 
     def process_single(self, x: torch.Tensor, prior_emb: torch.Tensor):
-        # Single instance processing with memory disabled
-        orig_memory = self.memory.clone()
-        self.memory.zero_()
         
-        # Process without memory tracking
-        with torch.no_grad():
-            mask = self.process_batch(x, prior_emb)
+        mask = self.process_batch(x, prior_emb)
         
-        # Restore memory
-        self.memory.copy_(orig_memory)
         return mask
     
 # input: (batch, num_frames (remove for images), num_channels, height, width) (height and width have to be greater than 16 and divisible by 8)

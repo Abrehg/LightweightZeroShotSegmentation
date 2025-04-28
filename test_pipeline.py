@@ -13,7 +13,6 @@ parser.add_argument("--token", type=str, required=True, help="Hugging Face API t
 args = parser.parse_args()
 HUGGINGFACE_TOKEN = args.token
 
-
 def main():
     # Main Test ###################################################################
     
@@ -143,16 +142,11 @@ def main():
         param.requires_grad_(False)
     for param in teacher.prior.parameters():
         param.requires_grad_(False)
-    
-    print("[DEBUG] SAMDecoder parameters require_grad status:")
-    for name, param in teacher.sam_decoder.named_parameters():
-        print(f"{name}: {param.requires_grad}")
 
     # Create datasets and dataloader
     def load_file_list(file_path):
         with open(file_path) as f:
             return [line.strip().split('\t') for line in f.readlines()[1:]]
-
 
     print("Initializing SA-1B dataset")
     sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
@@ -160,6 +154,9 @@ def main():
     #sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
 
     CACHE_PATH = "dataset_cache.pth"
+
+    if os.path.exists(CACHE_PATH):
+        os.remove(CACHE_PATH)
 
     # Try loading cached dataset FIRST
     if os.path.exists(CACHE_PATH):
@@ -170,9 +167,8 @@ def main():
         # Create dataset WITHOUT building index
         sa1b_dataset = SA1BDataset(
             root_dir="./data", 
-            text_processor=CLIPTokenize, 
             file_list=sa1b_files,
-            build_index=False,  # Skip index building
+            build_index=False,
             verify_files=False
         )
         
@@ -183,8 +179,7 @@ def main():
     else:
         # Create dataset WITH index building
         sa1b_dataset = SA1BDataset(
-            root_dir="./data", 
-            text_processor=CLIPTokenize, 
+            root_dir="./data",
             file_list=sa1b_files,
             build_index=True,
             verify_files=True
@@ -195,13 +190,50 @@ def main():
             'samples': sa1b_dataset.samples,
             'available_files': sa1b_dataset.available_files
         }, CACHE_PATH)
-    
-    # sav_dataset = SAVDataset(root_dir="./data", 
-    #                          text_processor=CLIPTokenize, 
-    #                          file_list=sav_files)
+
+    # VIDEO_CACHE_PATH = "video_dataset_cache.pth"
+
+    # if os.path.exists(VIDEO_CACHE_PATH):
+    #     print("\nLoading cached dataset...")
+    #     start = time.time()
+    #     cache = torch.load(VIDEO_CACHE_PATH)
+        
+    #     # Create dataset WITHOUT building index
+    #     sav_dataset = SAVDataset(
+    #         root_dir="./data", 
+    #         text_processor=CLIPTokenize, 
+    #         file_list=sav_files,
+    #         build_index=False,  # Skip index building
+    #         verify_files=False
+    #     )
+        
+    #     # Restore cached state
+    #     sav_dataset.samples = cache['samples']
+    #     sav_dataset.available_files = cache['available_files']
+    #     print(f"Loaded cached dataset in {time.time()-start:.1f}s")
+    # else:
+    #     # Create dataset WITH index building
+    #     sav_dataset = SAVDataset(
+    #         root_dir="./data", 
+    #         text_processor=CLIPTokenize, 
+    #         file_list=sav_files,
+    #         build_index=True,
+    #         verify_files=True
+    #     )
+    #     # Save cache
+    #     print("\nCaching dataset...")
+    #     torch.save({
+    #         'samples': sav_dataset.samples,
+    #         'available_files': sav_dataset.available_files
+    #     }, VIDEO_CACHE_PATH)
 
     #combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
-    dataloader = DataLoader(sa1b_dataset, batch_size=1, shuffle=True, num_workers=1, collate_fn=SAM_adaptive_collate, pin_memory=True)
+    dataloader = DataLoader(sa1b_dataset, 
+                            batch_size=1, 
+                            shuffle=True, 
+                            num_workers=1, 
+                            collate_fn=SAM_adaptive_collate, 
+                            pin_memory=True)
 
     # Train teacher only
     print("[Teacher Training] Training SAM decoder...")
@@ -246,32 +278,17 @@ def main():
     
             with torch.autograd.detect_anomaly():
                 # Forward pass
-                print("Starting text encoder for texts input")
-                print(txt.size())
                 text_emb = teacher.text_encoder(txt)
-                print(f"Finished processing text imput with shape {text_emb.size()}")
-                print("Starting prior model processing")
 
                 prior_emb = teacher.prior(text_emb)
-                print(f"Finished prior model processing with size {prior_emb.size()}")
-                print(f"Starting SAM decoder processing")
 
                 pred_mask = teacher.sam_decoder(img, prior_emb)
-                print(f"Finished SAM decoder processing with size {pred_mask.size()}")
-                print(resized_mask.size())
-                print(f"Device: pred_mask={pred_mask.device}, mask={resized_mask.device}")
-                print(f"Dtype: pred_mask={pred_mask.dtype}, mask={resized_mask.dtype}")
-                print(f"pred_mask.requires_grad: {pred_mask.requires_grad}")  # Debugging line
-                print(f"pred_mask grad_fn: {pred_mask.grad_fn}")
 
                 loss = iou_loss(pred_mask, resized_mask.to(device))
-                print(f"loss.requires_grad: {loss.requires_grad}")  # Debugging line
-                print(f"loss grad_fn: {loss.grad_fn}")
 
                 loss.backward()
         
                 # Accumulate gradients
-                #loss.backward()
                 losses.append(loss.item())
         
         optimizer_teacher.step()

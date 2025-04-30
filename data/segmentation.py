@@ -10,8 +10,14 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 import torchvision.transforms.functional as F
 import json
 from pycocotools import mask as coco_mask
+from models.clip_model import CLIPTokenize
 
 def SAM_adaptive_collate(batch):
+    """Handle variable-sized images by stacking as lists"""
+    images, masks, texts = zip(*batch)
+    return list(images), list(masks), list(texts)
+
+def SAV_adaptive_collate(batch):
     """Handle variable-sized images by stacking as lists"""
     images, masks, texts = zip(*batch)
     return list(images), list(masks), list(texts)
@@ -93,10 +99,9 @@ class BaseTarDataset(Dataset):
 
 class SA1BDataset(BaseTarDataset):
     """Segment Anything 1B Dataset"""
-    def __init__(self, root_dir, file_list, text_processor=None, 
+    def __init__(self, root_dir, file_list, 
                  device='cuda' if torch.cuda.is_available() else 'cpu', build_index = True, verify_files=True):
         super().__init__(root_dir, file_list, max_retries=3, verify_files=verify_files)
-        self.text_processor = text_processor
         self.device = device
 
         if build_index:
@@ -190,7 +195,6 @@ class SA1BDataset(BaseTarDataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        print(f"\nLoading sample {idx+1}/{len(self)}")
         tar_path, json_name, ann_idx, image_path = self.samples[idx]
         
         with tarfile.open(tar_path, "r") as tar:
@@ -198,14 +202,12 @@ class SA1BDataset(BaseTarDataset):
             json_file = tar.extractfile(json_name)
             data = json.load(json_file)
             
-            print(f"Loading image: {image_path}")
             # Load image
             image_member = tar.getmember(image_path)
             image_file = tar.extractfile(image_member)
             image = Image.open(image_file).convert("RGB")
             image = self.transform(image) if self.transform else transforms.ToTensor()(image)
             
-            print(f"Processing annotation {ann_idx} from {json_name}")
             # Process annotation using pycocotools
             ann = data['annotations'][ann_idx]
             
@@ -218,16 +220,17 @@ class SA1BDataset(BaseTarDataset):
             # Decode mask
             mask = coco_mask.decode(rle)
             mask = torch.from_numpy(mask).long()
+            mask = mask.unsqueeze(0)
             
             # Generate caption
             with torch.no_grad():
                 caption = self._generate_object_caption(image, mask)
-                #caption = caption.squeeze(0)
             
-            if self.text_processor:
-                caption = self.text_processor(caption)
-            
-            print(f"Generated caption: {caption[:50]}...")
+            caption = CLIPTokenize(caption)
+            caption = caption.squeeze(1)
+
+            image = image.unsqueeze(0)
+            mask = mask.unsqueeze(0)
                 
         return image, mask, caption
     
@@ -241,9 +244,8 @@ class SA1BDataset(BaseTarDataset):
 
 class SAVDataset(BaseTarDataset):
     """Segment Anything Video Dataset"""
-    def __init__(self, root_dir, file_list, text_processor=None, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, root_dir, file_list, device='cuda' if torch.cuda.is_available() else 'cpu'):
         super().__init__(root_dir, file_list, max_retries=3)
-        self.text_processor = text_processor
         self.device = device
         self.caption_cache = {}
         self.samples = self._build_index()
@@ -350,9 +352,9 @@ class SAVDataset(BaseTarDataset):
             # Retrieve cached caption or use generated
             caption = self.caption_cache.get(video_id, "object in video")
 
-        if self.text_processor:
-            caption = self.text_processor(caption)
-            caption = caption.squeeze(0)
+
+        caption = CLIPTokenize(caption)
+        caption = caption.squeeze(0)
             
         if self.transform:
             image = self.transform(image)

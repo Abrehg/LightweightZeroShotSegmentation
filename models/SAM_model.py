@@ -174,17 +174,14 @@ class VideoSAM(nn.Module):
         tokens = encoded.flatten(3).permute(0, 1, 3, 2)
         B, T, N, C = tokens.shape
         tokens = tokens.reshape(B, T*N, C)
-        print(f"tokens.requires_grad: {tokens.requires_grad}")
         
         memory = self.memory.expand(B, -1, -1).detach()
         tokens = torch.cat([memory, tokens], dim=1)
         
         processed = self.transformer(tokens)
-        print(f"processed.requires_grad: {processed.requires_grad}")  # Should be True
         masks = processed[:, -T*N:].view(B, T, N, C)
         masks = masks.view(B, T, H_enc, W_enc, C).permute(0, 4, 1, 2, 3)
         masks = self.decoder(masks)
-        print(f"masks.requires_grad: {masks.requires_grad}")
 
         B_dec, C_dec, T_dec, H_dec, W_dec = masks.shape
         masks = masks.permute(0, 2, 1, 3, 4).reshape(-1, C_dec, H_dec, W_dec)

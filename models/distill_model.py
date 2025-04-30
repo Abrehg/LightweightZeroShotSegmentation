@@ -77,6 +77,9 @@ class DistilledMemoryStudent(nn.Module):
             nn.Conv2d(128, 64, 3, padding=1),
             nn.GELU(),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(64, 1, 1)
         )
 
@@ -104,15 +107,17 @@ class DistilledMemoryStudent(nn.Module):
 
     def forward(self, x, text_tokens):
         # Handle video/image inputs
-        is_video = x.ndim == 5
-        B = x.size(0)
-        T = x.size(1) if is_video else 1
+        if x.ndim == 4:  # Image input (B, C, H, W)
+            x = x.unsqueeze(0)  # Add temporal dim (B, 1, C, H, W)
 
-        # Encode frames
-        x = x.flatten(0, 1) if is_video else x.unsqueeze(1)
+        # Now x is guaranteed to be 5D
+        B, T, C, H_orig, W_orig = x.shape
+    
+        # Flatten batch and temporal dimensions for image encoder
+        x = x.flatten(0, 1)  # Shape: (B*T, C, H, W)
         img_feats = self.image_encoder(x)  # (B*T, 128, H', W')
 
-        # Text processing
+        # Text processing (unchanged)
         B_text, seq_len = text_tokens.shape
         positions = torch.arange(seq_len, device=text_tokens.device).expand(B_text, -1)
         token_emb = self.token_embed(text_tokens)
@@ -125,11 +130,10 @@ class DistilledMemoryStudent(nn.Module):
         text_feats = text_feats.expand(-1, -1, *img_feats.shape[-2:])  # (B*T, 256, H', W')
 
         # Temporal fusion (if video)
-        if is_video:
-            img_feats = img_feats.view(B, T, *img_feats.shape[1:])
-            img_feats = img_feats.permute(0, 2, 1, 3, 4)  # (B, 128, T, H', W')
-            img_feats = self.temporal_fuser(img_feats)
-            img_feats = img_feats.permute(0, 2, 1, 3, 4).flatten(0, 1)  # (B*T, 128, H', W')
+        img_feats = img_feats.view(B, T, *img_feats.shape[1:])
+        img_feats = img_feats.permute(0, 2, 1, 3, 4)  # (B, 128, T, H', W')
+        img_feats = self.temporal_fuser(img_feats)
+        img_feats = img_feats.permute(0, 2, 1, 3, 4).flatten(0, 1)  # (B*T, 128, H', W')
 
         # Concatenate along channels
         fused = torch.cat([img_feats, text_feats], dim=1)  # (B*T, 384, H', W')
@@ -139,11 +143,18 @@ class DistilledMemoryStudent(nn.Module):
         
         # Decode masks
         masks = self.decoder(fused)
+
+        masks = F.interpolate(
+            masks, 
+            size=(H_orig, W_orig),  # Original input dimensions
+            mode='bilinear', 
+            align_corners=False
+        )
         
         # Update memory during training
         if self.training:
             self.update_memory(img_feats, masks)
-        
+    
         return torch.sigmoid(masks)
 
     def register_teacher(self, teacher_model):
@@ -210,11 +221,6 @@ class TeacherModel(nn.Module):
         self.text_encoder = create_text_encoder()
         self.prior = create_prior()
         self.sam_decoder = VideoSAM()
-        
-        # Freeze all components
-        for module in [self.text_encoder, self.prior, self.sam_decoder]:
-            for param in module.parameters():
-                param.requires_grad_(False)
 
     def forward(self, x, text_tokens):
         """
@@ -247,13 +253,4 @@ class TeacherModel(nn.Module):
 # with torch.no_grad():
 #     teacher_out = teacher(video_input, text_input)
 
-# # Compute loss
-# loss = student.compute_distill_loss(student_out, teacher_out)
-# loss.backward()
-
 # print("Completed sequence")
-
-# # Inference
-# student.eval()
-# frame_sequence = [torch.randn(3, 512, 512) for _ in range(10)]
-# masks = process_video(student, frame_sequence, "A dancing person", update_memory=True)

@@ -2,7 +2,7 @@
 import torch
 from torch.utils.data import DataLoader
 from data.custom400m import get_laion_test_dataset, adaptive_collate
-from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
+from data.segmentation import SAM_adaptive_collate, SAV_adaptive_collate, SA1BDataset, SAVDataset
 import argparse
 import time
 import os
@@ -151,84 +151,86 @@ def main():
     print("Initializing SA-1B dataset")
     sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
 
-    #sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
+    sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
 
-    CACHE_PATH = "dataset_cache.pth"
+    # CACHE_PATH = "dataset_cache.pth"
 
-    if os.path.exists(CACHE_PATH):
-        os.remove(CACHE_PATH)
+    # if os.path.exists(CACHE_PATH):
+    #     os.remove(CACHE_PATH)
 
-    # Try loading cached dataset FIRST
-    if os.path.exists(CACHE_PATH):
-        print("\nLoading cached dataset...")
-        start = time.time()
-        cache = torch.load(CACHE_PATH)
-        
-        # Create dataset WITHOUT building index
-        sa1b_dataset = SA1BDataset(
-            root_dir="./data", 
-            file_list=sa1b_files,
-            build_index=False,
-            verify_files=False
-        )
-        
-        # Restore cached state
-        sa1b_dataset.samples = cache['samples']
-        sa1b_dataset.available_files = cache['available_files']
-        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
-    else:
-        # Create dataset WITH index building
-        sa1b_dataset = SA1BDataset(
-            root_dir="./data",
-            file_list=sa1b_files,
-            build_index=True,
-            verify_files=True
-        )
-        # Save cache
-        print("\nCaching dataset...")
-        torch.save({
-            'samples': sa1b_dataset.samples,
-            'available_files': sa1b_dataset.available_files
-        }, CACHE_PATH)
-
-    # VIDEO_CACHE_PATH = "video_dataset_cache.pth"
-
-    # if os.path.exists(VIDEO_CACHE_PATH):
+    # # Try loading cached dataset FIRST
+    # if os.path.exists(CACHE_PATH):
     #     print("\nLoading cached dataset...")
     #     start = time.time()
-    #     cache = torch.load(VIDEO_CACHE_PATH)
+    #     cache = torch.load(CACHE_PATH)
         
     #     # Create dataset WITHOUT building index
-    #     sav_dataset = SAVDataset(
+    #     sa1b_dataset = SA1BDataset(
     #         root_dir="./data", 
-    #         text_processor=CLIPTokenize, 
-    #         file_list=sav_files,
-    #         build_index=False,  # Skip index building
+    #         file_list=sa1b_files,
+    #         build_index=False,
     #         verify_files=False
     #     )
         
     #     # Restore cached state
-    #     sav_dataset.samples = cache['samples']
-    #     sav_dataset.available_files = cache['available_files']
+    #     sa1b_dataset.samples = cache['samples']
+    #     sa1b_dataset.available_files = cache['available_files']
     #     print(f"Loaded cached dataset in {time.time()-start:.1f}s")
     # else:
     #     # Create dataset WITH index building
-    #     sav_dataset = SAVDataset(
-    #         root_dir="./data", 
-    #         text_processor=CLIPTokenize, 
-    #         file_list=sav_files,
+    #     sa1b_dataset = SA1BDataset(
+    #         root_dir="./data",
+    #         file_list=sa1b_files,
     #         build_index=True,
     #         verify_files=True
     #     )
     #     # Save cache
     #     print("\nCaching dataset...")
     #     torch.save({
-    #         'samples': sav_dataset.samples,
-    #         'available_files': sav_dataset.available_files
-    #     }, VIDEO_CACHE_PATH)
+    #         'samples': sa1b_dataset.samples,
+    #         'available_files': sa1b_dataset.available_files
+    #     }, CACHE_PATH)
+
+    VIDEO_CACHE_PATH = "video_dataset_cache.pth"
+
+    if os.path.exists(VIDEO_CACHE_PATH):
+        os.remove(VIDEO_CACHE_PATH)
+
+    if os.path.exists(VIDEO_CACHE_PATH):
+        print("\nLoading cached dataset...")
+        start = time.time()
+        cache = torch.load(VIDEO_CACHE_PATH)
+        
+        # Create dataset WITHOUT building index
+        sav_dataset = SAVDataset(
+            root_dir="./data",
+            file_list=sav_files,
+            build_index=False,
+            verify_files=False
+        )
+        
+        # Restore cached state
+        sav_dataset.samples = cache['samples']
+        sav_dataset.available_files = cache['available_files']
+        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
+    else:
+        # Create dataset WITH index building
+        sav_dataset = SAVDataset(
+            root_dir="./data", 
+            text_processor=CLIPTokenize, 
+            file_list=sav_files,
+            build_index=True,
+            verify_files=True
+        )
+        # Save cache
+        print("\nCaching dataset...")
+        torch.save({
+            'samples': sav_dataset.samples,
+            'available_files': sav_dataset.available_files
+        }, VIDEO_CACHE_PATH)
 
     #combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
-    dataloader = DataLoader(sa1b_dataset, 
+    dataloader = DataLoader(sav_dataset, 
                             batch_size=1, 
                             shuffle=True, 
                             num_workers=1, 
@@ -254,41 +256,35 @@ def main():
         optimizer_teacher.zero_grad()
 
         for img, mask, txt in zip(images, true_masks, texts):
+
             # Get original dimensions
-            C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+            C, H, W = img[0].shape[-3], img[0].shape[-2], img[0].shape[-1]
         
             # Calculate new size while preserving aspect ratio
             scale = target_size / max(H, W)
             new_H, new_W = int(H * scale), int(W * scale)
         
             # Resize image with bilinear interpolation
-            resized_img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+            resized_img = F.resize(img[0], [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
         
             # Resize mask with nearest neighbor (preserve integer labels)
-            resized_mask = F.resize(mask.unsqueeze(0), [new_H, new_W], 
-                               interpolation=F.InterpolationMode.NEAREST).unsqueeze(1)
-            
-            resized_mask = resized_mask.to(device).float()
-            
-            txt = txt.squeeze(1).to(device)
+            resized_mask = F.resize(mask[0], [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
         
             # Process individual samples but maintain gradients
+            mask = resized_mask.unsqueeze(0).to(device).float()
             img = resized_img.unsqueeze(0).to(device)  # Add batch dimension
-            #txt = txt.unsqueeze(0).to(device)
-    
+            txt = txt.to(device)
+
             with torch.autograd.detect_anomaly():
                 # Forward pass
                 text_emb = teacher.text_encoder(txt)
-
                 prior_emb = teacher.prior(text_emb)
-
                 pred_mask = teacher.sam_decoder(img, prior_emb)
 
-                loss = iou_loss(pred_mask, resized_mask.to(device))
+                loss = iou_loss(pred_mask, mask)
 
                 loss.backward()
         
-                # Accumulate gradients
                 losses.append(loss.item())
         
         optimizer_teacher.step()
@@ -316,12 +312,11 @@ def main():
 
     print("[Joint Training] Starting joint training...")
     
-    
     for batch in dataloader:
         if batch is None:
             continue
 
-        images, texts, true_masks = batch
+        images, true_masks, texts = batch
 
         target_size = 256
 
@@ -335,48 +330,54 @@ def main():
         optimizer_student.zero_grad()
 
         for img, mask, txt in zip(images, true_masks, texts):
+
             # Get original dimensions
-            C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+            C, H, W = img[0].shape[-3], img[0].shape[-2], img[0].shape[-1]
         
             # Calculate new size while preserving aspect ratio
             scale = target_size / max(H, W)
             new_H, new_W = int(H * scale), int(W * scale)
         
             # Resize image with bilinear interpolation
-            resized_img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+            resized_img = F.resize(img[0], [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
         
             # Resize mask with nearest neighbor (preserve integer labels)
-            resized_mask = F.resize(mask.unsqueeze(0), [new_H, new_W], 
-                               interpolation=F.InterpolationMode.NEAREST).squeeze(0)
-            
-            txt = txt.squeeze(1)
+            resized_mask = F.resize(mask[0], [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
         
             # Process individual samples but maintain gradients
+            mask = resized_mask.unsqueeze(0).to(device).float()
             img = resized_img.unsqueeze(0).to(device)  # Add batch dimension
-            txt = txt.unsqueeze(0).to(device)
-    
-            # Forward pass
+            txt = txt.to(device)
 
-            teacher_out = teacher(resized_img, txt)
-            student_out = student(resized_img, txt)
+            with torch.autograd.detect_anomaly():
+                # Forward pass
+                teacher_out = teacher(img, txt)
 
-            # Compute losses
-            teacher_loss = iou_loss([teacher_out], [resized_mask])
-            student_loss = student.compute_distill_loss([student_out], [teacher_out], [resized_mask])
+                print(teacher_out.size())
+                print(mask.size())
 
-            # Backward passes
-            teacher_loss.backward()
-            student_loss.backward()
+                student_out = student(img, txt)
 
-            teacher_losses.append(teacher_loss.item())
-            student_losses.append(student_loss.item())
+                print(student_out.size())
+                print(mask.size())
+
+                # Compute losses
+                teacher_loss = iou_loss(teacher_out, mask)
+                student_loss = student.compute_distill_loss(student_out, teacher_out, mask)
+
+                # Backward passes
+                teacher_loss.backward(retain_graph=True)
+                student_loss.backward()
+
+                teacher_losses.append(teacher_loss.item())
+                student_losses.append(student_loss.item())
 
         # Update parameters
         optimizer_teacher.step()
         optimizer_student.step()
 
-        print(f"Teacher Training Loss: {sum(losses)/len(losses):.4f}")
         print(f"Joint Step - Teacher Loss: {sum(teacher_losses)/len(teacher_losses):.4f}, Student Loss: {sum(student_losses)/len(student_losses):.4f}")
+        break
 
 if __name__ == "__main__":
     torch.multiprocessing.freeze_support()  # Add this line

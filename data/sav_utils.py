@@ -60,7 +60,7 @@ def show_anns(masks, colors: List, borders=True) -> None:
     ax.imshow(canvas)
 
 
-class SAVDataset:
+class SAVDatasetHelper:
     """
     SAVDataset is a class to load the SAV dataset and visualize the annotations.
     """
@@ -77,7 +77,7 @@ class SAVDataset:
         self.manual_mask_colors = np.random.random((256, 3))
         self.auto_mask_colors = np.random.random((256, 3))
 
-    def read_frames(self, mp4_path: str) -> None:
+    def read_frames(self, mp4_path: str):
         """
         Read the frames and downsample them to align with the annotations.
         """
@@ -100,7 +100,7 @@ class SAVDataset:
 
     def get_frames_and_annotations(
         self, video_id: str
-    ) -> Tuple[List | None, Dict | None, Dict | None]:
+    ):
         """
         Get the frames and annotations for video.
         """
@@ -136,7 +136,7 @@ class SAVDataset:
         annotated_frame_id: int,
         show_auto=True,
         show_manual=True,
-    ) -> None:
+    ):
         """
         Visualize the annotations on the annotated_frame_id.
         If show_manual is True, show the manual annotations.

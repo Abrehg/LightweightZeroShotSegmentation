@@ -11,13 +11,9 @@ import torchvision.transforms.functional as F
 import json
 from pycocotools import mask as coco_mask
 from models.clip_model import CLIPTokenize
+from .sav_utils import SAVDatasetHelper, decode_video, show_anns
 
 def SAM_adaptive_collate(batch):
-    """Handle variable-sized images by stacking as lists"""
-    images, masks, texts = zip(*batch)
-    return list(images), list(masks), list(texts)
-
-def SAV_adaptive_collate(batch):
     """Handle variable-sized images by stacking as lists"""
     images, masks, texts = zip(*batch)
     return list(images), list(masks), list(texts)
@@ -243,127 +239,204 @@ class SA1BDataset(BaseTarDataset):
         self._samples = value
 
 class SAVDataset(BaseTarDataset):
-    """Segment Anything Video Dataset"""
-    def __init__(self, root_dir, file_list, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        super().__init__(root_dir, file_list, max_retries=3)
+    """SA-V dataset with flexible annotation handling"""
+    def __init__(self, root_dir, file_list, 
+                 device='cuda' if torch.cuda.is_available() else 'cpu',
+                 caption_strategy='video', 
+                 build_index=True):
+        super().__init__(root_dir, file_list, max_retries=3, verify_files=True)
         self.device = device
-        self.caption_cache = {}
-        self.samples = self._build_index()
+        self.caption_strategy = caption_strategy
+        self.extract_dir = os.path.join(root_dir, "sav_extracted")
+        os.makedirs(self.extract_dir, exist_ok=True)
         
-        # Initialize BLIP model for caption generation
+        # Initialize components
+        self.sav_helper = SAVDatasetHelper(self.extract_dir)
         self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
         self.caption_model = BlipForConditionalGeneration.from_pretrained(
             "Salesforce/blip-image-captioning-base"
-        ).to(self.device).eval()
+        ).to(device).eval()
 
-    def _generate_object_caption(self, image, mask):
-        """Generate caption for masked object using BLIP model"""
-        # Convert to PIL Images
-        image_pil = F.to_pil_image(image)
-        mask_pil = F.to_pil_image(mask.float())
+        if build_index:
+            self.samples = self._build_index()
+
+    def _load_from_tar(self, tar_path):
+        """SA-V tar processing with flexible annotation support"""
+        video_id = os.path.splitext(os.path.basename(tar_path))[0]
+        extract_path = os.path.join(self.extract_dir, video_id)
         
-        # Crop to masked region
-        bbox = mask_pil.getbbox()
-        if not bbox:  # Empty mask
-            return "object"
+        if os.path.exists(extract_path):
+            return extract_path
             
-        cropped_image = image_pil.crop(bbox)
-        
-        # Generate caption
-        inputs = self.processor(cropped_image, return_tensors="pt").to(self.device)
-        outputs = self.caption_model.generate(**inputs, max_new_tokens=20)
-        caption = self.processor.decode(outputs[0], skip_special_tokens=True)
-        
-        return caption
-
-    def _build_index(self):
-        """Index video sequences using first frame's mask for caption generation"""
-        print("\n=== Building SA-V dataset index ===")
-        samples = []
-        tar_idx = 1
-        for tar_path in self.available_files:
-            print(f"\nProcessing tar file {tar_idx}/{len(self.available_files)}: {os.path.basename(tar_path)}")
-            with tarfile.open(tar_path, "r") as tar:
-                all_members = tar.getmembers()
-                member_names = {m.name: m for m in all_members}
-            
-                # Process video directories
-                video_dirs = [m for m in all_members if m.isdir()]
-
-                print(f"Found {len(video_dirs)} video directories")
-                vid_idx = 1
-                for video_dir in video_dirs:
-                    print(f"\nProcessing video {vid_idx}/{len(video_dirs)}: {video_dir.name}")
-                    video_id = video_dir.name
-                    frames = sorted([m for m in tar.getmembers() 
-                                   if m.name.startswith(video_id) 
-                                   and "frame_" in m.name])
-                    masks = sorted([m for m in tar.getmembers() 
-                                  if m.name.startswith(video_id)
-                                  and "mask_" in m.name])
-
-                    print(f"Found {len(frames)} frames and {len(masks)} masks")
-                    if not masks:
-                        continue  # Skip videos without masks
-
-                    # Get first frame with mask
-                    first_frame = frames[0]
-                    first_mask = masks[0]
-                    
-                    # Check for existing caption
-                    caption_path = os.path.join(video_id, "caption.txt")
-                    try:
-                        caption_file = tar.extractfile(caption_path)
-                        caption = caption_file.read().decode('utf-8').strip()
-                    except KeyError:
-                        # Generate caption from first frame
-                        frame_file = tar.extractfile(first_frame)
-                        mask_file = tar.extractfile(first_mask)
-                        
-                        image = Image.open(frame_file).convert("RGB")
-                        mask = Image.open(mask_file)
-                        caption = self._generate_object_caption(image, mask)
-                        
-                        # Cache generated caption for all frames
-                        self.caption_cache[video_id] = caption
-
-                    # Create samples for all frames with cached caption
-                    for frame, mask in zip(frames, masks):
-                        samples.append((tar_path, frame.name, mask.name, video_id))
-                    vid_idx = vid_idx + 1
-            tar_idx = tar_idx + 1
-        print(f"\n=== Index built. Total video frames: {len(samples)} ===")
-        return samples
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        print(f"\nLoading video frame {idx+1}/{len(self)}")
-        tar_path, frame_path, mask_path, video_id = self.samples[idx]
+        os.makedirs(extract_path, exist_ok=True)
         
         with tarfile.open(tar_path, "r") as tar:
-            image_file = tar.extractfile(frame_path)
-            mask_file = tar.extractfile(mask_path)
+            # Extract all files first
+            tar.extractall(path=extract_path)
             
-            image = Image.open(image_file).convert("RGB")
-            mask = Image.open(mask_file)
+            # Post-extraction validation
+            extracted_files = set(os.listdir(extract_path))
+            required = {f"{video_id}.mp4"}
+            auto_file = f"{video_id}_auto.json"
+            manual_file = f"{video_id}_manual.json"
             
-            # Retrieve cached caption or use generated
-            caption = self.caption_cache.get(video_id, "object in video")
+            # Check for essential files
+            if not required.issubset(extracted_files):
+                raise ValueError(f"Missing video file in {tar_path}")
+                
+            if auto_file not in extracted_files and manual_file not in extracted_files:
+                print(f"No annotations found for {video_id}, skipping")
+                return None
+                
+        return extract_path
 
-
-        caption = CLIPTokenize(caption)
-        caption = caption.squeeze(0)
+    def _build_index(self):
+        """Build index handling mixed annotation availability"""
+        samples = []
+        for tar_path in self.available_files:
+            video_id = os.path.splitext(os.path.basename(tar_path))[0]
+            extract_path = self._load_from_tar(tar_path)
             
-        if self.transform:
-            image = self.transform(image)
-            mask = torch.from_numpy(np.array(mask)).long()
-
-        print(f"Using caption: {caption[:50]}...")
+            if extract_path is None:  # Skip invalid extractions
+                continue
+                
+            # Path setup with existence checks
+            mp4_path = os.path.join(extract_path, f"{video_id}.mp4")
+            auto_path = os.path.join(extract_path, f"{video_id}_auto.json")
+            manual_path = os.path.join(extract_path, f"{video_id}_manual.json")
             
-        return image, mask, caption
+            # Determine available annotations
+            annot_sources = []
+            if os.path.exists(manual_path):
+                annot_sources.append(('manual', manual_path))
+            if os.path.exists(auto_path):
+                annot_sources.append(('auto', auto_path))
 
+            for source_type, annot_path in annot_sources:
+                try:
+                    with open(annot_path) as f:
+                        annotations = json.load(f)
+                        
+                    # Validate annotation structure
+                    if not self._validate_annotations(annotations):
+                        continue
+                        
+                    # Process frames
+                    frames = decode_video(mp4_path)
+                    
+                    for frame_idx, frame_anns in enumerate(annotations['masklet']):
+                        for masklet_idx in range(len(frame_anns)):
+                            samples.append({
+                                'extract_path': extract_path,
+                                'video_id': video_id,
+                                'frame_idx': frame_idx,
+                                'masklet_idx': masklet_idx,
+                                'annot_source': source_type
+                            })
+                except Exception as e:
+                    print(f"Skipping {source_type} annotations for {video_id}: {str(e)}")
+        
+        return samples
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        extract_path = sample['extract_path']
+        video_id = sample['video_id']
+        
+        # Load frames
+        mp4_path = os.path.join(extract_path, f"{video_id}.mp4")
+        frames = decode_video(mp4_path)
+        
+        # Load annotations
+        json_path = os.path.join(extract_path, 
+            f"{video_id}_{sample['annot_source']}.json")
+        with open(json_path) as f:
+            annotations = json.load(f)
+            
+        # Process masklet
+        rle = annotations['masklet'][sample['frame_idx']][sample['masklet_idx']]
+        mask = coco_mask.decode(rle)
+        
+        # Generate caption with annotation priority
+        if self.caption_strategy == 'video':
+            caption = self._video_level_caption(extract_path, video_id)
+        else:
+            caption = self._generate_caption(frames[sample['frame_idx']], mask)
+
+        # Convert to tensors
+        image_tensor = F.to_tensor(frames[sample['frame_idx']])
+        mask_tensor = torch.from_numpy(mask).long()
+        caption_tensor = CLIPTokenize(caption).squeeze(0)
+
+        return image_tensor, mask_tensor, caption_tensor
+    
+    def _validate_annotations(self, annot_data):
+        """Validate annotation file structure"""
+        return all(k in annot_data for k in ['masklet', 'video_id', 'masklet_num'])
+
+    def _video_level_caption(self, video_id):
+        """New method: Generate caption from aggregated video masks"""
+        mp4_path = os.path.join(self.root_dir, f"{video_id}.mp4")
+        frames = decode_video(mp4_path)
+        
+        # Create composite mask across all frames
+        composite_mask = np.zeros_like(frames[0][..., 0], dtype=bool)
+        with open(os.path.join(self.root_dir, f"{video_id}_auto.json")) as f:
+            annotations = json.load(f)
+            
+        for frame_anns in annotations['masklet']:
+            for rle in frame_anns:
+                composite_mask |= coco_mask.decode(rle)
+
+        # Generate caption from composite mask
+        return self._generate_caption(frames[0], composite_mask)
+
+    def _generate_caption(self, frame, mask):
+        """Unified caption generation method"""
+        image_pil = Image.fromarray(frame)
+        mask_pil = Image.fromarray(mask.astype(np.uint8))
+        
+        bbox = mask_pil.getbbox()
+        if not bbox:
+            return "objects in video"
+            
+        cropped = image_pil.crop(bbox)
+        inputs = self.processor(cropped, return_tensors="pt").to(self.device)
+        outputs = self.caption_model.generate(**inputs, max_new_tokens=20)
+        return self.processor.decode(outputs[0], skip_special_tokens=True)
+
+    def visualize_sample(self, idx):
+        """Integrated visualization using sav_utils"""
+        sample = self.samples[idx]
+        self.sav_helper.visualize_annotation(
+            sample['video_id'],
+            sample['frame_idx'],
+            show_manual=(sample['annot_source'] == 'manual')
+        )
+    
+    def _video_level_caption(self, video_dir, video_id):
+        """Generate caption from all frames in video"""
+        composite_mask = np.zeros((1080, 1920), dtype=bool)  # Default size
+        json_path = os.path.join(video_dir, f"{video_id}_auto.json")
+        
+        try:
+            with open(json_path) as f:
+                annotations = json.load(f)
+            
+            # Create composite mask
+            for frame_anns in annotations['masklet']:
+                for rle in frame_anns:
+                    composite_mask |= coco_mask.decode(rle)
+        except:
+            pass
+            
+        # Get first frame for context
+        mp4_path = os.path.join(video_dir, f"{video_id}.mp4")
+        frames = decode_video(mp4_path)
+        
+        return self._generate_caption(frames[0], composite_mask)
+
+    
 # # Usage Example
 # if __name__ == "__main__":
 #     # Load dataset from text files

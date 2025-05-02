@@ -2,7 +2,7 @@
 import torch
 from torch.utils.data import DataLoader
 from data.custom400m import get_laion_test_dataset, adaptive_collate
-from data.segmentation import SAM_adaptive_collate, SAV_adaptive_collate, SA1BDataset, SAVDataset
+from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 import argparse
 import time
 import os
@@ -206,7 +206,7 @@ def main():
             root_dir="./data",
             file_list=sav_files,
             build_index=False,
-            verify_files=False
+            caption_strategy='video'
         )
         
         # Restore cached state
@@ -217,10 +217,9 @@ def main():
         # Create dataset WITH index building
         sav_dataset = SAVDataset(
             root_dir="./data", 
-            text_processor=CLIPTokenize, 
             file_list=sav_files,
             build_index=True,
-            verify_files=True
+            caption_strategy='video'
         )
         # Save cache
         print("\nCaching dataset...")

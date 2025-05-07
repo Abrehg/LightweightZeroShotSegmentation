@@ -19,68 +19,162 @@ def iou_loss(pred_masks, true_masks):
     return (1.0 - iou).mean()
 
 class DistilledMemoryStudent(nn.Module):
-    def __init__(self, 
-                 text_embed_dim=256,
-                 image_embed_dim=128,
-                 num_layers=4,
-                 memory_queue_len=15):  # Added memory_queue_len
+    def __init__(self,
+                 vocab_size=49408,
+                 text_seq_len=77,
+                 text_embed_dim=128,
+                 text_transformer_layers=2,
+                 text_transformer_heads=4,
+                 image_input_channels=3,
+                 image_feature_dim=128,
+                 output_mask_channels=1, 
+                 fixed_intermediate_spatial_size=(8, 8), 
+                 max_memory_length=15):
         super().__init__()
 
-        self.token_embed = nn.Embedding(49408, text_embed_dim)
-        self.pos_embed = nn.Embedding(512, text_embed_dim)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=text_embed_dim,
-                nhead=8,
-                dim_feedforward=4*text_embed_dim
-            ),
-            num_layers=num_layers
+        self.text_embed_dim = text_embed_dim
+        self.image_feature_dim = image_feature_dim
+        self.max_memory_length = max_memory_length
+        self.fixed_intermediate_H, self.fixed_intermediate_W = fixed_intermediate_spatial_size
+        
+        # --- Text Encoder ---
+        self.token_embed = nn.Embedding(vocab_size, text_embed_dim)
+        self.pos_embed = nn.Parameter(torch.randn(1, text_seq_len, text_embed_dim)) 
+        
+        transformer_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=text_embed_dim,
+            nhead=text_transformer_heads,
+            dim_feedforward=text_embed_dim * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True
         )
+        self.text_transformer = nn.TransformerEncoder(
+            encoder_layer=transformer_encoder_layer,
+            num_layers=text_transformer_layers
+        )
+
+        # --- Image Encoder ---
         self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            # Layer 1: HxW -> H/2 x W/2
+            nn.Conv2d(image_input_channels, 32, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 32), 
             nn.GELU(),
+            # Layer 2: H/2 x W/2 -> H/4 x W/4
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(16, 64),
             nn.GELU(),
-            nn.Conv2d(64, image_embed_dim, kernel_size=3, stride=2, padding=1),
+            # Layer 3: H/4 x W/4 -> H/8 x W/8
+            nn.Conv2d(64, image_feature_dim, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(min(16, image_feature_dim // 4 if image_feature_dim >=4 else image_feature_dim), image_feature_dim), 
+            nn.GELU()
         )
+        
+        # Adaptive pooling to resize image features to a fixed spatial size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(fixed_intermediate_spatial_size)
+
+        # --- Mask Decoder ---
+        combined_feature_dim = image_feature_dim + text_embed_dim
+        decoder_output_H = self.fixed_intermediate_H * (2**3) 
+        decoder_output_W = self.fixed_intermediate_W * (2**3)
+
         self.mask_decoder = nn.Sequential(
-            nn.ConvTranspose2d(text_embed_dim + image_embed_dim, 64, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(combined_feature_dim, 128, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(min(16, 128 // 4), 128),
             nn.GELU(),
-            nn.ConvTranspose2d(64, 1, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(min(16, 64 // 4), 64),
+            nn.GELU(),
+            nn.ConvTranspose2d(64, output_mask_channels, kernel_size=4, stride=2, padding=1)
         )
-        self.memory_queue_len = memory_queue_len
-        self.memory_queue = torch.zeros(memory_queue_len, 1, text_embed_dim + image_embed_dim) # Initialize with zeros
+        
+        # --- Memory Queue ---
+        initial_memory_queue = torch.zeros(
+            self.max_memory_length,
+            combined_feature_dim,
+            self.fixed_intermediate_H,
+            self.fixed_intermediate_W
+        )
+        self.register_buffer('memory_queue', initial_memory_queue, persistent=False) # persistent=False if re-init in forward
+        
         self.teacher = None
 
-    def forward(self, images, text):
-        if images.ndim == 3:  # Image input (C, H, W)
-            images = images.unsqueeze(0)
+    def forward(self, images, text_tokens):
+        """
+        Args:
+            images (torch.Tensor): Input image frames, shape [T, C, H, W] 
+                                   H and W can be variable.
+            text_tokens (torch.Tensor): Input text tokens, shape [1, S] (e.g., [1, 77])
+        Returns:
+            torch.Tensor: Output masks, shape [T, output_mask_channels, H_original, W_original]
+        """
+        if images.ndim == 3: 
+            images = images.unsqueeze(0) 
         
-        T, C, H, W = images.shape
-        masks = []
+        num_frames = images.shape[0]
+        original_H, original_W = images.shape[-2:] 
+        current_device = images.device
 
-        text_embeds = self.token_embed(text)
-        text_embeds = text_embeds + self.pos_embed(torch.arange(text_embeds.size(1), device=text_embeds.device))
-        text_embeds = self.transformer(text_embeds)
+        print(f"Input image shape: {images.shape}")
+        print(f"Input text shape: {text_tokens.shape}")
 
-        for t in range(T):
-            image = images[t]
-            image_embeds = self.image_encoder(image)
-            image_embeds = F.interpolate(image_embeds, size=text_embeds.shape[1], mode='bilinear', align_corners=False)
+        #Re-initialize memory queue at the start of each forward call for statelessness between sequences.
+        if self.max_memory_length > 0:
+            self.memory_queue = torch.zeros(
+                self.max_memory_length,
+                self.image_feature_dim + self.text_embed_dim,
+                self.fixed_intermediate_H,
+                self.fixed_intermediate_W,
+                device=current_device
+            )
+
+        print(f"Input memory shape: {self.memory_queue.shape}")
+
+        # --- Process Text (once for all frames) ---
+        text_embeds = self.token_embed(text_tokens)  # [1, S, text_embed_dim]
+        text_embeds = text_embeds + self.pos_embed[:, :text_tokens.size(1), :]
+        text_features_seq = self.text_transformer(text_embeds) # [1, S, text_embed_dim]
+        text_features_global = text_features_seq.mean(dim=1) # [1, text_embed_dim]
+
+        output_masks = []
+        for t in range(num_frames):
+            current_frame = images[t].unsqueeze(0) # [1, C, H_original, W_original]
+
+            # --- Process Image Frame ---
+            image_frame_features_raw = self.image_encoder(current_frame) 
+            pooled_image_features = self.adaptive_pool(image_frame_features_raw)
+
+            # --- Fuse Text and Image Features for the current frame ---
+            text_features_spatial = text_features_global.unsqueeze(-1).unsqueeze(-1)
+            text_features_expanded = text_features_spatial.expand(
+                -1, -1, self.fixed_intermediate_H, self.fixed_intermediate_W
+            )
             
-            # Concatenate text and image embeddings
-            frame_embeds = torch.cat([text_embeds, image_embeds], dim=0)
+            # current_combined_features shape: [1, combined_dim, fixed_intermediate_H, fixed_intermediate_W]
+            current_combined_features = torch.cat([pooled_image_features, text_features_expanded], dim=1)
+
+            # --- Update Memory Queue (LIFO) ---
+            if self.max_memory_length > 0:
+                # memory_queue is [max_len, C_mem, H_fixed, W_fixed]
+                self.memory_queue = torch.cat((self.memory_queue[1:], current_combined_features), dim=0)
+                features_for_decoder = self.memory_queue.mean(dim=0, keepdim=True)
+            else: # No memory
+                features_for_decoder = current_combined_features
+
+            # --- Decode to Mask (Intermediate Fixed Size) ---
+            mask_pred_intermediate = self.mask_decoder(features_for_decoder)
             
-            # Use memory queue
-            decoder_input = torch.cat([frame_embeds.unsqueeze(0), self.memory_queue], dim=0).permute(1, 0, 2) # Prepend current frame embeds
+            # --- Interpolate to Original Frame Size ---
+            mask_pred_final = F.interpolate(
+                mask_pred_intermediate, 
+                size=(original_H, original_W), 
+                mode='bilinear', 
+                align_corners=False
+            )
+            output_masks.append(mask_pred_final.squeeze(0))
 
-            mask = self.mask_decoder(decoder_input[:, 0]).unsqueeze(0)
-            masks.append(mask)
-
-            # Update memory queue
-            self.memory_queue = torch.cat([self.memory_queue[1:], frame_embeds.unsqueeze(0)], dim=0)
-
-        return torch.stack(masks, dim=0).unsqueeze(1)
+        final_masks = torch.stack(output_masks, dim=0)
+        return final_masks
 
     def register_teacher(self, teacher_model):
         """Register teacher model for co-distillation"""

@@ -4,18 +4,18 @@ import os
 from torch.utils.data import DataLoader
 from data.custom400m import get_laion_streaming_dataset, adaptive_collate
 import argparse
-from models.clip_model import create_text_encoder, CLIPTokenize
 from models.prior_model import create_prior
 from models.SAM_model import VideoSAM, iou_loss
 from models.distill_model import DistilledMemoryStudent
 import time
-from data.segmentation import SAM_adaptive_collate, SAV_adaptive_collate, SA1BDataset, SAVDataset
+from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
+from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
 
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
     "CLIP_EPOCHS": 1,#10,
     "PRIOR_EPOCHS": 1,#10,
-    "TEACHER_STUDENT_EPOCHS": 10,
+    "TEACHER_STUDENT_EPOCHS": 1,#10,
     "CLIP_LR": 0.0001,
     "PRIOR_LR": 0.0001,
     "DECODER_LR": 0.0001,
@@ -31,7 +31,6 @@ device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 # ======== CLIP Training ========
 def train_clip(hf_token):
     print("\n=== Training CLIP ===")
-    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
     
     # Initialize components
     text_encoder = create_text_encoder()
@@ -92,9 +91,6 @@ def train_clip(hf_token):
 # ======== Prior Training ========
 def train_prior(hf_token):
     print("\n=== Training Prior ===")
-    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize
-    from models.prior_model import create_prior
-    
     # Load frozen CLIP
     text_encoder = create_text_encoder()
     image_encoder = create_image_encoder()
@@ -173,10 +169,6 @@ def train_prior(hf_token):
 
 def train_SAM_decoder(dataloader):
     print("\n[Teacher Training] Initializing Teacher Model...")
-    from models.clip_model import create_text_encoder
-    from models.prior_model import create_prior
-    from models.SAM_model import VideoSAM, iou_loss
-
     class TeacherModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -216,6 +208,7 @@ def train_SAM_decoder(dataloader):
     for batch in dataloader:
         if batch is None:
             continue
+
         images, true_masks, texts = batch
 
         losses = []
@@ -223,17 +216,20 @@ def train_SAM_decoder(dataloader):
         optimizer_teacher.zero_grad()
 
         for img, mask, txt in zip(images, true_masks, texts):
-        
-            # Process individual samples but maintain gradients
             mask = mask.to(device).float()
             img = img.to(device)
             txt = txt.to(device)
+
+            print(f"Resized image: {img.shape}")
+            print(f"Resized mask: {mask.shape}")
 
             with torch.autograd.detect_anomaly():
                 # Forward pass
                 text_emb = teacher.text_encoder(txt)
                 prior_emb = teacher.prior(text_emb)
                 pred_mask = teacher.sam_decoder(img, prior_emb)
+
+                print(f"Output mask: {mask.shape}")
 
                 loss = iou_loss(pred_mask, mask)
                 loss.backward()
@@ -249,8 +245,6 @@ def train_SAM_decoder(dataloader):
         print(f"Saved SAM Decoder checkpoint to {ckpt_path}")
 
 def train_student(dataloader):
-    from models.distill_model import DistilledMemoryStudent
-
     class TeacherModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -277,11 +271,11 @@ def train_student(dataloader):
     teacher.text_encoder.load_state_dict(torch.load(text_ckpt))
     teacher.prior.load_state_dict(torch.load(prior_ckpt))
 
-    # # Freeze text_encoder and prior
-    # for param in teacher.text_encoder.parameters():
-    #     param.requires_grad_(False)
-    # for param in teacher.prior.parameters():
-    #     param.requires_grad_(False)
+    # Freeze text_encoder and prior
+    for param in teacher.text_encoder.parameters():
+        param.requires_grad_(False)
+    for param in teacher.prior.parameters():
+        param.requires_grad_(False)
 
     print("\n[Joint Training] Initializing Student...")
     student = DistilledMemoryStudent().to(device)
@@ -307,15 +301,14 @@ def train_student(dataloader):
             optimizer_student.zero_grad()
 
             for img, mask, txt in zip(images, true_masks, texts):
-                # Process individual samples but maintain gradients
+
                 mask = mask.to(device).float()
-                img = img.to(device)  # Add batch dimension
+                img = img.to(device)
                 txt = txt.to(device)
 
                 with torch.autograd.detect_anomaly():
                     # Forward pass
                     teacher_out = teacher(img, txt)
-
                     student_out = student(img, txt)
 
                     # Compute losses
@@ -355,25 +348,19 @@ def main(hf_token):
     """Central training orchestration function"""
     # Create checkpoint directory
     os.makedirs(HYPERPARAMS["CHECKPOINT_DIR"], exist_ok=True)
-    
-    # Phase 1: CLIP training
-    print("\n🚀 Starting CLIP Training Phase")
-    train_clip(hf_token)
-    
-    # Phase 2: Prior training
-    print("\n🚀 Starting Prior Training Phase")
-    train_prior(hf_token)
 
-    # Phase 3: Mixed Dataset loading
+    # Phase 1: Mixed Dataset loading
     def load_file_list(file_path):
         with open(file_path) as f:
             return [line.strip().split('\t') for line in f.readlines()[1:]]
-        
-    print("Initializing SA-1B dataset")
-    sa1b_files = load_file_list("data/Datasets/SA-1B_dataset.txt")
-    sav_files = load_file_list("data/Datasets/SA-V_dataset.txt")
 
-    CACHE_PATH = "dataset_cache.pth"
+    print("Initializing SA-1B dataset")
+    sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
+
+    print("Initializing SA-V dataset")
+    sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
+
+    CACHE_PATH = "img_dataset_cache.pth"
 
     # Try loading cached dataset FIRST
     if os.path.exists(CACHE_PATH):
@@ -417,10 +404,9 @@ def main(hf_token):
         
         # Create dataset WITHOUT building index
         sav_dataset = SAVDataset(
-            root_dir="./data", 
-            text_processor=CLIPTokenize, 
+            root_dir="./data",
             file_list=sav_files,
-            build_index=False,  # Skip index building
+            build_index=False,
             verify_files=False
         )
         
@@ -432,7 +418,6 @@ def main(hf_token):
         # Create dataset WITH index building
         sav_dataset = SAVDataset(
             root_dir="./data", 
-            text_processor=CLIPTokenize, 
             file_list=sav_files,
             build_index=True,
             verify_files=True
@@ -451,12 +436,20 @@ def main(hf_token):
                             num_workers=1, 
                             collate_fn=SAM_adaptive_collate, 
                             pin_memory=True)
+    
+    # Phase 2: CLIP training
+    print("\n🚀 Starting CLIP Training Phase")
+    train_clip(hf_token)
+    
+    # Phase 3: Prior training
+    print("\n🚀 Starting Prior Training Phase")
+    train_prior(hf_token)
 
-    # Phase 3: SAM Decoder training
+    # Phase 4: SAM Decoder training
     print("\n🚀 Starting SAM Decoder Training Phase")
     train_SAM_decoder(dataloader)
 
-    # Phase 4: Student training
+    # Phase 5: Student training
     print("\n🚀 Starting Student Training Phase")
     train_student(dataloader)
     

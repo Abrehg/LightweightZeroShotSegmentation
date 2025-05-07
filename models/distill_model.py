@@ -115,9 +115,6 @@ class DistilledMemoryStudent(nn.Module):
         original_H, original_W = images.shape[-2:] 
         current_device = images.device
 
-        print(f"Input image shape: {images.shape}")
-        print(f"Input text shape: {text_tokens.shape}")
-
         #Re-initialize memory queue at the start of each forward call for statelessness between sequences.
         if self.max_memory_length > 0:
             self.memory_queue = torch.zeros(
@@ -127,8 +124,6 @@ class DistilledMemoryStudent(nn.Module):
                 self.fixed_intermediate_W,
                 device=current_device
             )
-
-        print(f"Input memory shape: {self.memory_queue.shape}")
 
         # --- Process Text (once for all frames) ---
         text_embeds = self.token_embed(text_tokens)  # [1, S, text_embed_dim]

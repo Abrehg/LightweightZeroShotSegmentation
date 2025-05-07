@@ -225,8 +225,8 @@ class SA1BDataset(BaseTarDataset):
             caption = CLIPTokenize(caption)
             caption = caption.squeeze(1)
 
-            image = image.unsqueeze(0).unsqueeze(0)
-            mask = mask.unsqueeze(0).unsqueeze(0)
+            image = image.unsqueeze(0)
+            mask = mask.unsqueeze(0)
                 
         return image, mask, caption
     

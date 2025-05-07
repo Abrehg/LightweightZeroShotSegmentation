@@ -109,7 +109,7 @@ def main():
 
     # Test Segmentation training
     print("\n[Teacher Training] Initializing Teacher Model...")
-    from models.clip_model import create_text_encoder, CLIPTokenize
+    from models.clip_model import create_text_encoder
     from models.prior_model import create_prior
     from models.SAM_model import VideoSAM, iou_loss
     
@@ -223,7 +223,7 @@ def main():
             'available_files': sav_dataset.available_files
         }, VIDEO_CACHE_PATH)
 
-    # combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
+    combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
     dataloader = DataLoader(sav_dataset, 
                             batch_size=1, 
                             shuffle=True, 
@@ -231,85 +231,85 @@ def main():
                             collate_fn=SAM_adaptive_collate, 
                             pin_memory=True)
 
-    # # Train teacher only
-    # print("[Teacher Training] Training SAM decoder...")
-    # optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=0.001)
+    # Train teacher only
+    print("[Teacher Training] Training SAM decoder...")
+    optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=0.001)
 
-    # for batch in dataloader:
-    #     if batch is None:
-    #         continue
+    for batch in dataloader:
+        if batch is None:
+            continue
 
-    #     images, true_masks, texts = batch
+        images, true_masks, texts = batch
 
-    #     target_size = 256
+        target_size = 256
+        vid_target_size = 64
 
-    #     losses = []
-    #     import torchvision.transforms.functional as F
+        losses = []
+        import torchvision.transforms.functional as F
 
-    #     optimizer_teacher.zero_grad()
+        optimizer_teacher.zero_grad()
 
-    #     for img, mask, txt in zip(images, true_masks, texts):
-    #         # # Image resizing
-    #         # # Get original dimensions
-    #         # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+        for img, mask, txt in zip(images, true_masks, texts):
+            # Image resizing
+            # Get original dimensions
+            print(f"Image shape: {img.shape}")
+            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
         
-    #         # # Calculate new size while preserving aspect ratio
-    #         # scale = target_size / max(H, W)
-    #         # new_H, new_W = int(H * scale), int(W * scale)
+            # # Calculate new size while preserving aspect ratio
+            # scale = target_size / max(H, W)
+            # new_H, new_W = int(H * scale), int(W * scale)
         
-    #         # # Resize image with bilinear interpolation
-    #         # resized_img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+            # # Resize image with bilinear interpolation
+            # img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
         
-    #         # # Resize mask with nearest neighbor (preserve integer labels)
-    #         # resized_mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
+            # # Resize mask with nearest neighbor (preserve integer labels)
+            # mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
+
+            # # Video resizing
+            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
         
-    #         # # Process individual samples but maintain gradients
-    #         # mask = resized_mask
-    #         # img = resized_img
+            # # Calculate new size while preserving aspect ratio
+            # scale = vid_target_size / max(H, W)
+            # new_H, new_W = int(H * scale), int(W * scale)
+            # resized_img = []
+            # resized_mask = []
+            # for i in range(img.shape[1]):
+            #     resized_img.append(F.resize(img[i], [new_H, new_W]))  # [T, C, H, W]
+            #     resized_mask.append(F.resize(mask[i], [new_H, new_W],
+            #                     interpolation=F.InterpolationMode.NEAREST))  # [T, 1, H, W]
 
-    #         # Video resizing
-    #         new_size = [64, 64]
-    #         resized_img = []
-    #         resized_mask = []
-    #         for i in range(img.shape[1]):
-    #             resized_img.append(F.resize(img[i], new_size))  # [T, C, H, W]
-    #             resized_mask.append(F.resize(mask[i], new_size,
-    #                             interpolation=F.InterpolationMode.NEAREST))  # [T, 1, H, W]
+            # img = torch.stack(resized_img, dim=0)
+            # mask = torch.stack(resized_mask, dim=0)
 
-    #         img = torch.stack(resized_img, dim=0)
-    #         mask = torch.stack(resized_mask, dim=0)
+            mask = mask.to(device).float()
+            img = img.to(device)
+            txt = txt.to(device)
 
-    #         mask = mask.to(device).float()
-    #         img = img.to(device)
-    #         txt = txt.to(device)
+            print(f"Resized image: {img.shape}")
+            print(f"Resized mask: {mask.shape}")
 
-    #         with torch.autograd.detect_anomaly():
-    #             # Forward pass
-    #             text_emb = teacher.text_encoder(txt)
-    #             prior_emb = teacher.prior(text_emb)
-    #             pred_mask = teacher.sam_decoder(img, prior_emb)
+            with torch.autograd.detect_anomaly():
+                # Forward pass
+                text_emb = teacher.text_encoder(txt)
+                prior_emb = teacher.prior(text_emb)
+                pred_mask = teacher.sam_decoder(img, prior_emb)
 
-    #             loss = iou_loss(pred_mask, mask)
-    #             loss.backward()
-    #             losses.append(loss.item())
+                print(f"Output mask: {mask.shape}")
+
+                loss = iou_loss(pred_mask, mask)
+                loss.backward()
+                losses.append(loss.item())
         
-    #     optimizer_teacher.step()
+        optimizer_teacher.step()
 
-    #     print(f"Teacher Training Loss: {sum(losses)/len(losses):.4f}")
-    #     break
+        print(f"Teacher Training Loss: {sum(losses)/len(losses):.4f}")
+        break
 
     from models.distill_model import DistilledMemoryStudent
 
     print("\n[Joint Training] Initializing Student...")
     student = DistilledMemoryStudent().to(device)
     student.register_teacher(teacher)
-
-    if torch.backends.mps.is_available():
-        from torch.mps import empty_cache
-        empty_cache()
-    
-    import psutil
-    print(f"Available RAM: {psutil.virtual_memory().available / 1e9:.1f} GB")
 
     # Separate optimizers
     optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=0.0001)  # Teacher LR
@@ -324,19 +324,19 @@ def main():
         images, true_masks, texts = batch
 
         target_size = 256
+        vid_target_size = 64
 
         teacher_losses = []
         student_losses = []
 
-        from torchvision.transforms import Resize
         import torchvision.transforms.functional as F
 
         optimizer_teacher.zero_grad()
         optimizer_student.zero_grad()
 
         for img, mask, txt in zip(images, true_masks, texts):
-            # # Image resizing
-            # # Get original dimensions
+            # Image resizing
+            # Get original dimensions
             # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
         
             # # Calculate new size while preserving aspect ratio
@@ -344,39 +344,38 @@ def main():
             # new_H, new_W = int(H * scale), int(W * scale)
         
             # # Resize image with bilinear interpolation
-            # resized_img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+            # img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
         
             # # Resize mask with nearest neighbor (preserve integer labels)
-            # resized_mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
+            # mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
         
-            # # Process individual samples but maintain gradients
-            # mask = resized_mask
-            # img = resized_img
 
-            # Video resizing
-            new_size = (64, 64)
-            img = F.resize(img, new_size)  # [T, C, H, W]
-            mask = F.resize(mask, new_size,
-                            interpolation=F.InterpolationMode.NEAREST)  # [T, 1, H, W]
-
-            print(f"Resized image shape: {img.shape}")  # Should be [T, 3, 64, 64]
-            print(f"Resized mask shape: {mask.shape}")  # Should be [T, 1, 64, 64]
+            # # Video resizing
+            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+        
+            # # Calculate new size while preserving aspect ratio
+            # scale = vid_target_size / max(H, W)
+            # new_H, new_W = int(H * scale), int(W * scale)
+            # resized_img = []
+            # resized_mask = []
+            # for i in range(img.shape[1]):
+            #     resized_img.append(F.resize(img[i], [new_H, new_W]))  # [T, C, H, W]
+            #     resized_mask.append(F.resize(mask[i], [new_H, new_W],
+            #                     interpolation=F.InterpolationMode.NEAREST))  # [T, 1, H, W]
 
             mask = mask.to(device).float()
             img = img.to(device)
             txt = txt.to(device)
 
+            print(f"Resized image: {img.shape}")
+            print(f"Resized mask: {mask.shape}")
+
             with torch.autograd.detect_anomaly():
                 # Forward pass
-                print(f"Input shape: {img.shape}")
                 teacher_out = teacher(img, txt)
-
-                print(f"Teacher Output shape: {teacher_out.shape}")
-
+                print(f"Teacher Output mask: {teacher_out.shape}")
                 student_out = student(img, txt)
-
-                print(f"Student Output shape: {student_out.shape}")
-                print(f"Target Mask shape: {mask.shape}")
+                print(f"Student Output mask: {student_out.shape}")
 
                 # Compute losses
                 teacher_loss = iou_loss(teacher_out, mask)

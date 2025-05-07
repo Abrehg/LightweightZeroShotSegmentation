@@ -5,6 +5,7 @@ from data.custom400m import get_laion_test_dataset, adaptive_collate
 from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 import argparse
 import time
+from torchinfo import summary
 import os
 
 parser = argparse.ArgumentParser(description="Load LAION-400M dataset from Hugging Face.")
@@ -116,13 +117,6 @@ def main():
     device = torch.device('cpu')
     print(f"\nUsing device: {device}\n")
 
-    if torch.backends.mps.is_available():
-        from torch.mps import empty_cache
-        empty_cache()
-
-    import psutil
-    print(f"Available RAM: {psutil.virtual_memory().available / 1e9:.1f} GB")
-
     class TeacherModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -151,50 +145,51 @@ def main():
     print("Initializing SA-1B dataset")
     sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
 
+    print("Initializing SA-V dataset")
     sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
 
-    # CACHE_PATH = "dataset_cache.pth"
+    CACHE_PATH = "img_dataset_cache.pth"
 
     # if os.path.exists(CACHE_PATH):
     #     os.remove(CACHE_PATH)
 
-    # # Try loading cached dataset FIRST
-    # if os.path.exists(CACHE_PATH):
-    #     print("\nLoading cached dataset...")
-    #     start = time.time()
-    #     cache = torch.load(CACHE_PATH)
+    # Try loading cached dataset FIRST
+    if os.path.exists(CACHE_PATH):
+        print("\nLoading cached dataset...")
+        start = time.time()
+        cache = torch.load(CACHE_PATH)
         
-    #     # Create dataset WITHOUT building index
-    #     sa1b_dataset = SA1BDataset(
-    #         root_dir="./data", 
-    #         file_list=sa1b_files,
-    #         build_index=False,
-    #         verify_files=False
-    #     )
+        # Create dataset WITHOUT building index
+        sa1b_dataset = SA1BDataset(
+            root_dir="./data", 
+            file_list=sa1b_files,
+            build_index=False,
+            verify_files=False
+        )
         
-    #     # Restore cached state
-    #     sa1b_dataset.samples = cache['samples']
-    #     sa1b_dataset.available_files = cache['available_files']
-    #     print(f"Loaded cached dataset in {time.time()-start:.1f}s")
-    # else:
-    #     # Create dataset WITH index building
-    #     sa1b_dataset = SA1BDataset(
-    #         root_dir="./data",
-    #         file_list=sa1b_files,
-    #         build_index=True,
-    #         verify_files=True
-    #     )
-    #     # Save cache
-    #     print("\nCaching dataset...")
-    #     torch.save({
-    #         'samples': sa1b_dataset.samples,
-    #         'available_files': sa1b_dataset.available_files
-    #     }, CACHE_PATH)
+        # Restore cached state
+        sa1b_dataset.samples = cache['samples']
+        sa1b_dataset.available_files = cache['available_files']
+        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
+    else:
+        # Create dataset WITH index building
+        sa1b_dataset = SA1BDataset(
+            root_dir="./data",
+            file_list=sa1b_files,
+            build_index=True,
+            verify_files=True
+        )
+        # Save cache
+        print("\nCaching dataset...")
+        torch.save({
+            'samples': sa1b_dataset.samples,
+            'available_files': sa1b_dataset.available_files
+        }, CACHE_PATH)
 
     VIDEO_CACHE_PATH = "video_dataset_cache.pth"
 
-    if os.path.exists(VIDEO_CACHE_PATH):
-        os.remove(VIDEO_CACHE_PATH)
+    # if os.path.exists(VIDEO_CACHE_PATH):
+    #     os.remove(VIDEO_CACHE_PATH)
 
     if os.path.exists(VIDEO_CACHE_PATH):
         print("\nLoading cached dataset...")
@@ -206,7 +201,7 @@ def main():
             root_dir="./data",
             file_list=sav_files,
             build_index=False,
-            caption_strategy='video'
+            verify_files=False
         )
         
         # Restore cached state
@@ -219,7 +214,7 @@ def main():
             root_dir="./data", 
             file_list=sav_files,
             build_index=True,
-            caption_strategy='video'
+            verify_files=True
         )
         # Save cache
         print("\nCaching dataset...")
@@ -228,7 +223,7 @@ def main():
             'available_files': sav_dataset.available_files
         }, VIDEO_CACHE_PATH)
 
-    #combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
+    # combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
     dataloader = DataLoader(sav_dataset, 
                             batch_size=1, 
                             shuffle=True, 
@@ -255,23 +250,38 @@ def main():
         optimizer_teacher.zero_grad()
 
         for img, mask, txt in zip(images, true_masks, texts):
+            # # Image resizing
+            # # Get original dimensions
+            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+        
+            # # Calculate new size while preserving aspect ratio
+            # scale = target_size / max(H, W)
+            # new_H, new_W = int(H * scale), int(W * scale)
+        
+            # # Resize image with bilinear interpolation
+            # resized_img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+        
+            # # Resize mask with nearest neighbor (preserve integer labels)
+            # resized_mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
+        
+            # # Process individual samples but maintain gradients
+            # mask = resized_mask
+            # img = resized_img
 
-            # Get original dimensions
-            C, H, W = img[0].shape[-3], img[0].shape[-2], img[0].shape[-1]
-        
-            # Calculate new size while preserving aspect ratio
-            scale = target_size / max(H, W)
-            new_H, new_W = int(H * scale), int(W * scale)
-        
-            # Resize image with bilinear interpolation
-            resized_img = F.resize(img[0], [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
-        
-            # Resize mask with nearest neighbor (preserve integer labels)
-            resized_mask = F.resize(mask[0], [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
-        
-            # Process individual samples but maintain gradients
-            mask = resized_mask.unsqueeze(0).to(device).float()
-            img = resized_img.unsqueeze(0).to(device)  # Add batch dimension
+            # Video resizing
+            new_size = [64, 64]
+            resized_img = []
+            resized_mask = []
+            for i in range(img.shape[1]):
+                resized_img.append(F.resize(img[i], new_size))  # [T, C, H, W]
+                resized_mask.append(F.resize(mask[i], new_size,
+                                interpolation=F.InterpolationMode.NEAREST))  # [T, 1, H, W]
+            
+            img = torch.stack(resized_img)
+            mask = torch.stack(resized_mask)
+
+            mask = mask.to(device).float()
+            img = img.to(device)
             txt = txt.to(device)
 
             with torch.autograd.detect_anomaly():
@@ -279,6 +289,8 @@ def main():
                 text_emb = teacher.text_encoder(txt)
                 prior_emb = teacher.prior(text_emb)
                 pred_mask = teacher.sam_decoder(img, prior_emb)
+
+                print(f"Output shape: {pred_mask.shape}")
 
                 loss = iou_loss(pred_mask, mask)
 
@@ -329,23 +341,38 @@ def main():
         optimizer_student.zero_grad()
 
         for img, mask, txt in zip(images, true_masks, texts):
+            # # Image resizing
+            # # Get original dimensions
+            # C, H, W = img[0].shape[-3], img[0].shape[-2], img[0].shape[-1]
+        
+            # # Calculate new size while preserving aspect ratio
+            # scale = target_size / max(H, W)
+            # new_H, new_W = int(H * scale), int(W * scale)
+        
+            # # Resize image with bilinear interpolation
+            # resized_img = F.resize(img[0], [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+        
+            # # Resize mask with nearest neighbor (preserve integer labels)
+            # resized_mask = F.resize(mask[0], [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
+        
+            # # Process individual samples but maintain gradients
+            # mask = resized_mask.unsqueeze(0)
+            # img = resized_img.unsqueeze(0)
 
-            # Get original dimensions
-            C, H, W = img[0].shape[-3], img[0].shape[-2], img[0].shape[-1]
-        
-            # Calculate new size while preserving aspect ratio
-            scale = target_size / max(H, W)
-            new_H, new_W = int(H * scale), int(W * scale)
-        
-            # Resize image with bilinear interpolation
-            resized_img = F.resize(img[0], [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
-        
-            # Resize mask with nearest neighbor (preserve integer labels)
-            resized_mask = F.resize(mask[0], [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
-        
-            # Process individual samples but maintain gradients
-            mask = resized_mask.unsqueeze(0).to(device).float()
-            img = resized_img.unsqueeze(0).to(device)  # Add batch dimension
+            # Video resizing
+            new_size = (64, 64)
+            img = F.resize(img, new_size)  # [T, C, H, W]
+            mask = F.resize(mask, new_size,
+                            interpolation=F.InterpolationMode.NEAREST)  # [T, 1, H, W]
+
+            print(f"Resized image shape: {img.shape}")  # Should be [T, 3, 64, 64]
+            print(f"Resized mask shape: {mask.shape}")  # Should be [T, 1, 64, 64]
+
+            img = img.unsqueeze(0)  # Add batch dimension [1, T, 3, 64, 64]
+            mask = mask.unsqueeze(0)  # Add batch dimension [1, T, 1, 64, 64]
+
+            mask = mask.to(device).float()
+            img = img.to(device)
             txt = txt.to(device)
 
             with torch.autograd.detect_anomaly():
@@ -379,6 +406,6 @@ def main():
         break
 
 if __name__ == "__main__":
-    torch.multiprocessing.freeze_support()  # Add this line
+    torch.multiprocessing.freeze_support()
     torch.manual_seed(42)
     main()

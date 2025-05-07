@@ -22,30 +22,26 @@ def iou_loss(pred_masks, true_masks):
     return 1.0 - iou.mean()
 
 class UnifiedPositionalEncoding(nn.Module):
-    def __init__(self, embed_dim=1024, max_frames=32, spatial_size=16):
+    def __init__(self, max_frames=32, spatial_size=16, embed_dim=512):
         super().__init__()
         self.temporal_enc = nn.Embedding(max_frames, embed_dim)
         self.spatial_enc = nn.Parameter(torch.randn(1, spatial_size, spatial_size, embed_dim))
-        self.frame_counter = nn.Parameter(torch.arange(max_frames), requires_grad=False)
+        self.max_frames = max_frames
         self.spatial_size = spatial_size
+        self.embed_dim = embed_dim
 
-    def forward(self, x: torch.Tensor):
-        B, T, C, H, W = x.shape
+    def forward(self, x: torch.Tensor, t: int):
+        C, H, W = x.shape
+
+        spatial = self.spatial_enc.permute(0, 3, 1, 2)
+        spatial = F.interpolate(spatial, size=(H, W), mode='bilinear', align_corners=False).squeeze(0)
         
-        # Reshape and interpolate spatial encoding
-        spatial = self.spatial_enc.permute(0, 3, 1, 2)  # (1, C, S, S)
-        spatial = F.interpolate(spatial, size=(H, W), mode='bilinear', align_corners=False)
-        spatial = spatial.permute(0, 2, 3, 1).unsqueeze(1)  # (1, 1, H, W, C)
-        spatial = spatial.expand(B, T, -1, -1, -1)  # (B, T, H, W, C)
-        
-        # Temporal encoding
-        time_ids = self.frame_counter[:T].unsqueeze(0).expand(B, -1)
-        temporal = self.temporal_enc(time_ids).view(B, T, 1, 1, C)
-        
-        # Align dimensions and add
-        x = x.permute(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+        time_id = torch.tensor([t], device=x.device)
+        time_id = torch.clamp(time_id, 0, self.max_frames - 1)
+        temporal = self.temporal_enc(time_id).view(self.embed_dim, 1, 1).expand(-1, H, W)
+
         x = x + spatial + temporal
-        return x.permute(0, 1, 4, 2, 3)  # Back to (B, T, C, H, W)
+        return x
 
 class AdaptiveVisionEncoder(nn.Module):
     """Resolution-agnostic image encoder with dynamic spatial processing"""
@@ -53,20 +49,17 @@ class AdaptiveVisionEncoder(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         
-        # Resolution-independent stem
         self.stem = nn.Sequential(
             nn.Conv2d(3, base_channels, 3, stride=2, padding=1),
             nn.GroupNorm(8, base_channels),
             nn.GELU()
         )
         
-        # Resolution-adaptive blocks
         self.blocks = nn.ModuleList([
             self._make_ds_block(base_channels, base_channels*2, stride=2),
             self._make_ds_block(base_channels*2, base_channels*4, stride=2),
             self._make_ds_block(base_channels*4, embed_dim, stride=1),
             
-            # Atrous spatial pyramid components
             nn.Sequential(
                 nn.Conv2d(embed_dim, embed_dim, 3, padding=2, dilation=2),
                 nn.GroupNorm(8, embed_dim),
@@ -79,10 +72,8 @@ class AdaptiveVisionEncoder(nn.Module):
             )
         ])
         
-        # Fix 1: Correct projection layer input channels
-        self.projection = nn.Conv2d(1920, embed_dim, 1)  # 128+256+512+512+512=1920
+        self.projection = nn.Conv2d(1920, embed_dim, 1)
         
-        # Dynamic spatial attention
         self.attn = nn.Sequential(
             nn.Conv2d(embed_dim, 1, 1),
             nn.Sigmoid()
@@ -100,106 +91,125 @@ class AdaptiveVisionEncoder(nn.Module):
         )
 
     def forward(self, x):
+        x = x.unsqueeze(0)
         x = self.stem(x)
         spatial_features = []
         
-        # Fix 2: Ensure features are collected before concatenation
         for block in self.blocks:
             x = block(x)
             spatial_features.append(x)
         
-        # Multi-scale fusion
         fused = torch.cat([
             F.interpolate(f, size=x.shape[-2:], mode='bilinear', align_corners=False)
             for f in spatial_features
-        ], dim=1)  # Concatenate along channels
+        ], dim=1)
         
-        # Fix 3: Apply projection after concatenation
-        x = self.projection(fused)  # Now input channels=1920
+        x = self.projection(fused)
         
-        # Attention-weighted fusion
         attn_weights = self.attn(x)
-        return x * attn_weights
+        output = x * attn_weights
+        return output.squeeze(0)
+
+class FrameTransformerDecoder(nn.Module):
+    def __init__(self, embed_dim=512, mem_size=10, num_layers=2, num_heads=8, memory_queue_len=15):
+        super().__init__()
+        self.mem_size = mem_size
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.memory_queue_len = memory_queue_len
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=2048, batch_first=True)
+            self.layers.append(layer)
+
+        self.mask_prediction = nn.Sequential(
+            nn.ConvTranspose2d(1, 64, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid(),
+            nn.ConvTranspose2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid(),
+            nn.ConvTranspose2d(128, 1, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, memory_queue: torch.Tensor, encoded: torch.Tensor, mask_tokens: torch.Tensor):
+        #  Input shapes:
+        #  - memory_queue:  [memory_queue_length, mem_size, embed_dim]  (e.g., [15, 10, 512])
+        #  - encoded:       [C, H_enc, W_enc]                         (e.g., [512, 14, 14])
+        #  - mask_tokens:   [num_mask_tokens, C]                         (e.g., [10, 512])
+
+        C, H_enc, W_enc = encoded.shape
+        num_mask_tokens = mask_tokens.shape[0]
+
+        #  Prepare encoded input for the decoder
+        encoded_in = encoded.unsqueeze(0).expand(self.memory_queue_len, self.mem_size, C, H_enc, W_enc)
+        encoded_in = encoded_in.reshape(self.memory_queue_len * self.mem_size, H_enc * W_enc, C)
+
+        #  Initialize decoder input using mask tokens
+        decoder_input = mask_tokens.unsqueeze(0).expand(self.memory_queue_len * self.mem_size, num_mask_tokens, -1)
+
+        #  Transformer Decoder layers
+        for layer in self.layers:
+            decoder_input = layer(decoder_input, encoded_in)
+
+        decoder_output = self.norm(decoder_input)
+        decoder_output_store = decoder_output.reshape(self.memory_queue_len, self.mem_size, num_mask_tokens, self.embed_dim)
+
+        #  Predict masks
+        decoder_output = decoder_output_store.mean(dim=0, keepdim=True)
+        decoder_output = decoder_output.permute(0, 3, 1, 2)
+        mask = torch.einsum("bcmn,chw->bhw", decoder_output, encoded)
+        final_mask = self.mask_prediction(mask)
+
+        final_mask = final_mask
+
+        #  Generate the next memory block
+        next_memory_block = decoder_output_store.mean(dim=(0, 1))
+        next_memory_block = next_memory_block.unsqueeze(0)
+
+        return final_mask, next_memory_block
 
 class VideoSAM(nn.Module):
-    def __init__(self, mem_size=5, num_transformers=6):
+    def __init__(self, embed_dim=512, patch_size=8, mem_size = 10, memory_queue_len=15):
         super().__init__()
-        self.image_encoder = AdaptiveVisionEncoder()
-        self.pos_enc = UnifiedPositionalEncoding(embed_dim=1024)
-        self.memory = nn.Parameter(torch.zeros(1, mem_size, 1024))
-        self.mem_size = mem_size
-        # Unified transformer
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=1024,
-                nhead=8,
-                dim_feedforward=2048,
-                batch_first=True,
-                activation='gelu',
-                dropout=0.1
-            ),
-            num_layers=1
-        )
+        self.image_encoder = AdaptiveVisionEncoder(embed_dim=embed_dim)
+        self.pos_enc = UnifiedPositionalEncoding(embed_dim=embed_dim, spatial_size=32)
+        self.mask_tokens = nn.Parameter(torch.zeros(mem_size, embed_dim))  # May be problematic
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.memory_queue_len = memory_queue_len
         
-        # Memory-enhanced decoder
-        self.decoder = nn.Sequential(
-            nn.Conv3d(1024, 256, kernel_size=(1,3,3), padding=(0,1,1)),
-            nn.GELU(),
-            nn.Conv3d(256, 128, kernel_size=(1,3,3), padding=(0,1,1)),
-            nn.GELU(),
-            nn.Conv3d(128, 1, kernel_size=1)
-        )
+        self.decoder = FrameTransformerDecoder(memory_queue_len=memory_queue_len)
 
     def forward(self, x: torch.Tensor, prior_emb: torch.Tensor):
-        if isinstance(x, list) or x.dim() == 5:  # Handle both list and tensor inputs
-            return self.process_batch(x, prior_emb)
-        else:
-            return self.process_single(x, prior_emb)
+        if len(x.shape) == 3: # Image input (C, H, W)
+            x = x.unsqueeze(0)
 
-    
-    def process_batch(self, x: torch.Tensor, prior_emb: torch.Tensor):
-        # Original batch processing logic
-        x = x.unsqueeze(1) if x.ndim == 4 else x  # (B, T, C, H, W)
-        B, T = x.shape[:2]
-        
-        encoded_flat = self.image_encoder(x.flatten(0, 1))
-        C_enc, H_enc, W_enc = encoded_flat.shape[1], encoded_flat.shape[2], encoded_flat.shape[3]
-        encoded = encoded_flat.view(B, T, C_enc, H_enc, W_enc)
-        
-        prior = prior_emb.view(B, 1, -1, 1, 1).expand(-1, T, -1, H_enc, W_enc)
-        encoded = torch.cat([encoded, prior], dim=2)
-        
-        encoded = self.pos_enc(encoded)
-        
-        tokens = encoded.flatten(3).permute(0, 1, 3, 2)
-        B, T, N, C = tokens.shape
-        tokens = tokens.reshape(B, T*N, C)
-        
-        memory = self.memory.expand(B, -1, -1).detach()
-        tokens = torch.cat([memory, tokens], dim=1)
-        
-        processed = self.transformer(tokens)
-        masks = processed[:, -T*N:].view(B, T, N, C)
-        masks = masks.view(B, T, H_enc, W_enc, C).permute(0, 4, 1, 2, 3)
-        masks = self.decoder(masks)
+        T, C_in, H, W = x.shape
+        H_enc = H // self.patch_size
+        W_enc = W // self.patch_size
 
-        B_dec, C_dec, T_dec, H_dec, W_dec = masks.shape
-        masks = masks.permute(0, 2, 1, 3, 4).reshape(-1, C_dec, H_dec, W_dec)
-        masks = F.interpolate(masks, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        masks = masks.view(B, T_dec, C_dec, x.shape[-2], x.shape[-1]).permute(0, 2, 1, 3, 4)
+        masks = []
         
-        if self.training:
-            new_memory = processed[:, :self.mem_size].mean(dim=0, keepdim=True)
-            self.memory = nn.Parameter(new_memory.detach())
+        memory_queue = torch.zeros(self.memory_queue_len, self.decoder.mem_size, self.embed_dim, device=x.device)
 
-        
-        return torch.sigmoid(masks.squeeze(1))
+        for t in range(T):
+            frame = x[t]  # [C, H, W]
+            encoded = self.image_encoder(frame)
+            
+            # Incorporate prior
+            prior = prior_emb.view(-1, 1, 1).expand(-1, H_enc, W_enc)
+            encoded = torch.cat([encoded, prior], dim=0)
+            encoded = self.pos_enc(encoded.mean(dim=0, keepdim=True), t)
+            mask, new_memory = self.decoder(memory_queue, encoded, self.mask_tokens)
+            masks.append(mask)
 
-    def process_single(self, x: torch.Tensor, prior_emb: torch.Tensor):
-        
-        mask = self.process_batch(x, prior_emb)
-        
-        return mask
+            memory_queue = torch.cat([memory_queue[1:], new_memory], dim=0)
+
+        masks = torch.stack(masks, dim=0)
+        return masks
     
 # input: (batch, num_frames (remove for images), num_channels, height, width) (height and width have to be greater than 16 and divisible by 8)
 # output: (batch, num_frames (remove for images), num_channels, height, width)

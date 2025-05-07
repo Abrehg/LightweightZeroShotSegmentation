@@ -22,140 +22,65 @@ class DistilledMemoryStudent(nn.Module):
     def __init__(self, 
                  text_embed_dim=256,
                  image_embed_dim=128,
-                 mem_size=5,
-                 num_layers=4):
+                 num_layers=4,
+                 memory_queue_len=15):  # Added memory_queue_len
         super().__init__()
 
         self.token_embed = nn.Embedding(49408, text_embed_dim)
-        self.pos_embed = nn.Embedding(512, text_embed_dim)  # Increased position capacity
+        self.pos_embed = nn.Embedding(512, text_embed_dim)
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=text_embed_dim,
                 nhead=8,
-                dim_feedforward=4*text_embed_dim,
-                batch_first=True
+                dim_feedforward=4*text_embed_dim
             ),
-            num_layers=4
+            num_layers=num_layers
         )
-        self.text_ln = nn.LayerNorm(text_embed_dim)
-        
-        # Resolution-adaptive image encoder
         self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 64, 3, stride=2, padding=1),
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
             nn.GELU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.GELU(),
-            nn.AdaptiveAvgPool2d((None, None)),  # Preserve spatial dims
-            nn.Conv2d(128, image_embed_dim, 3, padding=1)
+            nn.Conv2d(64, image_embed_dim, kernel_size=3, stride=2, padding=1),
         )
-        
-        # Memory buffers with FIFO update
-        self.register_buffer('memory', torch.zeros(mem_size, image_embed_dim, 64, 64))
-        self.register_buffer('mask_memory', torch.zeros(mem_size, 1, 64, 64))
-        self.mem_size = mem_size
-        self.mem_ptr = 0
-        
-        # Temporal fusion components
-        self.temporal_fuser = nn.Conv3d(
-            in_channels=128,
-            out_channels=128,
-            kernel_size=(3,1,1),
-            padding=(1,0,0)
-        )
-        
-        # Unified fusion layers
-        self.fusion = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(384 if i == 0 else 128, 128, 1),
-                nn.GroupNorm(8, 128),
-                nn.GELU()
-            ) for i in range(num_layers)
-        ])
-        
-        # Mask decoder
-        self.decoder = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),
+        self.mask_decoder = nn.Sequential(
+            nn.ConvTranspose2d(text_embed_dim + image_embed_dim, 64, kernel_size=4, stride=2, padding=1),
             nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 1, 1)
+            nn.ConvTranspose2d(64, 1, kernel_size=4, stride=2, padding=1),
         )
+        self.memory_queue_len = memory_queue_len
+        self.memory_queue = torch.zeros(memory_queue_len, 1, text_embed_dim + image_embed_dim) # Initialize with zeros
+        self.teacher = None
 
-    def update_memory(self, features, masks):
-        """FIFO memory update with spatial features"""
-        with torch.no_grad():
-            # Concatenate features and masks
-            new_entry = torch.cat([
-                F.adaptive_avg_pool2d(features, (64, 64)),
-                F.interpolate(masks, size=(64, 64))
-            ], dim=1)  # Shape: (B*T, 128+1, 64, 64)
+    def forward(self, images, text):
+        if images.ndim == 3:  # Image input (C, H, W)
+            images = images.unsqueeze(0)
         
-            # Aggregate batch dimension
-            aggregated_entry = new_entry.mean(dim=0, keepdim=True)  # (1, 129, 64, 64)
-        
-            if self.mem_ptr < self.mem_size:
-                # Store aggregated features and masks
-                self.memory[self.mem_ptr] = aggregated_entry[:, :self.memory.size(1)]  # (1, 128, 64, 64)
-                self.mask_memory[self.mem_ptr] = aggregated_entry[:, -1:]  # (1, 1, 64, 64)
-                self.mem_ptr += 1
-            else:
-                # FIFO update with aggregated entry
-                self.memory = torch.cat([self.memory[1:], aggregated_entry[:, :self.memory.size(1)]])
-                self.mask_memory = torch.cat([self.mask_memory[1:], aggregated_entry[:, -1:]])
+        T, C, H, W = images.shape
+        masks = []
 
-    def forward(self, x, text_tokens):
-        # Handle video/image inputs
-        if x.ndim == 4:  # Image input (B, C, H, W)
-            x = x.unsqueeze(0)  # Add temporal dim (B, 1, C, H, W)
+        text_embeds = self.token_embed(text)
+        text_embeds = text_embeds + self.pos_embed(torch.arange(text_embeds.size(1), device=text_embeds.device))
+        text_embeds = self.transformer(text_embeds)
 
-        # Now x is guaranteed to be 5D
-        B, T, C, H_orig, W_orig = x.shape
-    
-        # Flatten batch and temporal dimensions for image encoder
-        x = x.flatten(0, 1)  # Shape: (B*T, C, H, W)
-        img_feats = self.image_encoder(x)  # (B*T, 128, H', W')
+        for t in range(T):
+            image = images[t]
+            image_embeds = self.image_encoder(image)
+            image_embeds = F.interpolate(image_embeds, size=text_embeds.shape[1], mode='bilinear', align_corners=False)
+            
+            # Concatenate text and image embeddings
+            frame_embeds = torch.cat([text_embeds, image_embeds], dim=0)
+            
+            # Use memory queue
+            decoder_input = torch.cat([frame_embeds.unsqueeze(0), self.memory_queue], dim=0).permute(1, 0, 2) # Prepend current frame embeds
 
-        # Text processing (unchanged)
-        B_text, seq_len = text_tokens.shape
-        positions = torch.arange(seq_len, device=text_tokens.device).expand(B_text, -1)
-        token_emb = self.token_embed(text_tokens)
-        pos_emb = self.pos_embed(positions)
-        text_feats = self.text_ln(self.transformer(token_emb + pos_emb)).mean(dim=1)
-    
-        # Expand text features to match spatial dimensions
-        text_feats = text_feats.view(B, 1, -1).expand(-1, T, -1)  # (B, T, 256)
-        text_feats = text_feats.reshape(B*T, -1)[:, :, None, None]  # (B*T, 256, 1, 1)
-        text_feats = text_feats.expand(-1, -1, *img_feats.shape[-2:])  # (B*T, 256, H', W')
+            mask = self.mask_decoder(decoder_input[:, 0]).unsqueeze(0)
+            masks.append(mask)
 
-        # Temporal fusion (if video)
-        img_feats = img_feats.view(B, T, *img_feats.shape[1:])
-        img_feats = img_feats.permute(0, 2, 1, 3, 4)  # (B, 128, T, H', W')
-        img_feats = self.temporal_fuser(img_feats)
-        img_feats = img_feats.permute(0, 2, 1, 3, 4).flatten(0, 1)  # (B*T, 128, H', W')
+            # Update memory queue
+            self.memory_queue = torch.cat([self.memory_queue[1:], frame_embeds.unsqueeze(0)], dim=0)
 
-        # Concatenate along channels
-        fused = torch.cat([img_feats, text_feats], dim=1)  # (B*T, 384, H', W')
-    
-        for layer in self.fusion:
-            fused = layer(fused)
-        
-        # Decode masks
-        masks = self.decoder(fused)
-
-        masks = F.interpolate(
-            masks, 
-            size=(H_orig, W_orig),  # Original input dimensions
-            mode='bilinear', 
-            align_corners=False
-        )
-        
-        # Update memory during training
-        if self.training:
-            self.update_memory(img_feats, masks)
-    
-        return torch.sigmoid(masks)
+        return torch.stack(masks, dim=0).unsqueeze(1)
 
     def register_teacher(self, teacher_model):
         """Register teacher model for co-distillation"""
@@ -179,6 +104,14 @@ class DistilledMemoryStudent(nn.Module):
         
         # Combine losses
         return student_true_loss + student_teacher_loss
+
+    def compute_distill_loss(self, student_masks, teacher_masks, true_masks):
+        """
+        Compute a combined loss for distillation and mask prediction.
+        """
+        distill_loss = F.l1_loss(student_masks, teacher_masks)
+        iou_l = iou_loss(student_masks, true_masks)
+        return distill_loss + iou_l
 
 def load_student(weights_path):
     """Load trained student model"""
@@ -210,30 +143,30 @@ def process_video(student, frames, prompt, update_memory=False):
     
     return torch.stack(masks)
 
-from .SAM_model import VideoSAM
-from .clip_model import create_text_encoder
-from .prior_model import create_prior
+# from .SAM_model import VideoSAM
+# from .clip_model import create_text_encoder
+# from .prior_model import create_prior
 
-class TeacherModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Text processing components
-        self.text_encoder = create_text_encoder()
-        self.prior = create_prior()
-        self.sam_decoder = VideoSAM()
+# class TeacherModel(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         # Text processing components
+#         self.text_encoder = create_text_encoder()
+#         self.prior = create_prior()
+#         self.sam_decoder = VideoSAM()
 
-    def forward(self, x, text_tokens):
-        """
-        Args:
-            x: Input video/image tensor (B, T, C, H, W)
-            text_tokens: Tokenized text indices (B, seq_len)
-        """
-        # Text processing
-        text_emb = self.text_encoder(text_tokens)
-        prior_emb = self.prior(text_emb)
+#     def forward(self, x, text_tokens):
+#         """
+#         Args:
+#             x: Input video/image tensor (B, T, C, H, W)
+#             text_tokens: Tokenized text indices (B, seq_len)
+#         """
+#         # Text processing
+#         text_emb = self.text_encoder(text_tokens)
+#         prior_emb = self.prior(text_emb)
         
-        # VideoSAM processing
-        return self.sam_decoder(x, prior_emb)
+#         # VideoSAM processing
+#         return self.sam_decoder(x, prior_emb)
 
 
 # # Initialize with teacher for distillation

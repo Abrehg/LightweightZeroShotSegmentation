@@ -5,7 +5,6 @@ from data.custom400m import get_laion_test_dataset, adaptive_collate
 from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 import argparse
 import time
-from torchinfo import summary
 import os
 
 parser = argparse.ArgumentParser(description="Load LAION-400M dataset from Hugging Face.")

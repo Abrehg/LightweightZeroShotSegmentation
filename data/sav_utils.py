@@ -6,7 +6,6 @@
 import json
 import os
 from typing import Dict, List, Optional, Tuple
-
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np

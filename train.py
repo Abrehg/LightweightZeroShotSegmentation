@@ -25,11 +25,11 @@ HYPERPARAMS = {
     "DECODER_LR": 0.0001, # For SAM Decoder training
     "TEACHER_LR": 0.00001, # For teacher fine-tuning during student training
     "STUDENT_LR": 0.0001,
-    "BATCH_SIZE": 64, # For CLIP and Prior
-    "SAM_BATCH_SIZE": 1, # For SAM and Student, as per original dataloader
+    "LAION_BATCH_SIZE": 64,
+    "SAM_BATCH_SIZE": 512,
     "CHECKPOINT_DIR": "weights",
-    "WANDB_PROJECT_NAME": "YOUR_WANDB_PROJECT_NAME", # Replace with your project name
-    "WANDB_ENTITY_NAME": None # Replace with your entity/team name if applicable, else None
+    "WANDB_PROJECT_NAME": "Zero Shot Segmentation", # Replace with your project name
+    "WANDB_ENTITY_NAME": "adityaasuratkal-rensselaer-polytechnic-institute" # Replace with your entity/team name if applicable, else None
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -62,7 +62,7 @@ def get_latest_epoch_checkpoint(directory, prefix):
     return latest_file, latest_epoch
 
 # ======== CLIP Training ========
-def train_clip(hf_token, start_epoch = 0):
+def train_clip(hf_token, run: wandb, start_epoch = 0):
     print("\n=== Training CLIP ===")
     
     # Initialize components
@@ -89,7 +89,7 @@ def train_clip(hf_token, start_epoch = 0):
     )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=HYPERPARAMS["BATCH_SIZE"],
+        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
         collate_fn=adaptive_collate,
         pin_memory=True
     )
@@ -123,7 +123,7 @@ def train_clip(hf_token, start_epoch = 0):
             
             if batch_idx % 100 == 0:
                 print(f"CLIP Epoch {epoch+1}/{HYPERPARAMS['CLIP_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
-                wandb.log({
+                run.log({
                     "clip_batch_loss": loss.item(), 
                     "clip_epoch": epoch + 1,
                     "clip_batch_idx": batch_idx
@@ -131,7 +131,7 @@ def train_clip(hf_token, start_epoch = 0):
         
         avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
         print(f"CLIP Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
-        wandb.log({"clip_epoch_avg_loss": avg_epoch_loss, "clip_epoch": epoch + 1})
+        run.log({"clip_epoch_avg_loss": avg_epoch_loss, "clip_epoch": epoch + 1})
 
         text_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{epoch+1}.pt")
         image_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{epoch+1}.pt")
@@ -142,7 +142,7 @@ def train_clip(hf_token, start_epoch = 0):
     print("CLIP training completed.\n")
 
 # ======== Prior Training ========
-def train_prior(hf_token, start_epoch = 0):
+def train_prior(hf_token, run: wandb, start_epoch = 0):
     print("\n=== Training Prior ===")
     # Load frozen CLIP
     text_encoder = create_text_encoder().to(device)
@@ -221,7 +221,7 @@ def train_prior(hf_token, start_epoch = 0):
             
             if batch_idx % 100 == 0:
                 print(f"Prior Epoch {epoch+1}/{HYPERPARAMS['PRIOR_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
-                wandb.log({
+                run.log({
                     "prior_batch_loss": loss.item(), 
                     "prior_epoch": epoch + 1,
                     "prior_batch_idx": batch_idx
@@ -229,7 +229,7 @@ def train_prior(hf_token, start_epoch = 0):
 
         avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
         print(f"Prior Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
-        wandb.log({"prior_epoch_avg_loss": avg_epoch_loss, "prior_epoch": epoch + 1})
+        run.log({"prior_epoch_avg_loss": avg_epoch_loss, "prior_epoch": epoch + 1})
         
         ckpt_path = os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"prior_epoch_{epoch+1}.pt")
         torch.save(prior.state_dict(), ckpt_path)
@@ -237,7 +237,7 @@ def train_prior(hf_token, start_epoch = 0):
     
     print("Prior training completed.\n")
 
-def train_SAM_decoder(dataloader, start_epoch = 0):
+def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
     print("\n=== Training SAM Decoder (Teacher Component) ===")
     class TeacherModel(torch.nn.Module):
         def __init__(self):
@@ -322,7 +322,7 @@ def train_SAM_decoder(dataloader, start_epoch = 0):
                 avg_batch_item_loss = current_batch_loss_sum / num_samples_in_batch
                 total_loss += avg_batch_item_loss
                 print(f"SAM Decoder Epoch {epoch+1}/{HYPERPARAMS['SAM_DECODER_EPOCHS']} | Batch {batch_idx} Avg Item Loss: {avg_batch_item_loss:.4f}")
-                wandb.log({
+                run.log({
                     "sam_decoder_batch_avg_item_loss": avg_batch_item_loss,
                     "sam_decoder_epoch": epoch + 1,
                     "sam_decoder_batch_idx": batch_idx
@@ -331,14 +331,14 @@ def train_SAM_decoder(dataloader, start_epoch = 0):
             
         avg_epoch_loss = total_loss / batch_count if batch_count > 0 else 0
         print(f"SAM Decoder Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
-        wandb.log({"sam_decoder_epoch_avg_loss": avg_epoch_loss, "sam_decoder_epoch": epoch + 1})
+        run.log({"sam_decoder_epoch_avg_loss": avg_epoch_loss, "sam_decoder_epoch": epoch + 1})
 
         ckpt_path = os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"sam_decoder_epoch_{epoch+1}.pt")
         torch.save(teacher.sam_decoder.state_dict(), ckpt_path)
         print(f"Saved SAM Decoder checkpoint for epoch {epoch+1} to {ckpt_path}")
     print("SAM Decoder training completed.\n")
 
-def train_student(dataloader, start_epoch = 0):
+def train_student(dataloader, run:wandb, start_epoch = 0):
     print("\n=== Training Student (with Teacher Fine-tuning) ===")
 
     class TeacherModel(torch.nn.Module):
@@ -458,7 +458,7 @@ def train_student(dataloader, start_epoch = 0):
                 total_student_loss += avg_batch_student_loss
 
                 print(f"Student Epoch {epoch+1}/{HYPERPARAMS['TEACHER_STUDENT_EPOCHS']} | Batch {batch_idx} | Teacher Loss: {avg_batch_teacher_loss:.4f}, Student Loss: {avg_batch_student_loss:.4f}")
-                wandb.log({
+                run.log({
                     "student_phase_batch_teacher_loss": avg_batch_teacher_loss,
                     "student_phase_batch_student_loss": avg_batch_student_loss,
                     "student_phase_epoch": epoch + 1,
@@ -472,7 +472,7 @@ def train_student(dataloader, start_epoch = 0):
         avg_epoch_teacher_loss = total_teacher_loss / batch_count if batch_count > 0 else 0
         avg_epoch_student_loss = total_student_loss / batch_count if batch_count > 0 else 0
         print(f"Student Epoch {epoch+1} Avg Losses - Teacher: {avg_epoch_teacher_loss:.4f}, Student: {avg_epoch_student_loss:.4f}")
-        wandb.log({
+        run.log({
             "student_phase_epoch_avg_teacher_loss": avg_epoch_teacher_loss,
             "student_phase_epoch_avg_student_loss": avg_epoch_student_loss,
             "student_phase_epoch": epoch + 1
@@ -493,7 +493,7 @@ def main(hf_token):
     # Create checkpoint directory
     os.makedirs(HYPERPARAMS["CHECKPOINT_DIR"], exist_ok=True)
 
-    wandb.init(
+    run = wandb.init(
         project=HYPERPARAMS["WANDB_PROJECT_NAME"],
         entity=HYPERPARAMS["WANDB_ENTITY_NAME"],
         config=HYPERPARAMS
@@ -587,7 +587,7 @@ def main(hf_token):
 
     combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
     dataloader = DataLoader(combined_dataset, 
-                            batch_size=512, 
+                            batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
                             shuffle=True, 
                             num_workers=10, 
                             collate_fn=SAM_adaptive_collate, 
@@ -595,30 +595,30 @@ def main(hf_token):
     
     if clip_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
         print("\n🚀 Starting CLIP Training Phase")
-        train_clip(hf_token, start_epoch=clip_start_epoch + 1)
+        train_clip(hf_token, start_epoch=clip_start_epoch + 1, run=run)
     else:
         print("\n✅ CLIP training already completed or up to date.")
 
     if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
         print("\n🚀 Starting Prior Training Phase")
-        train_prior(hf_token, start_epoch=prior_start_epoch + 1)
+        train_prior(hf_token, start_epoch=prior_start_epoch + 1, run=run)
     else:
         print("\n✅ Prior training already completed or up to date.")
 
     if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
         print("\n🚀 Starting SAM Decoder Training Phase")
-        train_SAM_decoder(dataloader, start_epoch=sam_decoder_start_epoch + 1)
+        train_SAM_decoder(dataloader, start_epoch=sam_decoder_start_epoch + 1, run=run)
     else:
         print("\n✅ SAM Decoder training already completed or up to date.")
 
     if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
         print("\n🚀 Starting Student Training Phase")
-        train_student(dataloader, start_epoch=student_start_epoch + 1)
+        train_student(dataloader, start_epoch=student_start_epoch + 1, run=run)
     else:
         print("\n✅ Student training already completed or up to date.")
     
     print("\n🏁 All training phases processed!")
-    wandb.finish() # Finish W&B run
+    run.finish() # Finish W&B run
 
 # ======== Main ========
 if __name__ == "__main__":

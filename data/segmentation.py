@@ -5,13 +5,12 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import numpy as np
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import torchvision.transforms.functional as F
 import json
 from pycocotools import mask as coco_mask
 from models.clip_model import CLIPTokenize
-from .sav_utils import SAVDatasetHelper, decode_video, show_anns
+from .sav_utils import SAVDatasetHelper
 
 def SAM_adaptive_collate(batch):
     """Handle variable-sized images by stacking as lists"""

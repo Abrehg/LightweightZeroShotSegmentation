@@ -5,17 +5,105 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import pipeline, BitsAndBytesConfig
 import torchvision.transforms.functional as F
 import json
 from pycocotools import mask as coco_mask
 from models.clip_model import CLIPTokenize
 from .sav_utils import SAVDatasetHelper
+import random
 
 def SAM_adaptive_collate(batch):
     """Handle variable-sized images by stacking as lists"""
     images, masks, texts = zip(*batch)
     return list(images), list(masks), list(texts)
+
+class CaptionGenerator:
+    """A helper class to centralize all captioning models and logic."""
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.device = device
+        print("=== Initializing Captioning Models ===")
+
+        # Define a 4-bit quantization config for memory efficiency
+        quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+
+        # 1. BLIP Pipeline
+        self.pipe_blip = pipeline(
+            "image-to-text",
+            model="Salesforce/blip-image-captioning-base",
+            device=self.device
+        )
+
+        # 2. PaliGemma Pipeline
+        self.pipe_paligemma = pipeline(
+            "image-to-text",
+            model="google/paligemma-3b-pt-224",
+            model_kwargs={"torch_dtype": torch.bfloat16},
+            device=self.device
+        )
+
+        # 3. Florence-2 Pipeline (with quantization)
+        self.pipe_florence2 = pipeline(
+            "image-to-text",
+            model="microsoft/Florence-2-large",
+            trust_remote_code=True,
+            model_kwargs={"torch_dtype": torch.bfloat16, "quantization_config": quantization_config},
+            device_map="auto"
+        )
+
+        # 4. Qwen3-VL Pipeline
+        self.pipe_qwen3vl = pipeline(
+            "image-to-text",
+            model="Qwen/Qwen3-VL",
+            trust_remote_code=True,
+            model_kwargs={"torch_dtype": torch.float16},
+            device_map="auto"
+        )
+
+        # 5. CogVLM2 Pipeline
+        self.pipe_cogvlm2 = pipeline(
+            "image-to-text",
+            model="zai-org/cogvlm2-llama3-caption",
+            trust_remote_code=True,
+            model_kwargs={"torch_dtype": "auto"},
+            device=self.device
+        )
+        print("=== ✅ All Captioning Pipelines Initialized ===")
+
+    def _parse_output(self, output):
+        """Helper to safely extract generated text from pipeline output."""
+        if output and isinstance(output, list) and 'generated_text' in output[0]:
+            return output[0]['generated_text']
+        return "caption generation failed"
+    
+    def generate_all_captions(self, image, mask):
+        """
+        Generates a single caption for a masked object from a random choice of models.
+        """
+        # Convert to PIL Image and crop to the masked region's bounding box
+        image_pil = F.to_pil_image(image)
+        mask_pil = F.to_pil_image(mask.float())
+        bbox = mask_pil.getbbox()
+        if not bbox:
+            return "object"
+        cropped_image = image_pil.crop(bbox)
+
+        captions = []
+        with torch.no_grad():
+            # Generate captions using each pipeline
+            captions.append(self._parse_output(self.pipe_blip(cropped_image, max_new_tokens=20)))
+            captions.append(self._parse_output(self.pipe_paligemma(cropped_image, max_new_tokens=50)))
+            florence_output = self.pipe_florence2(
+                cropped_image,
+                prompt="<CAPTION>",
+                generate_kwargs={"max_new_tokens": 50}
+            )
+            parsed_florence = self._parse_output(florence_output).replace("<CAPTION>", "").strip()
+            captions.append(parsed_florence)
+            captions.append(self._parse_output(self.pipe_qwen3vl(cropped_image, generate_kwargs={"max_new_tokens": 128})))
+            captions.append(self._parse_output(self.pipe_cogvlm2(cropped_image, generate_kwargs={"max_new_tokens": 128})))
+            
+        return captions
 
 class BaseTarDataset(Dataset):
     """Base class for tar-based segmentation datasets"""
@@ -34,7 +122,7 @@ class BaseTarDataset(Dataset):
         self.cache_dir = os.path.join(root_dir, "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        if verify_files:  # New conditional
+        if verify_files:
             self.available_files = self._verify_files()
         else:
             self.available_files = []
@@ -101,35 +189,12 @@ class SA1BDataset(BaseTarDataset):
 
         if build_index:
             self.samples = self._build_index()
+            random.shuffle(self.samples)
         else:
             self.samples = []
-
         
-        # Initialize BLIP model for caption generation
-        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        self.caption_model = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-base"
-        ).to(self.device).eval()
-
-    def _generate_object_caption(self, image, mask):
-        """Generate caption for masked object using BLIP model"""
-        # Convert to PIL Images
-        image_pil = F.to_pil_image(image)
-        mask_pil = F.to_pil_image(mask.float())
-        
-        # Crop to masked region
-        bbox = mask_pil.getbbox()
-        if not bbox:  # Empty mask
-            return "object"
-            
-        cropped_image = image_pil.crop(bbox)
-        
-        # Generate caption
-        inputs = self.processor(cropped_image, return_tensors="pt").to(self.device)
-        outputs = self.caption_model.generate(**inputs, max_new_tokens=20)
-        caption = self.processor.decode(outputs[0], skip_special_tokens=True)
-        
-        return caption
+        # Initialize models for caption generation
+        self.caption_generator = CaptionGenerator(device=self.device)
 
     def _build_index(self):
         """Create index with enhanced validation using pycocotools"""
@@ -187,47 +252,77 @@ class SA1BDataset(BaseTarDataset):
         return samples
     
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples)*5
 
     def __getitem__(self, idx):
-        tar_path, json_name, ann_idx, image_path = self.samples[idx]
+        # Map the flat index to an original sample index and a caption index
+        original_sample_idx = idx // 5
+        caption_idx = idx % 5
+        
+        tar_path, json_name, ann_idx, image_path = self.samples[original_sample_idx]
         
         with tarfile.open(tar_path, "r") as tar:
-            # Load JSON data
             json_file = tar.extractfile(json_name)
             data = json.load(json_file)
             
-            # Load image
             image_member = tar.getmember(image_path)
             image_file = tar.extractfile(image_member)
             image = Image.open(image_file).convert("RGB")
             image = self.transform(image) if self.transform else transforms.ToTensor()(image)
             
-            # Process annotation using pycocotools
             ann = data['annotations'][ann_idx]
-            
-            # Convert segmentation to COCO-compatible format
-            rle = {
-                'counts': ann['segmentation']['counts'],
-                'size': ann['segmentation']['size']
-            }
-            
-            # Decode mask
+            rle = {'counts': ann['segmentation']['counts'], 'size': ann['segmentation']['size']}
             mask = coco_mask.decode(rle)
-            mask = torch.from_numpy(mask).long()
-            mask = mask.unsqueeze(0)
+            mask = torch.from_numpy(mask).long().unsqueeze(0)
             
-            # Generate caption
-            with torch.no_grad():
-                caption = self._generate_object_caption(image, mask)
+            # Generate all 5 captions and select the one for this index
+            all_captions = self.caption_generator.generate_all_captions(image, mask)
+            caption = all_captions[caption_idx]
             
-            caption = CLIPTokenize(caption)
-            caption = caption.squeeze(1)
-
+            caption = CLIPTokenize(caption).squeeze(1)
             image = image.unsqueeze(0)
             mask = mask.unsqueeze(0)
                 
         return image, mask, caption
+
+    # def __getitem__(self, idx):
+    #     tar_path, json_name, ann_idx, image_path = self.samples[idx]
+        
+    #     with tarfile.open(tar_path, "r") as tar:
+    #         # Load JSON data
+    #         json_file = tar.extractfile(json_name)
+    #         data = json.load(json_file)
+            
+    #         # Load image
+    #         image_member = tar.getmember(image_path)
+    #         image_file = tar.extractfile(image_member)
+    #         image = Image.open(image_file).convert("RGB")
+    #         image = self.transform(image) if self.transform else transforms.ToTensor()(image)
+            
+    #         # Process annotation using pycocotools
+    #         ann = data['annotations'][ann_idx]
+            
+    #         # Convert segmentation to COCO-compatible format
+    #         rle = {
+    #             'counts': ann['segmentation']['counts'],
+    #             'size': ann['segmentation']['size']
+    #         }
+            
+    #         # Decode mask
+    #         mask = coco_mask.decode(rle)
+    #         mask = torch.from_numpy(mask).long()
+    #         mask = mask.unsqueeze(0)
+            
+    #         # Generate caption
+    #         caption = self.caption_generator.generate_caption(image, mask)
+            
+    #         caption = CLIPTokenize(caption)
+    #         caption = caption.squeeze(1)
+
+    #         image = image.unsqueeze(0)
+    #         mask = mask.unsqueeze(0)
+                
+    #     return image, mask, caption
     
     @property
     def samples(self):
@@ -245,41 +340,17 @@ class SAVDataset(BaseTarDataset):
                  verify_files=True):
         super().__init__(root_dir, file_list, max_retries=3, verify_files=verify_files)
         self.device = device
-        self.sav_helper = SAVDatasetHelper(root_dir)  # Initialize helper
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
+        self.sav_helper = SAVDatasetHelper(root_dir)
+        self.transform = transforms.Compose([transforms.ToTensor()])
 
         if build_index:
             self.samples = self._build_index()
+            random.shuffle(self.samples)
         else:
             self.samples = []
 
-        # Initialize BLIP model for caption generation
-        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        self.caption_model = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-base"
-        ).to(self.device).eval()
-
-    def _generate_object_caption(self, frame, mask):
-        """Generate caption for masked object in the given frame using BLIP model"""
-
-        # Convert to PIL Images
-        image_pil = F.to_pil_image(frame)
-        mask_pil = F.to_pil_image(mask.float())
-
-        # Crop to masked region
-        bbox = mask_pil.getbbox()
-        if not bbox:  # Empty mask
-            return "object"
-
-        cropped_image = image_pil.crop(bbox)
-
-        # Generate caption
-        inputs = self.processor(cropped_image, return_tensors="pt").to(self.device)
-        outputs = self.caption_model.generate(**inputs, max_new_tokens=20)
-        caption = self.processor.decode(outputs[0], skip_special_tokens=True)
-        return caption
+        # Initialize models for caption generation
+        self.caption_generator = CaptionGenerator(device=self.device)
 
     def _build_index(self):
         """Create index for SA-V dataset by iterating through video files"""
@@ -330,35 +401,35 @@ class SAVDataset(BaseTarDataset):
         return samples
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) * 5
 
     def __getitem__(self, idx):
-        tar_path, video_id, annot_name = self.samples[idx]
+        # Map the flat index to an original sample index and a caption index
+        original_sample_idx = idx // 5
+        caption_idx = idx % 5
+
+        tar_path, video_id, annot_name = self.samples[original_sample_idx]
         with tarfile.open(tar_path, "r") as tar:
-            # Load frames
             video_path = f"{video_id}.mp4"
             video_member = next((m for m in tar.getmembers() if m.isfile() and m.name.endswith(video_path)), None)
             if not video_member:
                 raise ValueError(f"Video file {video_path} not found in tar archive")
+            
             video_file = tar.extractfile(video_member)
-            temp_video_path = os.path.join(self.cache_dir, video_path)  # Temporary path to save video
+            temp_video_path = os.path.join(self.cache_dir, video_path)
             with open(temp_video_path, 'wb') as f:
                 f.write(video_file.read())
             frames = self.sav_helper.read_frames(temp_video_path)
-            os.remove(temp_video_path)  # Clean up temporary file
+            os.remove(temp_video_path)
 
             if frames is None or len(frames) == 0:
                 raise ValueError(f"Failed to load frames from {video_path}")
 
-            frames = [self.transform(Image.fromarray(frame)) for frame in frames]
-            frames = torch.stack(frames)  # Shape: (num_frames, C, H, W)
+            frames = torch.stack([self.transform(Image.fromarray(frame)) for frame in frames])
 
-            # Load annotations
             annot_file = tar.extractfile(annot_name)
             data = json.load(annot_file)
 
-            # Process masks and find the first valid frame
-            first_valid_frame_idx = None
             first_valid_frame = None
             first_valid_mask = None
             masks = []
@@ -366,40 +437,170 @@ class SAVDataset(BaseTarDataset):
                 frame_masks = []
                 if data and data.get('masklet') and len(data['masklet']) > frame_idx:
                     for ann in data['masklet'][frame_idx]:
-                        rle = {
-                            'counts': ann['counts'],
-                            'size': ann['size']
-                        }
-                        mask = coco_mask.decode(rle)
-                        mask = torch.from_numpy(mask).long()
+                        rle = {'counts': ann['counts'], 'size': ann['size']}
+                        mask = torch.from_numpy(coco_mask.decode(rle)).long()
                         frame_masks.append(mask)
+                
                 if frame_masks:
-                    # Combine masks if multiple
                     frame_mask = torch.stack(frame_masks).any(dim=0).unsqueeze(0).float()
                     masks.append(frame_mask)
-                    if first_valid_frame_idx is None:
-                        first_valid_frame_idx = frame_idx
+                    if first_valid_frame is None:
                         first_valid_frame = frames[frame_idx]
                         first_valid_mask = frame_mask
                 else:
-                    # Dummy mask
                     masks.append(torch.zeros_like(frames[0].mean(dim=0, keepdim=True)))
             masks = torch.stack(masks)
 
-            # Generate caption using the first valid frame
             if first_valid_frame is not None:
-                with torch.no_grad():
-                    caption = self._generate_object_caption(first_valid_frame, first_valid_mask)
+                # Generate all 5 captions and select the one for this index
+                all_captions = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask)
+                caption = all_captions[caption_idx]
             else:
-                caption = "object"  # Default caption if no object is found in the video
+                caption = "object"
 
-            caption = CLIPTokenize(caption)
-            caption = caption.squeeze(1)
-
-            frames = frames
-            masks = masks
+            caption = CLIPTokenize(caption).squeeze(1)
 
         return frames, masks, caption
+
+
+
+def test_captioning_models(image_path: str, mask_path: str):
+    """
+    Loads an image and a mask to test the five captioning models.
+
+    This function initializes the CaptionGenerator, processes the input files,
+    generates a caption from each model for the masked object, and prints the results.
+
+    Args:
+        image_path (str): The file path to the input image (e.g., JPG, PNG).
+        mask_path (str): The file path to the segmentation mask (e.g., a black & white PNG).
+    """
+    print(f"🧪 Testing with:\n  Image: {image_path}\n  Mask:  {mask_path}\n")
+
+    ## 1. Load and Preprocess Image and Mask
+    try:
+        # Load the image and mask from the specified paths
+        input_image = Image.open(image_path).convert("RGB")
+        mask_image = Image.open(mask_path).convert("L")  # Convert mask to grayscale
+    except FileNotFoundError as e:
+        print(f"❌ Error: Could not find a file. Please check your paths.\n{e}")
+        return
+
+    # Define a transform to convert PIL images to PyTorch tensors
+    to_tensor = transforms.ToTensor()
+    image_tensor = to_tensor(input_image)
+    mask_tensor = to_tensor(mask_image)
+
+    # Validate that image and mask dimensions match
+    if image_tensor.shape[1:] != mask_tensor.shape[1:]:
+        print("❌ Error: Image and mask dimensions must be the same.")
+        print(f"Image shape: {image_tensor.shape}, Mask shape: {mask_tensor.shape}")
+        return
+
+    ## 2. Initialize the Caption Generator
+    # This step loads all five large language models and may require significant
+    # GPU memory and time.
+    print("🧠 Initializing captioning models... (This may take a moment)")
+    try:
+        caption_generator = CaptionGenerator()
+        print("✅ Models initialized successfully.")
+    except Exception as e:
+        print(f"❌ Error during model initialization: {e}")
+        return
+        
+    ## 3. Generate Captions
+    print("\n✍️ Generating captions for the masked object...")
+    try:
+        all_captions = caption_generator.generate_all_captions(image_tensor, mask_tensor)
+    except Exception as e:
+        print(f"\n❌ An error occurred during caption generation: {e}")
+        return
+
+    ## 4. Display Results
+    model_names = ["BLIP", "PaliGemma", "Florence-2", "Qwen3-VL", "CogVLM2"]
+    
+    print("\n--- 📸 Generated Captions ---")
+    if len(all_captions) == len(model_names):
+        for name, caption in zip(model_names, all_captions):
+            print(f"🔹 **{name}**: {caption}")
+    else:
+        print("An unexpected number of captions were returned.")
+        print(all_captions)
+    print("----------------------------\n")
+
+
+image_file = "/Users/adityaasuratkal/Downloads/Gemini_Generated_Image_wpocdvwpocdvwpoc.png"
+mask_file = "/Users/adityaasuratkal/Downloads/Gemini_Generated_Image_velvxjvelvxjvelv.png"
+
+test_captioning_models(image_path=image_file, mask_path=mask_file)
+        
+    # def __getitem__(self, idx):
+    #     tar_path, video_id, annot_name = self.samples[idx]
+    #     with tarfile.open(tar_path, "r") as tar:
+    #         # Load frames
+    #         video_path = f"{video_id}.mp4"
+    #         video_member = next((m for m in tar.getmembers() if m.isfile() and m.name.endswith(video_path)), None)
+    #         if not video_member:
+    #             raise ValueError(f"Video file {video_path} not found in tar archive")
+    #         video_file = tar.extractfile(video_member)
+    #         temp_video_path = os.path.join(self.cache_dir, video_path)  # Temporary path to save video
+    #         with open(temp_video_path, 'wb') as f:
+    #             f.write(video_file.read())
+    #         frames = self.sav_helper.read_frames(temp_video_path)
+    #         os.remove(temp_video_path)  # Clean up temporary file
+
+    #         if frames is None or len(frames) == 0:
+    #             raise ValueError(f"Failed to load frames from {video_path}")
+
+    #         frames = [self.transform(Image.fromarray(frame)) for frame in frames]
+    #         frames = torch.stack(frames)  # Shape: (num_frames, C, H, W)
+
+    #         # Load annotations
+    #         annot_file = tar.extractfile(annot_name)
+    #         data = json.load(annot_file)
+
+    #         # Process masks and find the first valid frame
+    #         first_valid_frame_idx = None
+    #         first_valid_frame = None
+    #         first_valid_mask = None
+    #         masks = []
+    #         for frame_idx in range(len(frames)):
+    #             frame_masks = []
+    #             if data and data.get('masklet') and len(data['masklet']) > frame_idx:
+    #                 for ann in data['masklet'][frame_idx]:
+    #                     rle = {
+    #                         'counts': ann['counts'],
+    #                         'size': ann['size']
+    #                     }
+    #                     mask = coco_mask.decode(rle)
+    #                     mask = torch.from_numpy(mask).long()
+    #                     frame_masks.append(mask)
+    #             if frame_masks:
+    #                 # Combine masks if multiple
+    #                 frame_mask = torch.stack(frame_masks).any(dim=0).unsqueeze(0).float()
+    #                 masks.append(frame_mask)
+    #                 if first_valid_frame_idx is None:
+    #                     first_valid_frame_idx = frame_idx
+    #                     first_valid_frame = frames[frame_idx]
+    #                     first_valid_mask = frame_mask
+    #             else:
+    #                 # Dummy mask
+    #                 masks.append(torch.zeros_like(frames[0].mean(dim=0, keepdim=True)))
+    #         masks = torch.stack(masks)
+
+    #         # Generate caption using the first valid frame
+    #         if first_valid_frame is not None:
+    #             caption = self.caption_generator.generate_caption(first_valid_frame, first_valid_mask)
+    #         else:
+    #             caption = "object"  # Default caption if no object is found in the video
+
+    #         caption = CLIPTokenize(caption)
+    #         caption = caption.squeeze(1)
+
+    #         frames = frames
+    #         masks = masks
+
+    #     return frames, masks, caption
 
     
 # # Usage Example

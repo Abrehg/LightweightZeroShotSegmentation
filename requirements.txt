@@ -1,8 +1,6 @@
+Python 3.9.18
 torch
 argparse
-os
-time
-re
 glob
 wandb
 transformers

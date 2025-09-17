@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .clip_model import CLIPTokenize
+from clip_model import CLIPTokenize
 
 def iou_loss(pred_masks, true_masks):
     """
@@ -232,9 +232,9 @@ def process_video(student, frames, prompt, update_memory=False):
     
     return torch.stack(masks)
 
-# from .SAM_model import VideoSAM
-# from .clip_model import create_text_encoder
-# from .prior_model import create_prior
+# from SAM_model import VideoSAM
+# from clip_model import create_text_encoder
+# from prior_model import create_prior
 
 # class TeacherModel(nn.Module):
 #     def __init__(self):
@@ -261,6 +261,10 @@ def process_video(student, frames, prompt, update_memory=False):
 # # Initialize with teacher for distillation
 # student = DistilledMemoryStudent()
 # teacher = TeacherModel()
+
+# print(student)
+# print(teacher)
+
 # student.register_teacher(teacher)
 
 # # Training step

@@ -5,13 +5,21 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from transformers import pipeline, BitsAndBytesConfig
+from transformers import (
+    BlipProcessor, BlipForConditionalGeneration,
+    AutoProcessor, AutoModelForVision2Seq,
+    Florence2ForConditionalGeneration,
+    AutoTokenizer, AutoModelForCausalLM,
+    LlavaForConditionalGeneration
+)
 import torchvision.transforms.functional as F
 import json
 from pycocotools import mask as coco_mask
 from models.clip_model import CLIPTokenize
 from .sav_utils import SAVDatasetHelper
 import random
+
+# pip install pytorchvideo
 
 def SAM_adaptive_collate(batch):
     """Handle variable-sized images by stacking as lists"""
@@ -24,51 +32,41 @@ class CaptionGenerator:
         self.device = device
         print("=== Initializing Captioning Models ===")
 
-        # Define a 4-bit quantization config for memory efficiency
-        quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+        # 1. BLIP Model
+        self.processor_blip = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.model_blip = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base",
+            attn_implementation="eager"
+        ).to(self.device).eval()
 
-        # 1. BLIP Pipeline
-        self.pipe_blip = pipeline(
-            "image-to-text",
-            model="Salesforce/blip-image-captioning-base",
-            device=self.device
+        # 2. PaliGemma Model
+        self.processor_paligemma = AutoProcessor.from_pretrained("google/paligemma-3b-pt-224")
+        self.model_paligemma = AutoModelForVision2Seq.from_pretrained(
+            "google/paligemma-3b-pt-224",
+            torch_dtype=torch.float32,
+            attn_implementation="eager"
+        ).to(self.device).eval()
+
+        # 3. Florence-2 Pipeline
+        self.processor_florence2 = AutoProcessor.from_pretrained(
+            "microsoft/Florence-2-base", trust_remote_code=True
         )
-
-        # 2. PaliGemma Pipeline
-        self.pipe_paligemma = pipeline(
-            "image-to-text",
-            model="google/paligemma-3b-pt-224",
-            model_kwargs={"torch_dtype": torch.bfloat16},
-            device=self.device
-        )
-
-        # 3. Florence-2 Pipeline (with quantization)
-        self.pipe_florence2 = pipeline(
-            "image-to-text",
-            model="microsoft/Florence-2-large",
+        self.model_florence2 = Florence2ForConditionalGeneration.from_pretrained(
+            "microsoft/Florence-2-base",
+            # ✅ VERIFY THIS LINE IS CORRECT
+            torch_dtype=torch.bfloat16, 
             trust_remote_code=True,
-            model_kwargs={"torch_dtype": torch.bfloat16, "quantization_config": quantization_config},
-            device_map="auto"
-        )
+            attn_implementation="eager"
+        ).to(self.device).eval()
 
-        # 4. Qwen3-VL Pipeline
-        self.pipe_qwen3vl = pipeline(
-            "image-to-text",
-            model="Qwen/Qwen3-VL",
-            trust_remote_code=True,
-            model_kwargs={"torch_dtype": torch.float16},
-            device_map="auto"
-        )
-
-        # 5. CogVLM2 Pipeline
-        self.pipe_cogvlm2 = pipeline(
-            "image-to-text",
-            model="zai-org/cogvlm2-llama3-caption",
-            trust_remote_code=True,
-            model_kwargs={"torch_dtype": "auto"},
-            device=self.device
-        )
-        print("=== ✅ All Captioning Pipelines Initialized ===")
+        # 4. Llava-1.5 Model
+        self.model_llava_name = "llava-hf/llava-1.5-7b-hf"
+        self.processor_llava = AutoProcessor.from_pretrained(self.model_llava_name)
+        self.model_llava = LlavaForConditionalGeneration.from_pretrained(
+            self.model_llava_name,
+            torch_dtype=torch.float32, 
+            attn_implementation="eager"
+        ).to(self.device).eval()
 
     def _parse_output(self, output):
         """Helper to safely extract generated text from pipeline output."""
@@ -85,23 +83,70 @@ class CaptionGenerator:
         mask_pil = F.to_pil_image(mask.float())
         bbox = mask_pil.getbbox()
         if not bbox:
-            return "object"
+            return ["object"] * 4
         cropped_image = image_pil.crop(bbox)
 
         captions = []
         with torch.no_grad():
             # Generate captions using each pipeline
-            captions.append(self._parse_output(self.pipe_blip(cropped_image, max_new_tokens=20)))
-            captions.append(self._parse_output(self.pipe_paligemma(cropped_image, max_new_tokens=50)))
-            florence_output = self.pipe_florence2(
-                cropped_image,
-                prompt="<CAPTION>",
-                generate_kwargs={"max_new_tokens": 50}
+            # 1. BLIP Caption
+            print("Starting BLIP Caption")
+            inputs_blip = self.processor_blip(cropped_image, return_tensors="pt").to(self.device)
+            outputs_blip = self.model_blip.generate(**inputs_blip, max_new_tokens=20)
+            captions.append(self.processor_blip.decode(outputs_blip[0], skip_special_tokens=True))
+            print("Finished BLIP caption")
+
+            # 2. PaliGemma Caption
+            print("Starting PaliGemma Caption")
+            prompt_paligemma = "<image>\nDescribe this image"
+            inputs_paligemma = self.processor_paligemma(
+                text=prompt_paligemma, 
+                images=cropped_image, 
+                return_tensors="pt"
+            ).to(self.device)
+
+            outputs_paligemma = self.model_paligemma.generate(**inputs_paligemma, max_new_tokens=50)
+            paligemma_caption = self.processor_paligemma.decode(outputs_paligemma[0], skip_special_tokens=True)
+            # The output might still contain the prompt, so clean it up.
+            paligemma_caption = paligemma_caption.replace(prompt_paligemma, '').strip()
+            captions.append(paligemma_caption)
+            print("Finished PaliGemma caption")
+            
+            # 3. Florence-2 Caption
+            print("Starting Florence-2 Caption")
+            Florence_prompt = "<CAPTION>"
+            
+            # ✅ VERIFY THIS BLOCK IS CORRECT
+            inputs_florence2 = self.processor_florence2(
+                text=Florence_prompt, images=cropped_image, return_tensors="pt"
             )
-            parsed_florence = self._parse_output(florence_output).replace("<CAPTION>", "").strip()
+
+            inputs_florence2 = {key: val.to(self.device) for key, val in inputs_florence2.items()}
+            inputs_florence2["pixel_values"] = inputs_florence2["pixel_values"].to(self.model_florence2.dtype)
+
+            outputs = self.model_florence2.generate(
+                **inputs_florence2,
+                max_new_tokens=50,
+                num_beams=3
+            )
+            generated_text = self.processor_florence2.batch_decode(outputs, skip_special_tokens=True)[0]
+            parsed_florence = generated_text.replace(Florence_prompt, "").strip()
             captions.append(parsed_florence)
-            captions.append(self._parse_output(self.pipe_qwen3vl(cropped_image, generate_kwargs={"max_new_tokens": 128})))
-            captions.append(self._parse_output(self.pipe_cogvlm2(cropped_image, generate_kwargs={"max_new_tokens": 128})))
+            print("Finished Florence 2 caption")
+
+            # 4. Llava-1.5 Caption
+            print("Starting Llava-1.5 Caption")
+            prompt_llava = "USER: <image>\nDescribe this image. ASSISTANT:"
+            inputs_llava = self.processor_llava(text=prompt_llava, images=cropped_image, return_tensors="pt").to(self.device)
+            outputs_llava = self.model_llava.generate(**inputs_llava, max_new_tokens=128, do_sample=True, temperature=0.2)
+            llava_caption = self.processor_llava.batch_decode(outputs_llava, skip_special_tokens=True)[0]
+            # It's better to split by ASSISTANT: to get only the model's response
+            if "ASSISTANT:" in llava_caption:
+                 llava_caption = llava_caption.split("ASSISTANT:")[1].strip()
+            else:
+                 llava_caption = llava_caption.replace(prompt_llava, "").strip() # Fallback
+            captions.append(llava_caption)
+            print("Finished Llava-1.5 caption")
             
         return captions
 
@@ -165,12 +210,6 @@ class BaseTarDataset(Dataset):
         """Load images and masks from tar file"""
         with tarfile.open(tar_path, "r") as tar:
             members = tar.getmembers()
-            
-            # SA-1B specific structure: {image_id}.jpg and {image_id}.mask.png
-            # SA-V specific structure: video_id/frame_{n}.jpg and video_id/mask_{n}.png
-            # Implement this in child classes
-            
-        #return images, masks
     
     @property
     def available_files(self):
@@ -252,12 +291,12 @@ class SA1BDataset(BaseTarDataset):
         return samples
     
     def __len__(self):
-        return len(self.samples)*5
+        return len(self.samples)*4
 
     def __getitem__(self, idx):
         # Map the flat index to an original sample index and a caption index
-        original_sample_idx = idx // 5
-        caption_idx = idx % 5
+        original_sample_idx = idx // 4
+        caption_idx = idx % 4
         
         tar_path, json_name, ann_idx, image_path = self.samples[original_sample_idx]
         
@@ -284,45 +323,6 @@ class SA1BDataset(BaseTarDataset):
             mask = mask.unsqueeze(0)
                 
         return image, mask, caption
-
-    # def __getitem__(self, idx):
-    #     tar_path, json_name, ann_idx, image_path = self.samples[idx]
-        
-    #     with tarfile.open(tar_path, "r") as tar:
-    #         # Load JSON data
-    #         json_file = tar.extractfile(json_name)
-    #         data = json.load(json_file)
-            
-    #         # Load image
-    #         image_member = tar.getmember(image_path)
-    #         image_file = tar.extractfile(image_member)
-    #         image = Image.open(image_file).convert("RGB")
-    #         image = self.transform(image) if self.transform else transforms.ToTensor()(image)
-            
-    #         # Process annotation using pycocotools
-    #         ann = data['annotations'][ann_idx]
-            
-    #         # Convert segmentation to COCO-compatible format
-    #         rle = {
-    #             'counts': ann['segmentation']['counts'],
-    #             'size': ann['segmentation']['size']
-    #         }
-            
-    #         # Decode mask
-    #         mask = coco_mask.decode(rle)
-    #         mask = torch.from_numpy(mask).long()
-    #         mask = mask.unsqueeze(0)
-            
-    #         # Generate caption
-    #         caption = self.caption_generator.generate_caption(image, mask)
-            
-    #         caption = CLIPTokenize(caption)
-    #         caption = caption.squeeze(1)
-
-    #         image = image.unsqueeze(0)
-    #         mask = mask.unsqueeze(0)
-                
-    #     return image, mask, caption
     
     @property
     def samples(self):
@@ -401,12 +401,12 @@ class SAVDataset(BaseTarDataset):
         return samples
 
     def __len__(self):
-        return len(self.samples) * 5
+        return len(self.samples) * 4
 
     def __getitem__(self, idx):
         # Map the flat index to an original sample index and a caption index
-        original_sample_idx = idx // 5
-        caption_idx = idx % 5
+        original_sample_idx = idx // 4
+        caption_idx = idx % 4
 
         tar_path, video_id, annot_name = self.samples[original_sample_idx]
         with tarfile.open(tar_path, "r") as tar:
@@ -465,16 +465,6 @@ class SAVDataset(BaseTarDataset):
 
 
 def test_captioning_models(image_path: str, mask_path: str):
-    """
-    Loads an image and a mask to test the five captioning models.
-
-    This function initializes the CaptionGenerator, processes the input files,
-    generates a caption from each model for the masked object, and prints the results.
-
-    Args:
-        image_path (str): The file path to the input image (e.g., JPG, PNG).
-        mask_path (str): The file path to the segmentation mask (e.g., a black & white PNG).
-    """
     print(f"🧪 Testing with:\n  Image: {image_path}\n  Mask:  {mask_path}\n")
 
     ## 1. Load and Preprocess Image and Mask
@@ -517,7 +507,7 @@ def test_captioning_models(image_path: str, mask_path: str):
         return
 
     ## 4. Display Results
-    model_names = ["BLIP", "PaliGemma", "Florence-2", "Qwen3-VL", "CogVLM2"]
+    model_names = ["BLIP", "PaliGemma", "Florence-2", "Llava-1.5"]
     
     print("\n--- 📸 Generated Captions ---")
     if len(all_captions) == len(model_names):
@@ -533,75 +523,6 @@ image_file = "/Users/adityaasuratkal/Downloads/Gemini_Generated_Image_wpocdvwpoc
 mask_file = "/Users/adityaasuratkal/Downloads/Gemini_Generated_Image_velvxjvelvxjvelv.png"
 
 test_captioning_models(image_path=image_file, mask_path=mask_file)
-        
-    # def __getitem__(self, idx):
-    #     tar_path, video_id, annot_name = self.samples[idx]
-    #     with tarfile.open(tar_path, "r") as tar:
-    #         # Load frames
-    #         video_path = f"{video_id}.mp4"
-    #         video_member = next((m for m in tar.getmembers() if m.isfile() and m.name.endswith(video_path)), None)
-    #         if not video_member:
-    #             raise ValueError(f"Video file {video_path} not found in tar archive")
-    #         video_file = tar.extractfile(video_member)
-    #         temp_video_path = os.path.join(self.cache_dir, video_path)  # Temporary path to save video
-    #         with open(temp_video_path, 'wb') as f:
-    #             f.write(video_file.read())
-    #         frames = self.sav_helper.read_frames(temp_video_path)
-    #         os.remove(temp_video_path)  # Clean up temporary file
-
-    #         if frames is None or len(frames) == 0:
-    #             raise ValueError(f"Failed to load frames from {video_path}")
-
-    #         frames = [self.transform(Image.fromarray(frame)) for frame in frames]
-    #         frames = torch.stack(frames)  # Shape: (num_frames, C, H, W)
-
-    #         # Load annotations
-    #         annot_file = tar.extractfile(annot_name)
-    #         data = json.load(annot_file)
-
-    #         # Process masks and find the first valid frame
-    #         first_valid_frame_idx = None
-    #         first_valid_frame = None
-    #         first_valid_mask = None
-    #         masks = []
-    #         for frame_idx in range(len(frames)):
-    #             frame_masks = []
-    #             if data and data.get('masklet') and len(data['masklet']) > frame_idx:
-    #                 for ann in data['masklet'][frame_idx]:
-    #                     rle = {
-    #                         'counts': ann['counts'],
-    #                         'size': ann['size']
-    #                     }
-    #                     mask = coco_mask.decode(rle)
-    #                     mask = torch.from_numpy(mask).long()
-    #                     frame_masks.append(mask)
-    #             if frame_masks:
-    #                 # Combine masks if multiple
-    #                 frame_mask = torch.stack(frame_masks).any(dim=0).unsqueeze(0).float()
-    #                 masks.append(frame_mask)
-    #                 if first_valid_frame_idx is None:
-    #                     first_valid_frame_idx = frame_idx
-    #                     first_valid_frame = frames[frame_idx]
-    #                     first_valid_mask = frame_mask
-    #             else:
-    #                 # Dummy mask
-    #                 masks.append(torch.zeros_like(frames[0].mean(dim=0, keepdim=True)))
-    #         masks = torch.stack(masks)
-
-    #         # Generate caption using the first valid frame
-    #         if first_valid_frame is not None:
-    #             caption = self.caption_generator.generate_caption(first_valid_frame, first_valid_mask)
-    #         else:
-    #             caption = "object"  # Default caption if no object is found in the video
-
-    #         caption = CLIPTokenize(caption)
-    #         caption = caption.squeeze(1)
-
-    #         frames = frames
-    #         masks = masks
-
-    #     return frames, masks, caption
-
     
 # # Usage Example
 # if __name__ == "__main__":

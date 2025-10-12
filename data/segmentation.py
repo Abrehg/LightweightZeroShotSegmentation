@@ -5,21 +5,14 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from transformers import (
-    BlipProcessor, BlipForConditionalGeneration,
-    AutoProcessor, AutoModelForVision2Seq,
-    Florence2ForConditionalGeneration,
-    AutoTokenizer, AutoModelForCausalLM,
-    LlavaForConditionalGeneration
-)
+from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
 import torchvision.transforms.functional as F
 import json
 from pycocotools import mask as coco_mask
 from models.clip_model import CLIPTokenize
 from .sav_utils import SAVDatasetHelper
 import random
-
-# pip install pytorchvideo
+import re
 
 def SAM_adaptive_collate(batch):
     """Handle variable-sized images by stacking as lists"""
@@ -29,52 +22,52 @@ def SAM_adaptive_collate(batch):
 class CaptionGenerator:
     """A helper class to centralize all captioning models and logic."""
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        self.device = device
-        print("=== Initializing Captioning Models ===")
+        if device:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = 'cuda'
+        elif torch.backends.mps.is_available():
+            self.device = 'mps'
+        else:
+            self.device = 'cpu'
 
-        # 1. BLIP Model
-        self.processor_blip = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        self.model_blip = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-base",
-            attn_implementation="eager"
+        # Use flash_attention_2 for performance on CUDA, otherwise eager
+        attn_implementation = "flash_attention_2" if self.device == 'cuda' else "eager"
+        self.compute_dtype = torch.bfloat16 if self.device == 'cuda' else torch.float32
+
+        self.processor = InstructBlipProcessor.from_pretrained("Salesforce/instructblip-flan-t5-xl")
+        self.model = InstructBlipForConditionalGeneration.from_pretrained(
+            "Salesforce/instructblip-flan-t5-xl",
+            dtype=self.compute_dtype,
+            attn_implementation=attn_implementation
         ).to(self.device).eval()
-
-        # 2. PaliGemma Model
-        self.processor_paligemma = AutoProcessor.from_pretrained("google/paligemma-3b-pt-224")
-        self.model_paligemma = AutoModelForVision2Seq.from_pretrained(
-            "google/paligemma-3b-pt-224",
-            torch_dtype=torch.float32,
-            attn_implementation="eager"
-        ).to(self.device).eval()
-
-        # 3. Florence-2 Pipeline
-        self.processor_florence2 = AutoProcessor.from_pretrained(
-            "microsoft/Florence-2-base", trust_remote_code=True
-        )
-        self.model_florence2 = Florence2ForConditionalGeneration.from_pretrained(
-            "microsoft/Florence-2-base",
-            # ✅ VERIFY THIS LINE IS CORRECT
-            torch_dtype=torch.bfloat16, 
-            trust_remote_code=True,
-            attn_implementation="eager"
-        ).to(self.device).eval()
-
-        # 4. Llava-1.5 Model
-        self.model_llava_name = "llava-hf/llava-1.5-7b-hf"
-        self.processor_llava = AutoProcessor.from_pretrained(self.model_llava_name)
-        self.model_llava = LlavaForConditionalGeneration.from_pretrained(
-            self.model_llava_name,
-            torch_dtype=torch.float32, 
-            attn_implementation="eager"
-        ).to(self.device).eval()
-
-    def _parse_output(self, output):
-        """Helper to safely extract generated text from pipeline output."""
-        if output and isinstance(output, list) and 'generated_text' in output[0]:
-            return output[0]['generated_text']
-        return "caption generation failed"
     
-    def generate_all_captions(self, image, mask):
+    def _post_process_caption(self, caption):
+        prefixes = [
+            "a photo of", "a close-up of", "it's a photo of", "the image shows",
+            "the image depicts", "the image features", "the picture shows", "in this image,",
+            "this image shows", "this is a photo of", "this is a picture of",
+            "the subject of the image is", "the main subject of this image is",
+        ]
+        normalized_caption = caption.lower()
+        for prefix in prefixes:
+            if normalized_caption.startswith(prefix):
+                caption = caption[len(prefix):].lstrip()
+                break
+
+        background_pattern = r'\s*(on|in|with|against|in front of)\s+(a|the)\s+black\s+(background|surface|area)\b'
+        caption = re.sub(background_pattern, '', caption, flags=re.IGNORECASE)
+
+        sentences = caption.split('.')
+        cleaned_sentences = []
+        for sentence in sentences:
+            if "background is black" not in sentence.lower() and sentence.strip():
+                cleaned_sentences.append(sentence)
+        caption = '. '.join(cleaned_sentences)
+        
+        return caption.strip(" .,")
+
+    def generate_all_captions(self, image, mask, index):
         """
         Generates a single caption for a masked object from a random choice of models.
         """
@@ -84,71 +77,50 @@ class CaptionGenerator:
         bbox = mask_pil.getbbox()
         if not bbox:
             return ["object"] * 4
-        cropped_image = image_pil.crop(bbox)
+        image_rgba = image_pil.convert("RGBA")
+        cropped_image_rgba = image_rgba.crop(bbox)
+        cropped_mask = mask_pil.crop(bbox)
+        cropped_image_rgba.putalpha(cropped_mask)
 
-        captions = []
+        background = Image.new("RGB", cropped_image_rgba.size, (0, 0, 0))
+        background.paste(cropped_image_rgba, mask=cropped_image_rgba.split()[3])
+        final_masked_image_rgb = background
+
+
         with torch.no_grad():
-            # Generate captions using each pipeline
-            # 1. BLIP Caption
-            print("Starting BLIP Caption")
-            inputs_blip = self.processor_blip(cropped_image, return_tensors="pt").to(self.device)
-            outputs_blip = self.model_blip.generate(**inputs_blip, max_new_tokens=20)
-            captions.append(self.processor_blip.decode(outputs_blip[0], skip_special_tokens=True))
-            print("Finished BLIP caption")
+            if index == 0:
+                # Persona 1: The Search Query Generator
+                prompt = "Describe the subject of the image using a short, descriptive search query."
 
-            # 2. PaliGemma Caption
-            print("Starting PaliGemma Caption")
-            prompt_paligemma = "<image>\nDescribe this image"
-            inputs_paligemma = self.processor_paligemma(
-                text=prompt_paligemma, 
-                images=cropped_image, 
-                return_tensors="pt"
-            ).to(self.device)
+            elif index == 1:
+                # Persona 2: The Object-Focused Labeler
+                prompt = "A simple description of the subject, including its main color and what it is doing."
 
-            outputs_paligemma = self.model_paligemma.generate(**inputs_paligemma, max_new_tokens=50)
-            paligemma_caption = self.processor_paligemma.decode(outputs_paligemma[0], skip_special_tokens=True)
-            # The output might still contain the prompt, so clean it up.
-            paligemma_caption = paligemma_caption.replace(prompt_paligemma, '').strip()
-            captions.append(paligemma_caption)
-            print("Finished PaliGemma caption")
-            
-            # 3. Florence-2 Caption
-            print("Starting Florence-2 Caption")
-            Florence_prompt = "<CAPTION>"
-            
-            # ✅ VERIFY THIS BLOCK IS CORRECT
-            inputs_florence2 = self.processor_florence2(
-                text=Florence_prompt, images=cropped_image, return_tensors="pt"
-            )
+            elif index == 2:
+                # Persona 3: The Natural Language Captioner
+                prompt = "Write a brief, one-sentence caption for this image."
 
-            inputs_florence2 = {key: val.to(self.device) for key, val in inputs_florence2.items()}
-            inputs_florence2["pixel_values"] = inputs_florence2["pixel_values"].to(self.model_florence2.dtype)
+            elif index == 3:
+                # Persona 4: The Literal Labeler
+                prompt = "A factual label for the subject in the image."
 
-            outputs = self.model_florence2.generate(
-                **inputs_florence2,
-                max_new_tokens=50,
-                num_beams=3
-            )
-            generated_text = self.processor_florence2.batch_decode(outputs, skip_special_tokens=True)[0]
-            parsed_florence = generated_text.replace(Florence_prompt, "").strip()
-            captions.append(parsed_florence)
-            print("Finished Florence 2 caption")
-
-            # 4. Llava-1.5 Caption
-            print("Starting Llava-1.5 Caption")
-            prompt_llava = "USER: <image>\nDescribe this image. ASSISTANT:"
-            inputs_llava = self.processor_llava(text=prompt_llava, images=cropped_image, return_tensors="pt").to(self.device)
-            outputs_llava = self.model_llava.generate(**inputs_llava, max_new_tokens=128, do_sample=True, temperature=0.2)
-            llava_caption = self.processor_llava.batch_decode(outputs_llava, skip_special_tokens=True)[0]
-            # It's better to split by ASSISTANT: to get only the model's response
-            if "ASSISTANT:" in llava_caption:
-                 llava_caption = llava_caption.split("ASSISTANT:")[1].strip()
             else:
-                 llava_caption = llava_caption.replace(prompt_llava, "").strip() # Fallback
-            captions.append(llava_caption)
-            print("Finished Llava-1.5 caption")
-            
-        return captions
+                # Handle invalid index case
+                return "invalid_persona_index"
+
+            if prompt:
+                inputs = self.processor(
+                    images=final_masked_image_rgb, text=prompt, return_tensors="pt"
+                ).to(self.device, self.compute_dtype)
+                outputs = self.model.generate(
+                    **inputs, 
+                    max_length=75, 
+                    min_length=1, 
+                    num_beams=3,
+                    repetition_penalty=1.5
+                )
+                caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+                return self._post_process_caption(caption)
 
 class BaseTarDataset(Dataset):
     """Base class for tar-based segmentation datasets"""
@@ -315,9 +287,7 @@ class SA1BDataset(BaseTarDataset):
             mask = torch.from_numpy(mask).long().unsqueeze(0)
             
             # Generate all 5 captions and select the one for this index
-            all_captions = self.caption_generator.generate_all_captions(image, mask)
-            caption = all_captions[caption_idx]
-            
+            caption = self.caption_generator.generate_all_captions(image, mask, caption_idx)
             caption = CLIPTokenize(caption).squeeze(1)
             image = image.unsqueeze(0)
             mask = mask.unsqueeze(0)
@@ -452,9 +422,7 @@ class SAVDataset(BaseTarDataset):
             masks = torch.stack(masks)
 
             if first_valid_frame is not None:
-                # Generate all 5 captions and select the one for this index
-                all_captions = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask)
-                caption = all_captions[caption_idx]
+                caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
             else:
                 caption = "object"
 
@@ -462,68 +430,61 @@ class SAVDataset(BaseTarDataset):
 
         return frames, masks, caption
 
+# def test_captioning_models(image_path: str, mask_path: str):
+#     print(f"🧪 Testing with:\n  Image: {image_path}\n  Mask:  {mask_path}\n")
 
+#     ## 1. Load and Preprocess Image and Mask
+#     try:
+#         # Load the image and mask from the specified paths
+#         input_image = Image.open(image_path).convert("RGB")
+#         mask_image = Image.open(mask_path).convert("L")  # Convert mask to grayscale
+#     except FileNotFoundError as e:
+#         print(f"❌ Error: Could not find a file. Please check your paths.\n{e}")
+#         return
 
-def test_captioning_models(image_path: str, mask_path: str):
-    print(f"🧪 Testing with:\n  Image: {image_path}\n  Mask:  {mask_path}\n")
+#     # Define a transform to convert PIL images to PyTorch tensors
+#     to_tensor = transforms.ToTensor()
+#     image_tensor = to_tensor(input_image)
+#     mask_tensor = to_tensor(mask_image)
 
-    ## 1. Load and Preprocess Image and Mask
-    try:
-        # Load the image and mask from the specified paths
-        input_image = Image.open(image_path).convert("RGB")
-        mask_image = Image.open(mask_path).convert("L")  # Convert mask to grayscale
-    except FileNotFoundError as e:
-        print(f"❌ Error: Could not find a file. Please check your paths.\n{e}")
-        return
+#     # Validate that image and mask dimensions match
+#     if image_tensor.shape[1:] != mask_tensor.shape[1:]:
+#         print("❌ Error: Image and mask dimensions must be the same.")
+#         print(f"Image shape: {image_tensor.shape}, Mask shape: {mask_tensor.shape}")
+#         return
 
-    # Define a transform to convert PIL images to PyTorch tensors
-    to_tensor = transforms.ToTensor()
-    image_tensor = to_tensor(input_image)
-    mask_tensor = to_tensor(mask_image)
+#     ## 2. Initialize the Caption Generator
+#     # This step loads all five large language models and may require significant
+#     # GPU memory and time.
+#     print("🧠 Initializing captioning models... (This may take a moment)")
+#     try:
+#         caption_generator = CaptionGenerator()
+#         print("✅ Models initialized successfully.")
+#     except Exception as e:
+#         print(f"❌ Error during model initialization: {e}")
+#         return
 
-    # Validate that image and mask dimensions match
-    if image_tensor.shape[1:] != mask_tensor.shape[1:]:
-        print("❌ Error: Image and mask dimensions must be the same.")
-        print(f"Image shape: {image_tensor.shape}, Mask shape: {mask_tensor.shape}")
-        return
-
-    ## 2. Initialize the Caption Generator
-    # This step loads all five large language models and may require significant
-    # GPU memory and time.
-    print("🧠 Initializing captioning models... (This may take a moment)")
-    try:
-        caption_generator = CaptionGenerator()
-        print("✅ Models initialized successfully.")
-    except Exception as e:
-        print(f"❌ Error during model initialization: {e}")
-        return
+#     ## 4. Display Results
+#     model_names = ["The Search Query Generator", "The Object-Focused Labeler", "The Natural Language Captioner", "The Literal Labeler"]
+    
+#     print("\n--- 📸 Generated Captions ---")
+#     for i in range(len(model_names)):
+#         try:
+#             caption = caption_generator.generate_all_captions(image_tensor, mask_tensor, i)
+#             print(f"🔹 **{model_names[i]}**: {caption}")
+#         except Exception as e:
+#             print(f"\n❌ An error occurred during caption generation: {e}")
         
-    ## 3. Generate Captions
-    print("\n✍️ Generating captions for the masked object...")
-    try:
-        all_captions = caption_generator.generate_all_captions(image_tensor, mask_tensor)
-    except Exception as e:
-        print(f"\n❌ An error occurred during caption generation: {e}")
-        return
+#     print("----------------------------\n")
 
-    ## 4. Display Results
-    model_names = ["BLIP", "PaliGemma", "Florence-2", "Llava-1.5"]
-    
-    print("\n--- 📸 Generated Captions ---")
-    if len(all_captions) == len(model_names):
-        for name, caption in zip(model_names, all_captions):
-            print(f"🔹 **{name}**: {caption}")
-    else:
-        print("An unexpected number of captions were returned.")
-        print(all_captions)
-    print("----------------------------\n")
+#image_file = "/Users/adityaasuratkal/Downloads/Research_Datasets/Gemini_Generated_Image_wpocdvwpocdvwpoc.png"
+#mask_file = "/Users/adityaasuratkal/Downloads/Research_Datasets/Gemini_Generated_Image_velvxjvelvxjvelv.png"
 
+# image_file = "/Users/adityaasuratkal/Downloads/Research_Datasets/ADE20K/ADE20K_2021_17_01/images/ADE/training/sports_and_leisure/auto_racing_paddock/ADE_train_00002039.jpg"
+# mask_file = "/Users/adityaasuratkal/Downloads/Research_Datasets/ADE20K/ADE20K_2021_17_01/images/ADE/training/sports_and_leisure/auto_racing_paddock/ADE_train_00002039/instance_001_ADE_train_00002039.png"
 
-image_file = "/Users/adityaasuratkal/Downloads/Gemini_Generated_Image_wpocdvwpocdvwpoc.png"
-mask_file = "/Users/adityaasuratkal/Downloads/Gemini_Generated_Image_velvxjvelvxjvelv.png"
+# test_captioning_models(image_path=image_file, mask_path=mask_file)
 
-test_captioning_models(image_path=image_file, mask_path=mask_file)
-    
 # # Usage Example
 # if __name__ == "__main__":
 #     # Load dataset from text files

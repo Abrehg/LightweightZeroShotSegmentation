@@ -1,3 +1,4 @@
+# test_pipeline.py
 import torch
 import os
 from torch.utils.data import DataLoader
@@ -574,6 +575,18 @@ def main(hf_token, wandb_key):
     _, prior_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
     _, sam_decoder_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
     _, student_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
+    
+    if clip_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
+        print("\n🚀 Starting CLIP Training Phase")
+        train_clip(hf_token, start_epoch=clip_start_epoch + 1, run=run)
+    else:
+        print("\n✅ CLIP training already completed or up to date.")
+
+    if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+        print("\n🚀 Starting Prior Training Phase")
+        train_prior(hf_token, start_epoch=prior_start_epoch + 1, run=run)
+    else:
+        print("\n✅ Prior training already completed or up to date.")
 
     # Phase 1: Mixed Dataset loading
     def load_file_list(file_path):
@@ -664,18 +677,6 @@ def main(hf_token, wandb_key):
                             collate_fn=SAM_adaptive_collate, 
                             pin_memory=True,
                             sampler=sampler)
-    
-    if clip_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
-        print("\n🚀 Starting CLIP Training Phase")
-        train_clip(hf_token, start_epoch=clip_start_epoch + 1, run=run)
-    else:
-        print("\n✅ CLIP training already completed or up to date.")
-
-    if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
-        print("\n🚀 Starting Prior Training Phase")
-        train_prior(hf_token, start_epoch=prior_start_epoch + 1, run=run)
-    else:
-        print("\n✅ Prior training already completed or up to date.")
 
     if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
         print("\n🚀 Starting SAM Decoder Training Phase")
@@ -706,4 +707,3 @@ if __name__ == "__main__":
     
     # Update the main function call
     main(args.token, args.wandb_key)
-

@@ -2,18 +2,17 @@
 #SBATCH --mail-user=surata@rpi.edu
 #SBATCH --mail-type=end,fail
 #SBATCH --job-name=sam_clip_training
-#SBATCH --output=sam_clip_training_%j.out
-#SBATCH --error=sam_clip_training_%j.err
-#SBATCH --partition=gpu
-#SBATCH --nodes=10
+#SBATCH --output=slurm-%A.%a.out
+#SBATCH --error=slurm-%A.%a.err
+#SBATCH --nodes=30
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:v100:1
 #SBATCH --mem=128G
-#SBATCH --time=300:00:00
+#SBATCH --time=48:00:00
 
 # --- User-configurable ---
-PROJECT_DIR="/path/to/your/project_directory"
+PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/train.py"
 PYTHON_SCRIPT_NAME="train.py"
 VENV_NAME="visEnv"
 

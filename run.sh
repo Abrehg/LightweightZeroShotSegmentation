@@ -4,18 +4,17 @@
 #SBATCH --job-name=sam_clip_training
 #SBATCH --output=slurm-%A.%a.out
 #SBATCH --error=slurm-%A.%a.err
-#SBATCH --nodes=30
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:v100:1
-#SBATCH --mem=128G
+#SBATCH --nodes=25
+#SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
+#SBATCH --qos=dcs-48hr
 
 # --- User-configurable ---
 PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/train.py"
 PYTHON_SCRIPT_NAME="train.py"
 VENV_NAME="visEnv"
-
+HF_TOKEN="_"
+WANDB_API_KEY="_"
 
 # --- Sanity Checks ---
 if [ -z "$HF_TOKEN" ]; then

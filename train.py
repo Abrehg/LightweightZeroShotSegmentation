@@ -17,11 +17,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
+#Implement custom weight loading/storing functions + validation set accuracy
+
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
     "CLIP_EPOCHS": 1, #10,
     "PRIOR_EPOCHS": 1, #10,
-    "SAM_DECODER_EPOCHS": 1, # Added for dedicated SAM decoder training
+    "SAM_DECODER_EPOCHS": 1,
     "TEACHER_STUDENT_EPOCHS": 1, #10,
     "CLIP_LR": 0.0001,
     "PRIOR_LR": 0.0001,
@@ -31,8 +33,8 @@ HYPERPARAMS = {
     "LAION_BATCH_SIZE": 64,
     "SAM_BATCH_SIZE": 512,
     "CHECKPOINT_DIR": "weights",
-    "WANDB_PROJECT_NAME": "Zero Shot Segmentation", # Replace with your project name
-    "WANDB_ENTITY_NAME": "adityaasuratkal-rensselaer-polytechnic-institute" # Replace with your entity/team name if applicable, else None
+    "WANDB_PROJECT_NAME": "Zero Shot Segmentation",
+    "WANDB_ENTITY_NAME": "adityaasuratkal-rensselaer-polytechnic-institute"
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -75,21 +77,21 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
     text_encoder = create_text_encoder().to(device)
     image_encoder = create_image_encoder().to(device)
 
-    # Wrap the model AFTER moving it to the correct device
-    clip_model = DDP(CLIPWrapper(text_encoder, image_encoder).to(device), device_ids=[local_rank])
+    clip_model:CLIPWrapper = CLIPWrapper(text_encoder, image_encoder).to(device)
     optimizer = torch.optim.Adam(clip_model.parameters(), lr=HYPERPARAMS["CLIP_LR"])
     
     if start_epoch > 0:
-        text_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{start_epoch}.pt")
-        image_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{start_epoch}.pt")
-        if os.path.exists(text_ckpt_to_load) and os.path.exists(image_ckpt_to_load):
+        text_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{start_epoch}")
+        image_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{start_epoch}")
+        wrapper_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_wrapper_epoch_{start_epoch}")
+        if os.path.exists(text_ckpt_to_load) and os.path.exists(image_ckpt_to_load) and os.path.exists(wrapper_ckpt_to_load):
             print(f"Resuming CLIP training from epoch {start_epoch}")
-            text_encoder.load_state_dict(torch.load(text_ckpt_to_load, map_location=device))
-            image_encoder.load_state_dict(torch.load(image_ckpt_to_load, map_location=device))
+            clip_model.load_weights(wrapper_ckpt_to_load, image_ckpt_to_load, text_ckpt_to_load)
         else:
             print(f"Warning: Checkpoint for epoch {start_epoch} not found. Starting CLIP from scratch.")
-            start_epoch = 0 # Reset if checkpoint not found
+            start_epoch = 0
 
+    clip_model = DDP(clip_model, device_ids=[local_rank])
     # Streaming dataset
     train_dataset = get_laion_streaming_dataset(
         HUGGINGFACE = hf_token, 
@@ -142,10 +144,9 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
             print(f"CLIP Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
             run.log({"clip_epoch_avg_loss": avg_epoch_loss, "clip_epoch": epoch + 1})
 
-            text_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{epoch+1}.pt")
-            image_ckpt = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{epoch+1}.pt")
-            torch.save(text_encoder.state_dict(), text_ckpt)
-            torch.save(image_encoder.state_dict(), image_ckpt)
+            #Potentially add validation loss to filename and then implement early stopping
+
+            clip_model.store_weights(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{epoch+1}", f"clip_image_epoch_{epoch+1}", f"clip_wrapper_epoch_{epoch+1}")
             print(f"Saved CLIP checkpoints for epoch {epoch+1}")
     
     print("CLIP training completed.\n")

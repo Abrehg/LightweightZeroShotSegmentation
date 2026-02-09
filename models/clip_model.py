@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,8 +8,16 @@ MAXSEQLENGTH = 77
 
 tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
+def CLIPTokenize(inputText):
+    tokens = tokenizer(inputText, padding="max_length", truncation=True, max_length=MAXSEQLENGTH, return_tensors="pt")
+    # tokens shape = (numSequences, 77)
+    return tokens['input_ids']
+
+def VecToText(vector):
+    return tokenizer.convert_ids_to_tokens(vector)
+
+# Text encoder factory
 def create_text_encoder():
-    """Factory for text encoder with predefined architecture"""
     return TextEncoder(
         vocab_size=49408, 
         embed_dim=512, 
@@ -16,27 +25,28 @@ def create_text_encoder():
         num_layers=12
     )
 
+# Image encoder factory
 def create_image_encoder():
-    """Factory for image encoder with predefined architecture"""
     return ImageEncoder(
         embed_dim=512,
         input_channels=3
     )
 
+# Contrastive loss from CLIP paper
 def clip_contrastive_loss(logits_per_image, logits_per_text):
-    # Contrastive loss from CLIP paper
     labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
     loss_img = torch.nn.functional.cross_entropy(logits_per_image, labels)
     loss_txt = torch.nn.functional.cross_entropy(logits_per_text, labels)
     return (loss_img + loss_txt) / 2
 
+# Text input: (1, seq_len) (max seq_len is 77)
+# Output shape: (1, 512)
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_dim, max_seq_len, num_layers=6):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.positional_embedding = nn.Embedding(max_seq_len, embed_dim)
         
-        # Transformer layers
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, 
             nhead=8,
@@ -48,17 +58,24 @@ class TextEncoder(nn.Module):
         self.projection = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, text):
-        # text shape: (batch_size, seq_len)
         positions = torch.arange(text.size(1), device=text.device).expand(text.size(0), -1)
         x = self.token_embedding(text) + self.positional_embedding(positions)
         x = self.transformer(x)
-        x = x.mean(dim=1)  # Average pooling over sequence
+        x = x.mean(dim=1)
         x = self.final_ln(x)
         return self.projection(x)
     
-# Text input: (1, seq_len) (max seq_len is 77)
-# Output shape: (1, 512)
+    def load_weights(self, filename):
+        state_dict = torch.load(filename)
+        self.load_state_dict(state_dict)
 
+    def store_weights(self, path, filename):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        torch.save(self.state_dict(), os.path.join(path, filename))
+
+# Image input shape: (1, 3, Height, Width) (Height and Width can be any size greater than 16)
+# Output shape: (1, 512)
 class ImageEncoder(nn.Module):
     def __init__(self, embed_dim, input_channels=3):
         super().__init__()
@@ -83,9 +100,15 @@ class ImageEncoder(nn.Module):
 
     def forward(self, image):
         return self.cnn(image)
+    
+    def load_weights(self, filename):
+        state_dict = torch.load(filename)
+        self.load_state_dict(state_dict)
 
-# Image input shape: (1, 3, Height, Width) (Height and Width can be any size greater than 16)
-# Output shape: (1, 512)
+    def store_weights(self, path, filename):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        torch.save(self.state_dict(), os.path.join(path, filename))
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -110,44 +133,39 @@ class ResBlock(nn.Module):
 
 # Helper class for training
 class CLIPWrapper(nn.Module):
-    """Utility class for training CLIP components together"""
     def __init__(self, text_encoder, image_encoder):
         super().__init__()
-        self.text_encoder = text_encoder
-        self.image_encoder = image_encoder
+        self.text_encoder:TextEncoder = text_encoder
+        self.image_encoder:ImageEncoder = image_encoder
         self.logit_scale = nn.Parameter(torch.ones([]) * torch.tensor(1 / 0.07).log())
 
     def forward(self, text, images):
         text_features = self.text_encoder(text)
         image_features = self.image_encoder(images)
         return text_features, image_features, self.logit_scale.exp()
+    
+    def load_weights(self, wrapper_filename, img_filename, txt_filename):
+        self.image_encoder.load_weights(img_filename)
+        self.text_encoder.load_weights(txt_filename)
+        if wrapper_filename:
+            state_dict = torch.load(wrapper_filename)
+            wrapper_keys = {k: v for k, v in state_dict.items() 
+                            if not k.startswith('text_encoder.') 
+                            and not k.startswith('image_encoder.')}
+            self.load_state_dict(wrapper_keys, strict=False)
 
-def CLIPTokenize(inputText):
-    tokens = tokenizer(inputText, padding="max_length", truncation=True, max_length=MAXSEQLENGTH, return_tensors="pt")
-
-    # tokens shape = (numSequences, 77)
-    return tokens['input_ids']
-
-def VecToText(vector):
-    return tokenizer.convert_ids_to_tokens(vector)
-
-class CLIPWrapper(torch.nn.Module):
-    def __init__(self, text_encoder, image_encoder):
-        super().__init__()
-        self.text_encoder = text_encoder
-        self.image_encoder = image_encoder
-        self.logit_scale = torch.nn.Parameter(torch.ones([]) * torch.tensor(1/0.07).log())
-
-    def forward(self, text, images):
-        text_features = self.text_encoder(text)
-        image_features = self.image_encoder(images)
+    def store_weights(self, path, txt_filename, img_filename, wrapper_filename):
+        self.image_encoder.store_weights(path, img_filename)
+        self.text_encoder.store_weights(path, txt_filename)
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
         
-        # Normalize features
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        state_dict = self.state_dict()
+        wrapper_keys = {k: v for k, v in state_dict.items() 
+                        if not k.startswith('text_encoder.') 
+                        and not k.startswith('image_encoder.')}
         
-        return text_features, image_features, self.logit_scale.exp()
-
+        torch.save(wrapper_keys, os.path.join(path, wrapper_filename))
 
 # text_encoder = create_text_encoder()
 
@@ -155,3 +173,19 @@ class CLIPWrapper(torch.nn.Module):
 # tokens = CLIPTokenize(input_text)
 # encodings = text_encoder(tokens)
 # print(encodings.size())
+
+# input_text = ["Input string", "Another input string"]
+# tokens = CLIPTokenize(input_text)
+# encodings = text_encoder(tokens)
+# print(encodings.size())
+
+# img_encoder = create_image_encoder()
+# wrapper = CLIPWrapper(text_encoder, img_encoder)
+
+# wrapper.store_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models", "txtEncWeights", "imgEncWeights", "CLIPWrapperWeights")
+
+# text_encoder_new = create_text_encoder()
+# img_encoder_new = create_image_encoder()
+# wrapper_new = CLIPWrapper(text_encoder_new, img_encoder_new)
+
+# wrapper_new.load_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models/CLIPWrapperWeights", "/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models/imgEncWeights", "/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models/txtEncWeights")

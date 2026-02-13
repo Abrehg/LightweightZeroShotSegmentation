@@ -20,7 +20,7 @@ def VecToText(vector):
 def create_text_encoder():
     return TextEncoder(
         vocab_size=49408, 
-        embed_dim=512, 
+        embed_dim=768, 
         max_seq_len=MAXSEQLENGTH,
         num_layers=12
     )
@@ -28,7 +28,7 @@ def create_text_encoder():
 # Image encoder factory
 def create_image_encoder():
     return ImageEncoder(
-        embed_dim=512,
+        embed_dim=768,
         input_channels=3
     )
 
@@ -40,7 +40,7 @@ def clip_contrastive_loss(logits_per_image, logits_per_text):
     return (loss_img + loss_txt) / 2
 
 # Text input: (1, seq_len) (max seq_len is 77)
-# Output shape: (1, 512)
+# Output shape: (1, seq_len, 768)
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_dim, max_seq_len, num_layers=6):
         super().__init__()
@@ -54,16 +54,11 @@ class TextEncoder(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-        self.final_ln = nn.LayerNorm(embed_dim)
-        self.projection = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, text):
         positions = torch.arange(text.size(1), device=text.device).expand(text.size(0), -1)
         x = self.token_embedding(text) + self.positional_embedding(positions)
-        x = self.transformer(x)
-        x = x.mean(dim=1)
-        x = self.final_ln(x)
-        return self.projection(x)
+        return self.transformer(x)
     
     def load_weights(self, filename):
         state_dict = torch.load(filename)
@@ -75,7 +70,7 @@ class TextEncoder(nn.Module):
         torch.save(self.state_dict(), os.path.join(path, filename))
 
 # Image input shape: (1, 3, Height, Width) (Height and Width can be any size greater than 16)
-# Output shape: (1, 512)
+# Output shape: (1, 768)
 class ImageEncoder(nn.Module):
     def __init__(self, embed_dim, input_channels=3):
         super().__init__()
@@ -138,9 +133,14 @@ class CLIPWrapper(nn.Module):
         self.text_encoder:TextEncoder = text_encoder
         self.image_encoder:ImageEncoder = image_encoder
         self.logit_scale = nn.Parameter(torch.ones([]) * torch.tensor(1 / 0.07).log())
+        self.final_ln = nn.LayerNorm(768)
+        self.projection = nn.Linear(768, 768)
 
     def forward(self, text, images):
-        text_features = self.text_encoder(text)
+        x = self.text_encoder(text)
+        x = x.mean(dim=1)
+        x = self.final_ln(x)
+        text_features = self.projection(x)
         image_features = self.image_encoder(images)
         return text_features, image_features, self.logit_scale.exp()
     

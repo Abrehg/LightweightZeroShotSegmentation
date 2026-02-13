@@ -1,67 +1,118 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import os
+from transformers import CLIPVisionModel
 
+# Prior model factory
 def create_prior():
-    """Factory for prior model with DALL-E-style architecture"""
-    return Prior(
-        embed_dim=512,
-        num_layers=24
-    )
+    return Prior()
 
+# Input encoding shape: (1, seq_len, 768) (max seq_len is 77)
+# Output shape: (1, 256, 768)
 class Prior(nn.Module):
-    def __init__(self, embed_dim, num_layers=24):
+    def __init__(self, text_dim=768, vision_dim=768, num_patches=256, num_layers=12):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.num_patches = num_patches
+        self.vision_dim = vision_dim
+
+        self.text_proj = nn.Linear(text_dim, vision_dim)
+        self.query = nn.Parameter(torch.randn(1, num_patches, vision_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, vision_dim) * 0.02)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=vision_dim,
+            nhead=8,
+            dim_feedforward=4*vision_dim,
+            batch_first=True,
+            norm_first=True 
+        )
+        self.layers = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
-        # Learnable initial query (acts as "seed" for image embedding)
-        self.query = nn.Parameter(torch.randn(1, 1, embed_dim))
-        
-        # DALL-E-style decoder layers with cross-attention
-        self.layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model=embed_dim,
-                nhead=8,
-                dim_feedforward=4*embed_dim,
-                batch_first=True
-            ) for _ in range(num_layers)
-        ])
-        
-        self.final_ln = nn.LayerNorm(embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
+        self.final_ln = nn.LayerNorm(vision_dim)
+        self.output_proj = nn.Linear(vision_dim, vision_dim)
 
     def forward(self, text_emb):
-        # text_emb shape: (batch_size, embed_dim)
-        batch_size = text_emb.size(0)
+        B, seq_len, _ = text_emb.shape
         
-        # Expand learnable query to batch size
-        target = self.query.expand(batch_size, -1, -1)  # (B, 1, D)
-        
-        # Reshape text_emb as memory for cross-attention
-        memory = text_emb.unsqueeze(1)  # (B, 1, D)
-        
-        # Autoregressive decoding with causal masking
-        for layer in self.layers:
-            target = layer(
-                target, 
-                memory,
-                tgt_mask=self._causal_mask(target)
-            )
-            
-        # Final projection
-        x = self.final_ln(target.squeeze(1))
-        return self.output_proj(x)
+        memory = self.text_proj(text_emb) 
+        target = self.query.expand(B, -1, -1)
+        target = target + self.pos_embed
 
-    def _causal_mask(self, x):
-        """Optional causal mask for autoregressive generation"""
-        seq_len = x.size(1)
-        return torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1).to(x.device)
+        x = self.layers(target, memory)
+        
+        x = self.final_ln(x)
+        output = self.output_proj(x)
+        
+        return output
+    
+    def load_weights(self, filename):
+        state_dict = torch.load(filename)
+        self.load_state_dict(state_dict)
+
+    def store_weights(self, path, filename):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        torch.save(self.state_dict(), os.path.join(path, filename))
+
+class TeacherCLIP(nn.Module):
+    def __init__(self, model_name="openai/clip-vit-base-patch16"):
+        super().__init__()
+        self.vision_model = CLIPVisionModel.from_pretrained(model_name)
+        for param in self.vision_model.parameters():
+            param.requires_grad = False
+            
+    def get_feature_grid(self, pixel_values):
+        with torch.no_grad():
+            outputs = self.vision_model(pixel_values=pixel_values)
+            features = outputs.last_hidden_state[:, 1:, :] 
+            return features
+
+def PriorLoss(predicted_grid, target_grid):
+    loss = 1.0 - F.cosine_similarity(
+        predicted_grid.reshape(-1, 768), 
+        target_grid.reshape(-1, 768), 
+        dim=-1
+    ).mean()
+    return loss
 
 # from clip_model import create_text_encoder, CLIPTokenize
 
 # text_encoder = create_text_encoder()
 # prior = create_prior()
 
-# input_text = "Input string"
+# input_text = ["Input string"]
 # tokens = CLIPTokenize(input_text)
 # encodings = text_encoder(tokens)
 # prior_emb = prior(encodings)
+# print(prior_emb.size())
+
+# input_text = ["Input string", "Another input string"]
+# tokens = CLIPTokenize(input_text)
+# encodings = text_encoder(tokens)
+# prior_emb = prior(encodings)
+# print(prior_emb.size())
+
+
+# input_text = ["A photo of a cat", "A photo of a dog"] 
+# text_tokens = CLIPTokenize(input_text)
+# real_images = torch.randn(2, 3, 224, 224)
+
+# tokens = CLIPTokenize(input_text)
+# encodings = text_encoder(tokens)
+# prior_emb = prior(encodings)
+# teacher = TeacherCLIP()
+# target_grid = teacher.get_feature_grid(real_images)
+# print(f"prior size: {prior_emb.size()}")
+# print(f"target size: {prior_emb.size()}")
+
+# prior.store_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models", "PriorWeights")
+
+# newPrior = create_prior()
+# newPrior.load_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models/PriorWeights")
+
+# input_text = ["Input string"]
+# tokens = CLIPTokenize(input_text)
+# encodings = text_encoder(tokens)
+# new_prior_emb = newPrior(encodings)
+# print(new_prior_emb.size())

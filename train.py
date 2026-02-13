@@ -4,7 +4,7 @@ import os
 from torch.utils.data import DataLoader
 from data.custom400m import get_laion_streaming_dataset, adaptive_collate
 import argparse
-from models.prior_model import create_prior
+from models.prior_model import create_prior, Prior, PriorLoss, TeacherCLIP
 from models.SAM_model import VideoSAM, iou_loss
 from models.distill_model import DistilledMemoryStudent
 import time
@@ -39,16 +39,15 @@ HYPERPARAMS = {
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
+# Change format to store validation weights and then choose weights with lowest error, ignore epochs
+
 # ======== Helper Function for Checkpoints ========
 def get_latest_epoch_checkpoint(directory, prefix):
-    """
-    Finds the checkpoint file with the highest epoch number for a given prefix.
-    Example: prefix_epoch_1.pt, prefix_epoch_2.pt -> returns path to prefix_epoch_2.pt and epoch 2.
-    """
     if not os.path.isdir(directory):
         return None, -1
     
-    files = glob.glob(os.path.join(directory, f"{prefix}_epoch_*.pt"))
+    files = glob.glob(os.path.join(directory, f"{prefix}_epoch_*"))
     if not files:
         return None, -1
 
@@ -57,7 +56,7 @@ def get_latest_epoch_checkpoint(directory, prefix):
     
     for f_path in files:
         filename = os.path.basename(f_path)
-        match = re.search(rf"{prefix}_epoch_(\d+)\.pt", filename)
+        match = re.search(rf"{prefix}_epoch_(\d+)", filename)
         if match:
             epoch = int(match.group(1))
             if epoch > latest_epoch:
@@ -65,6 +64,28 @@ def get_latest_epoch_checkpoint(directory, prefix):
                 latest_file = f_path
                 
     return latest_file, latest_epoch
+
+def get_best_weights_checkpoint(directory, prefix):
+    if not os.path.isdir(directory):
+        return None, -1
+    
+    files = glob.glob(os.path.join(directory, f"{prefix}_epoch_*"))
+    if not files:
+        return None, -1
+
+    latest_epoch = -1
+    best_file = None
+    
+    for f_path in files:
+        filename = os.path.basename(f_path)
+        match = re.search(rf"{prefix}_epoch_(\d+)", filename)
+        if match:
+            epoch = int(match.group(1))
+            if epoch > latest_epoch:
+                latest_epoch = epoch
+                best_file = f_path
+                
+    return best_file, latest_epoch
 
 # ======== CLIP Training ========
 def train_clip(hf_token, run: wandb, start_epoch = 0):
@@ -159,40 +180,39 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
 
     # Load frozen CLIP
     text_encoder = create_text_encoder().to(device)
-    image_encoder = create_image_encoder().to(device)
+    prior_teacher = TeacherCLIP().to(device)
     
     # Load latest CLIP checkpoint
-    latest_clip_text_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
-    latest_clip_image_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_image")
+    best_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
 
-    if not latest_clip_text_ckpt or not latest_clip_image_ckpt:
+    if not best_clip_text_ckpt:
         raise FileNotFoundError("Latest CLIP text or image checkpoints not found. Train CLIP first.")
     
-    print(f"Loading CLIP text from: {latest_clip_text_ckpt}")
-    text_encoder.load_state_dict(torch.load(latest_clip_text_ckpt, map_location=device))
-    print(f"Loading CLIP image from: {latest_clip_image_ckpt}")
-    image_encoder.load_state_dict(torch.load(latest_clip_image_ckpt, map_location=device))
+    print(f"Loading CLIP text from: {best_clip_text_ckpt}")
+    text_encoder.load_weights(best_clip_text_ckpt)
     
     # Freeze CLIP
     for param in text_encoder.parameters(): param.requires_grad_(False)
-    for param in image_encoder.parameters(): param.requires_grad_(False)
     text_encoder.eval()
-    image_encoder.eval()
-    
+    for param in prior_teacher.parameters(): param.requires_grad_(False)
+    prior_teacher.eval()
+
     # Initialize Prior
-    prior_model = create_prior().to(device)
-    prior = DDP(prior_model, device_ids=[local_rank])
-    optimizer = torch.optim.Adam(prior.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
+    prior_model:Prior = create_prior().to(device)
+    
+    optimizer = torch.optim.Adam(prior_model.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
 
     if start_epoch > 0:
-        prior_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"prior_epoch_{start_epoch}.pt")
+        prior_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"prior_epoch_{start_epoch}")
         if os.path.exists(prior_ckpt_to_load):
             print(f"Resuming Prior training from epoch {start_epoch}")
-            prior.module.load_state_dict(torch.load(prior_ckpt_to_load, map_location=device))
+            prior_model.load_weights(prior_ckpt_to_load)
         else:
             print(f"Warning: Prior checkpoint for epoch {start_epoch} not found. Starting Prior from scratch.")
             start_epoch = 0
     
+    prior = DDP(prior_model, device_ids=[local_rank])
+
     # Streaming dataset (same as CLIP)
     train_dataset = get_laion_streaming_dataset(
         HUGGINGFACE=hf_token, 
@@ -200,7 +220,7 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=HYPERPARAMS["BATCH_SIZE"],
+        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
         collate_fn=adaptive_collate,
         pin_memory=True
     )
@@ -218,14 +238,14 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
             images = images.to(device)
             optimizer.zero_grad()
             
-            # Get frozen CLIP embeddings
+            # Get frozen embeddings
             with torch.no_grad():
                 text_emb = text_encoder(texts)
-                image_emb = image_encoder(images)
+                target_grid = prior_teacher(images)
             
             # Prior forward
-            prior_emb = prior(text_emb)
-            loss = torch.mean((prior_emb - image_emb)**2)
+            prior_grid = prior(text_emb)
+            loss = PriorLoss(prior_grid, target_grid)
             
             # Backprop
             loss.backward()
@@ -246,9 +266,10 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
             print(f"Prior Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
             run.log({"prior_epoch_avg_loss": avg_epoch_loss, "prior_epoch": epoch + 1})
         
-            ckpt_path = os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"prior_epoch_{epoch+1}.pt")
-            torch.save(prior.module.state_dict(), ckpt_path)
-            print(f"Saved Prior checkpoint for epoch {epoch+1} to {ckpt_path}")
+            #Potentially add validation loss to filename and then implement early stopping
+
+            prior.module.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"prior_epoch_{epoch+1}")
+            print(f"Saved Prior checkpoint for epoch {epoch+1}")
     
     print("Prior training completed.\n")
 
@@ -572,7 +593,7 @@ def main(hf_token, wandb_key):
         run = wandb.init(mode="disabled")
 
     # Determine start epochs for each phase by checking for existing checkpoints
-    _, clip_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text") # Assuming text/image saved together
+    _, clip_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
     _, prior_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
     _, sam_decoder_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
     _, student_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")

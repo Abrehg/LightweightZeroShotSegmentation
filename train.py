@@ -1,21 +1,21 @@
 # test_pipeline.py
 import torch
 import os
-from torch.utils.data import DataLoader
-from data.custom400m import get_laion_streaming_dataset, adaptive_collate
-import argparse
-from models.prior_model import create_prior, Prior, PriorLoss, TeacherCLIP
-from models.SAM_model import VideoSAM, iou_loss
-from models.distill_model import DistilledMemoryStudent
 import time
 import re
 import glob
 import wandb
-from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
-from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
+import argparse
+from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
+from models.prior_model import create_prior, Prior, PriorLoss, TeacherCLIP
+from models.SAM_model import VideoSAM, iou_loss, create_SAM
+from models.distill_model import DistilledMemoryStudent
+from data.custom400m import get_laion_streaming_dataset, adaptive_collate
+from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 
 #Implement custom weight loading/storing functions + validation set accuracy
 
@@ -32,6 +32,8 @@ HYPERPARAMS = {
     "STUDENT_LR": 0.0001,
     "LAION_VAL_SIZE": 10000,
     "LAION_BATCH_SIZE": 64,
+    "SA_VAL_SIZE": 10000,
+    "SAV_VAL_SIZE": 100,
     "SAM_BATCH_SIZE": 512,
     "CHECKPOINT_DIR": "weights",
     "WANDB_PROJECT_NAME": "Zero Shot Segmentation",
@@ -39,9 +41,6 @@ HYPERPARAMS = {
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-# Change format to store validation weights and then choose weights with lowest error, ignore epochs
 
 # ======== Helper Function for Checkpoints ========
 def get_latest_epoch_checkpoint(directory, prefix):
@@ -365,6 +364,7 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     
     print("Prior training completed.\n")
 
+# ======== SAM Teacher Training ========
 def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
     print("\n=== Training SAM Decoder (Teacher Component) ===")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -372,8 +372,30 @@ def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
 
     text_encoder = create_text_encoder().to(device)
     prior = create_prior().to(device)
-    sam_decoder_model = VideoSAM().to(device)
-    sam_decoder = DDP(sam_decoder_model, device_ids=[local_rank])
+    sam_decoder = create_SAM().to(device)
+
+    # Load latest CLIP Text Encoder
+    latest_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+    if not latest_clip_text_ckpt: raise FileNotFoundError("CLIP text checkpoint not found for SAM Decoder training.")
+    print(f"Loading CLIP text for SAM Decoder from: {latest_clip_text_ckpt}")
+    text_encoder.load_weights(latest_clip_text_ckpt)
+
+    # Load latest Prior
+    latest_prior_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
+    if not latest_prior_ckpt: raise FileNotFoundError("Prior checkpoint not found for SAM Decoder training.")
+    print(f"Loading Prior for SAM Decoder from: {latest_prior_ckpt}")
+    prior.load_weights(latest_prior_ckpt)
+
+    # Load SAM Decoder's own latest checkpoint if resuming
+    if start_epoch > 0:
+        sam_decoder_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"sam_decoder_epoch_{start_epoch}.pt")
+        if os.path.exists(sam_decoder_ckpt_to_load):
+            sam_decoder.load_weights(sam_decoder_ckpt_to_load)
+        else:
+            print(f"Warning: SAM Decoder checkpoint for epoch {start_epoch} not found. Starting fresh.")
+            start_epoch = 0
+
+    sam_decoder = DDP(sam_decoder, device_ids=[local_rank])
 
     class TeacherModel(torch.nn.Module):
         def __init__(self):
@@ -391,31 +413,10 @@ def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
 
     teacher = TeacherModel()
 
-    # Load latest CLIP Text Encoder
-    latest_clip_text_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
-    if not latest_clip_text_ckpt: raise FileNotFoundError("CLIP text checkpoint not found for SAM Decoder training.")
-    print(f"Loading CLIP text for SAM Decoder from: {latest_clip_text_ckpt}")
-    teacher.text_encoder.load_state_dict(torch.load(latest_clip_text_ckpt, map_location=device))
-
-    # Load latest Prior
-    latest_prior_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
-    if not latest_prior_ckpt: raise FileNotFoundError("Prior checkpoint not found for SAM Decoder training.")
-    print(f"Loading Prior for SAM Decoder from: {latest_prior_ckpt}")
-    teacher.prior.load_state_dict(torch.load(latest_prior_ckpt, map_location=device))
-
     for param in teacher.text_encoder.parameters(): param.requires_grad_(False)
     for param in teacher.prior.parameters(): param.requires_grad_(False)
     teacher.text_encoder.eval()
     teacher.prior.eval()
-
-    # Load SAM Decoder's own latest checkpoint if resuming
-    if start_epoch > 0:
-        sam_decoder_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"sam_decoder_epoch_{start_epoch}.pt")
-        if os.path.exists(sam_decoder_ckpt_to_load):
-            teacher.sam_decoder.module.load_state_dict(torch.load(sam_decoder_ckpt_to_load, map_location=device))
-        else:
-            print(f"Warning: SAM Decoder checkpoint for epoch {start_epoch} not found. Starting fresh.")
-            start_epoch = 0
             
     print("[Teacher Training] Training SAM decoder...")
     optimizer_sam_decoder = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["DECODER_LR"])
@@ -469,11 +470,11 @@ def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
             print(f"SAM Decoder Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
             run.log({"sam_decoder_epoch_avg_loss": avg_epoch_loss, "sam_decoder_epoch": epoch + 1})
 
-            ckpt_path = os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"sam_decoder_epoch_{epoch+1}.pt")
-            torch.save(teacher.sam_decoder.module.state_dict(), ckpt_path)
-            print(f"Saved SAM Decoder checkpoint for epoch {epoch+1} to {ckpt_path}")
+            teacher.sam_decoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"sam_decoder_epoch_{epoch+1}.pt")
+            print(f"Saved SAM Decoder checkpoint for epoch {epoch+1}")
     print("SAM Decoder training completed.\n")
 
+# ======== SAM Student Training ========
 def train_student(dataloader, run:wandb, start_epoch = 0):
     print("\n=== Training Student (with Teacher Fine-tuning) ===")
 
@@ -482,8 +483,31 @@ def train_student(dataloader, run:wandb, start_epoch = 0):
 
     text_encoder = create_text_encoder().to(device)
     prior = create_prior().to(device)
-    sam_decoder_model = VideoSAM().to(device)
-    sam_decoder = DDP(sam_decoder_model, device_ids=[local_rank])
+    sam_decoder = create_SAM().to(device)
+
+    # Load latest CLIP Text Encoder
+    latest_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+    latest_prior_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
+    latest_sam_decoder_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
+
+    if not latest_clip_text_ckpt: raise FileNotFoundError("CLIP text ckpt not found for Student training.")
+    if not latest_prior_ckpt: raise FileNotFoundError("Prior ckpt not found for Student training.")
+    if not latest_sam_decoder_ckpt: raise FileNotFoundError("SAM Decoder ckpt not found for Student training.")
+
+    print(f"Loading for Teacher (Student Phase) - CLIP Text: {latest_clip_text_ckpt}")
+    text_encoder.load_weights(latest_clip_text_ckpt)
+    print(f"Loading for Teacher (Student Phase) - Prior: {latest_prior_ckpt}")
+    prior.load_weights(latest_prior_ckpt)
+    print(f"Loading for Teacher (Student Phase) - SAM Decoder: {latest_sam_decoder_ckpt}")
+    sam_decoder.load_weights(latest_sam_decoder_ckpt)
+
+    # Freeze text_encoder and prior for teacher during student training
+    for param in text_encoder.parameters(): param.requires_grad_(False)
+    text_encoder.eval()
+    for param in prior.parameters(): param.requires_grad_(False)
+    prior.eval()
+
+    sam_decoder = DDP(sam_decoder, device_ids=[local_rank])
 
     class TeacherModel(torch.nn.Module):
         def __init__(self):
@@ -501,42 +525,12 @@ def train_student(dataloader, run:wandb, start_epoch = 0):
 
     teacher = TeacherModel()
 
-    # Load latest CLIP Text Encoder
-    latest_clip_text_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
-    latest_prior_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
-    latest_sam_decoder_ckpt, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
-
-    if not latest_clip_text_ckpt: raise FileNotFoundError("CLIP text ckpt not found for Student training.")
-    if not latest_prior_ckpt: raise FileNotFoundError("Prior ckpt not found for Student training.")
-    if not latest_sam_decoder_ckpt: raise FileNotFoundError("SAM Decoder ckpt not found for Student training.")
-
-    print(f"Loading for Teacher (Student Phase) - CLIP Text: {latest_clip_text_ckpt}")
-    teacher.text_encoder.load_state_dict(torch.load(latest_clip_text_ckpt, map_location=device))
-    print(f"Loading for Teacher (Student Phase) - Prior: {latest_prior_ckpt}")
-    teacher.prior.load_state_dict(torch.load(latest_prior_ckpt, map_location=device))
-    print(f"Loading for Teacher (Student Phase) - SAM Decoder: {latest_sam_decoder_ckpt}")
-    teacher.sam_decoder.module.load_state_dict(torch.load(latest_sam_decoder_ckpt, map_location=device))
-
-    # Freeze text_encoder and prior for teacher during student training
-    for param in teacher.text_encoder.parameters(): param.requires_grad_(False)
-    for param in teacher.prior.parameters(): param.requires_grad_(False)
-    teacher.text_encoder.eval()
-    teacher.prior.eval()
-
-    # Load SAM Decoder's own latest checkpoint if resuming
-    if start_epoch > 0:
-        sam_decoder_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"sam_decoder_epoch_{start_epoch}.pt")
-        if os.path.exists(sam_decoder_ckpt_to_load):
-            teacher.sam_decoder.module.load_state_dict(torch.load(sam_decoder_ckpt_to_load, map_location=device))
-        else:
-            print(f"Warning: SAM Decoder checkpoint for epoch {start_epoch} not found. Starting fresh.")
-            start_epoch = 0
-
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}')
 
-    student = DDP(DistilledMemoryStudent().to(device), device_ids=[local_rank]) # Assuming DistilledMemoryStudent is defined
-    student.register_teacher(teacher) 
+    student = DistilledMemoryStudent().to(device)
+    student.register_teacher(teacher)
+    student = DDP(student, device_ids=[local_rank])
 
     if start_epoch > 0:
         student_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"student_phase_student_epoch_{start_epoch}.pt")
@@ -545,8 +539,8 @@ def train_student(dataloader, run:wandb, start_epoch = 0):
         if os.path.exists(student_ckpt_to_load):
             print(f"Resuming Student training from epoch {start_epoch}")
             student.module.load_state_dict(torch.load(student_ckpt_to_load, map_location=device))
-            if os.path.exists(teacher_sam_decoder_ckpt_to_load): # Also load teacher's SAM decoder state from this phase
-                teacher.sam_decoder.module.load_state_dict(torch.load(teacher_sam_decoder_ckpt_to_load, map_location=device))
+            if os.path.exists(teacher_sam_decoder_ckpt_to_load):
+                teacher.sam_decoder.load_weights(teacher_sam_decoder_ckpt_to_load)
             else:
                 print(f"Warning: Student phase teacher SAM decoder checkpoint for epoch {start_epoch} not found. Using SAM decoder from dedicated training.")
         else:
@@ -637,16 +631,15 @@ def train_student(dataloader, run:wandb, start_epoch = 0):
 
             # Save checkpoints for this phase
             # Teacher components (text encoder and prior are frozen, but saved if that's the desired package)
-            # torch.save(teacher.text_encoder.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_text_encoder_epoch_{epoch+1}.pt"))
-            # torch.save(teacher.prior.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_prior_epoch_{epoch+1}.pt"))
-            torch.save(teacher.sam_decoder.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_sam_decoder_epoch_{epoch+1}.pt"))
+            # teacher.text_encoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_text_encoder_epoch_{epoch+1}")
+            # teacher.prior.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_prior_epoch_{epoch+1}")
+            teacher.sam_decoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_sam_decoder_epoch_{epoch+1}")
             torch.save(student.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_student_epoch_{epoch+1}.pt"))
             print(f"Saved Student Phase checkpoints for epoch {epoch+1}")
 
     print("Student training completed.\n")
 
 def setup_ddp():
-    """Initializes the distributed process group."""
     dist.init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
@@ -654,26 +647,19 @@ def is_main_process():
     return dist.get_rank() == 0
 
 def main(hf_token, wandb_key):
-    """Central training orchestration function"""
     setup_ddp()
 
-    # Login to W&B on the main process
     if is_main_process():
         try:
             wandb.login(key=wandb_key)
         except wandb.errors.UsageError as e:
             print(f"Failed to login to W&B: {e}")
-            # Decide if you want to exit or continue without logging
             return 
 
-    # Create checkpoint directory if it doesn't exist on the main process
     if is_main_process():
         os.makedirs(HYPERPARAMS["CHECKPOINT_DIR"], exist_ok=True)
-    
-    # All processes will wait here until the directory is created
     dist.barrier()
 
-    # Initialize W&B run (all processes do this, but only main process logs)
     if is_main_process():
         run = wandb.init(
             project=HYPERPARAMS["WANDB_PROJECT_NAME"],
@@ -815,9 +801,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
     
-    # Setup torch environment
     torch.multiprocessing.freeze_support()
     torch.manual_seed(42)
     
-    # Update the main function call
     main(args.token, args.wandb_key)

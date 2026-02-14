@@ -15,12 +15,10 @@ import random
 import re
 
 def SAM_adaptive_collate(batch):
-    """Handle variable-sized images by stacking as lists"""
     images, masks, texts = zip(*batch)
     return list(images), list(masks), list(texts)
 
 class CaptionGenerator:
-    """A helper class to centralize all captioning models and logic."""
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         if device:
             self.device = device
@@ -68,9 +66,6 @@ class CaptionGenerator:
         return caption.strip(" .,")
 
     def generate_all_captions(self, image, mask, index):
-        """
-        Generates a single caption for a masked object from a random choice of models.
-        """
         # Convert to PIL Image and crop to the masked region's bounding box
         image_pil = F.to_pil_image(image)
         mask_pil = F.to_pil_image(mask.float())
@@ -123,15 +118,7 @@ class CaptionGenerator:
                 return self._post_process_caption(caption)
 
 class BaseTarDataset(Dataset):
-    """Base class for tar-based segmentation datasets"""
     def __init__(self, root_dir, file_list, max_retries=3, verify_files=True):
-        """
-        Args:
-            root_dir (str): Root directory for storage
-            file_list (list): List of (filename, url) tuples
-            transform (callable): Optional transform
-            max_retries (int): Number of download retries
-        """
         self.root_dir = root_dir
         self.file_list = file_list
         self.transform = transforms.Compose([transforms.ToTensor()])
@@ -145,7 +132,6 @@ class BaseTarDataset(Dataset):
             self.available_files = []
 
     def _download_file(self, url, dest_path):
-        """Download with retries and progress tracking"""
         print(f"Attempting to download: {url}")
         for _ in range(self.max_retries):
             try:
@@ -163,7 +149,6 @@ class BaseTarDataset(Dataset):
         return False
 
     def _verify_files(self):
-        """Check local cache and download missing files"""
         print(f"\n=== Verifying {len(self.file_list)} files ===")
         valid_files = []
         for filename, url in self.file_list:
@@ -179,7 +164,6 @@ class BaseTarDataset(Dataset):
         return valid_files
 
     def _load_from_tar(self, tar_path):
-        """Load images and masks from tar file"""
         with tarfile.open(tar_path, "r") as tar:
             members = tar.getmembers()
     
@@ -192,7 +176,6 @@ class BaseTarDataset(Dataset):
         self._available_files = value
 
 class SA1BDataset(BaseTarDataset):
-    """Segment Anything 1B Dataset"""
     def __init__(self, root_dir, file_list, 
                  device='cuda' if torch.cuda.is_available() else 'cpu', build_index = True, verify_files=True):
         super().__init__(root_dir, file_list, max_retries=3, verify_files=verify_files)
@@ -208,7 +191,6 @@ class SA1BDataset(BaseTarDataset):
         self.caption_generator = CaptionGenerator(device=self.device)
 
     def _build_index(self):
-        """Create index with enhanced validation using pycocotools"""
         print("\n=== Building SA-1B dataset index ===")
         samples = []
         tar_idx = 1
@@ -303,8 +285,6 @@ class SA1BDataset(BaseTarDataset):
         self._samples = value
 
 class SAVDataset(BaseTarDataset):
-    """Segment Anything Video Dataset"""
-
     def __init__(self, root_dir, file_list,
                  device='cuda' if torch.cuda.is_available() else 'cpu', build_index=True,
                  verify_files=True):
@@ -323,8 +303,6 @@ class SAVDataset(BaseTarDataset):
         self.caption_generator = CaptionGenerator(device=self.device)
 
     def _build_index(self):
-        """Create index for SA-V dataset by iterating through video files"""
-
         print("\n=== Building SA-V dataset index ===")
         samples = []
         tar_idx = 1

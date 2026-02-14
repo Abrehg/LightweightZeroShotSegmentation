@@ -7,45 +7,12 @@ import io
 from torchvision import transforms
 from typing import Optional, Callable
 
-def _conditional_crop_pad(img: Image.Image, target_size: int) -> Image.Image:
-    """Custom transform to crop/pad images to target_size without resizing"""
-    width, height = img.size
-    
-    # Phase 1: Center cropping for oversized dimensions
-    if width > target_size:
-        left = (width - target_size) // 2
-        img = img.crop((left, 0, left + target_size, height))
-        width = target_size
-        
-    if height > target_size:
-        top = (height - target_size) // 2
-        img = img.crop((0, top, width, top + target_size))
-        height = target_size
-    
-    # Phase 2: Symmetric padding for undersized dimensions
-    pad_w = max(target_size - width, 0)
-    pad_h = max(target_size - height, 0)
-    
-    if pad_w > 0 or pad_h > 0:
-        img = transforms.functional.pad(
-            img, 
-            padding=(pad_w//2, pad_h//2, pad_w - pad_w//2, pad_h - pad_h//2),
-            fill=0,
-            padding_mode='constant'
-        )
-    
-    return img
+# Standard CLIP stats
+OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
+OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
 
-class ConditionalCropPad:
-    """Serializable version of the crop/pad transform"""
-    def __init__(self, target_size: int):
-        self.target_size = target_size
-    
-    def __call__(self, img: Image.Image) -> Image.Image:
-        return _conditional_crop_pad(img, self.target_size)
-
+#Streaming version of LAION Dataset for training phase
 class StreamingLAIONDataset(IterableDataset):
-    """Full streaming dataset for training"""
     def __init__(
         self,
         HUGGINGFACE_TOKEN,
@@ -54,7 +21,9 @@ class StreamingLAIONDataset(IterableDataset):
         min_size: int = 32,
         max_aspect_ratio: float = 4.0,
         sample_timeout: int = 10,
-        image_size: int = 512
+        image_size: int = 224,
+        split_mode: str = "train",
+        val_size: int = 10000
     ):
         self.text_processor = text_processor
         self.max_retries = max_retries
@@ -62,9 +31,14 @@ class StreamingLAIONDataset(IterableDataset):
         self.max_aspect_ratio = max_aspect_ratio
         self.sample_timeout = sample_timeout
         self.image_size = image_size
+        self.split_mode = split_mode
+        self.val_size = val_size
+
         self.transform = transforms.Compose([
-            ConditionalCropPad(self.image_size),
+            transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(self.image_size),
             transforms.ToTensor(),
+            transforms.Normalize(mean=OPENAI_DATASET_MEAN, std=OPENAI_DATASET_STD)
         ])
         
         self.hf_dataset = load_dataset(
@@ -74,8 +48,15 @@ class StreamingLAIONDataset(IterableDataset):
             token=HUGGINGFACE_TOKEN
         )
 
+        if self.split_mode == "train":
+            self.hf_dataset = self.hf_dataset.skip(self.val_size)
+            self.hf_dataset = self.hf_dataset.shuffle(seed=42, buffer_size=10000)
+        elif self.split_mode == "val":
+            self.hf_dataset = self.hf_dataset.take(self.val_size)
+        else:
+            raise ValueError(f"Unknown split_mode: {self.split_mode}")
+
     def _is_valid(self, img: Image.Image) -> bool:
-        """Validate image dimensions"""
         w, h = img.size
         return (
             min(w, h) >= self.min_size and
@@ -83,7 +64,6 @@ class StreamingLAIONDataset(IterableDataset):
         )
 
     def _process_sample(self, sample: dict) -> Optional[tuple]:
-        """Process single sample with retries"""
         for _ in range(self.max_retries):
             try:
                 response = requests.get(
@@ -118,8 +98,8 @@ class StreamingLAIONDataset(IterableDataset):
             if processed is not None:
                 yield processed
 
+#Cached version of LAION Dataset for testing/validation
 class CachedLAIONDataset(Dataset):
-    """Fixed-size cached dataset for testing/validation"""
     def __init__(
         self,
         HUGGINGFACE_TOKEN,
@@ -128,7 +108,9 @@ class CachedLAIONDataset(Dataset):
         min_size: int = 32,
         max_aspect_ratio: float = 4.0,
         seed: int = 42,
-        image_size: int = 512
+        image_size: int = 224,
+        split_mode: str = "train",
+        val_split_boundary: int = 10000
     ):
         self.num_samples = num_samples
         self.text_processor = text_processor
@@ -136,9 +118,14 @@ class CachedLAIONDataset(Dataset):
         self.max_aspect_ratio = max_aspect_ratio
         self.seed = seed
         self.image_size = image_size
+        self.split_mode = split_mode
+        self.val_split_boundary = val_split_boundary
+
         self.transform = transforms.Compose([
-            ConditionalCropPad(self.image_size),  # Replaces lambda
+            transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(self.image_size),
             transforms.ToTensor(),
+            transforms.Normalize(mean=OPENAI_DATASET_MEAN, std=OPENAI_DATASET_STD)
         ])
 
         self.samples = self._precache_samples(HUGGINGFACE_TOKEN)
@@ -151,24 +138,37 @@ class CachedLAIONDataset(Dataset):
         )
 
     def _precache_samples(self, HUGGINGFACE_TOKEN) -> list:
-        """Pre-download and cache validated samples"""
-        print(f"\n[Dataset] Precaching {self.num_samples} samples...")
-        dataset = load_dataset(
-            "laion/laion400m",
-            split="train",
-            streaming=True,
-            token=HUGGINGFACE_TOKEN
-        ).shuffle(seed=self.seed)
+        print(f"\n[CachedDataset] Mode: {self.split_mode}. Target Samples: {self.num_samples}")
+        
+        try:
+            dataset = load_dataset(
+                "laion/laion400m",
+                split="train",
+                streaming=True,
+                token=HUGGINGFACE_TOKEN
+            )
+            
+            if self.split_mode == "val":
+                dataset = dataset.take(self.val_split_boundary)
+            elif self.split_mode == "train":
+                dataset = dataset.skip(self.val_split_boundary)
+            
+            dataset = dataset.shuffle(seed=self.seed)
+            
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            return []
 
         samples = []
-        for idx, sample in enumerate(dataset):
+        iterator = iter(dataset)
+        
+        while len(samples) < self.num_samples:
             try:
-                print(f"[Cached Dataset] Attempting sample {idx+1}/{self.num_samples}")
+                sample = next(iterator)
                 response = requests.get(sample['url'], timeout=10)
                 img = Image.open(io.BytesIO(response.content)).convert("RGB")
             
                 if not self._is_valid(img):
-                    print(f"[Cached Dataset] Sample {idx+1} failed validation")
                     continue
             
                 text = sample['caption']
@@ -176,17 +176,20 @@ class CachedLAIONDataset(Dataset):
                     text = self.text_processor(text)
             
                 samples.append((self.transform(img), text))
-                print(f"[Cached Dataset] Sample {len(samples)}/{self.num_samples} cached")
-            
-                if len(samples) >= self.num_samples:
-                    print("[Cached Dataset] Precaching complete")
-                    break
+                
+                if len(samples) % 100 == 0:
+                     print(f"Cached {len(samples)}/{self.num_samples}...")
+
+            except StopIteration:
+                print("Stream exhausted before filling cache.")
+                break
             except Exception as e:
-                print(f"[Cached Dataset] Error processing sample {idx+1}: {str(e)}")
                 continue
     
         if len(samples) < self.num_samples:
-            print(f"\n⚠️ Warning: Only collected {len(samples)}/{self.num_samples} samples!")
+            print(f"\n Warning: Only collected {len(samples)}/{self.num_samples} samples!")
+        else:
+            print("[Cached Dataset] Precaching complete")
     
         return samples
 
@@ -197,22 +200,33 @@ class CachedLAIONDataset(Dataset):
         return self.samples[idx]
 
 def adaptive_collate(batch):
-    """Collate function that stacks images and texts"""
     batch = [item for item in batch if item is not None]
     if not batch:
-        return None, None
+        return None
     
     images, texts = zip(*batch)
     images = torch.stack(images)
     
-    # Stack text tensors if they're not already batched
-    if isinstance(texts[0], torch.Tensor):
+    if len(texts) > 0 and isinstance(texts[0], torch.Tensor):
         texts = torch.stack(texts).squeeze(1)
     
     return images, texts
 
-def get_laion_test_dataset(HUGGINGFACE, num_samples=5, text_processor=None):
-    return CachedLAIONDataset(HUGGINGFACE_TOKEN=HUGGINGFACE, num_samples=num_samples, text_processor=text_processor)
+# Call twice for train/val splits. once with split="train" and once with split="val"
+def get_laion_streaming_dataset(HUGGINGFACE, val_size, text_processor=None, split="train"):
+    return StreamingLAIONDataset(
+        HUGGINGFACE_TOKEN=HUGGINGFACE, 
+        text_processor=text_processor,
+        split_mode=split,
+        val_size=val_size
+    )
 
-def get_laion_streaming_dataset(HUGGINGFACE, text_processor=None):
-    return StreamingLAIONDataset(HUGGINGFACE_TOKEN=HUGGINGFACE, text_processor=text_processor)
+# Call twice for train/val splits. once with split="train" and once with split="val"
+def get_laion_test_dataset(HUGGINGFACE, val_boundary, num_samples=1000, text_processor=None, split = "train"):
+    return CachedLAIONDataset(
+        HUGGINGFACE_TOKEN=HUGGINGFACE, 
+        num_samples=num_samples, 
+        text_processor=text_processor,
+        split_mode=split,
+        val_split_boundary=val_boundary
+    )

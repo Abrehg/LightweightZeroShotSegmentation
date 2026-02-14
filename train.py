@@ -21,15 +21,16 @@ from torch.utils.data.distributed import DistributedSampler
 
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
-    "CLIP_EPOCHS": 1, #10,
-    "PRIOR_EPOCHS": 1, #10,
+    "CLIP_EPOCHS": 10,
+    "PRIOR_EPOCHS": 10,
     "SAM_DECODER_EPOCHS": 1,
-    "TEACHER_STUDENT_EPOCHS": 1, #10,
+    "TEACHER_STUDENT_EPOCHS": 10,
     "CLIP_LR": 0.0001,
     "PRIOR_LR": 0.0001,
     "DECODER_LR": 0.0001, # For SAM Decoder training
     "TEACHER_LR": 0.00001, # For teacher fine-tuning during student training
     "STUDENT_LR": 0.0001,
+    "LAION_VAL_SIZE": 10000,
     "LAION_BATCH_SIZE": 64,
     "SAM_BATCH_SIZE": 512,
     "CHECKPOINT_DIR": "weights",
@@ -73,19 +74,25 @@ def get_best_weights_checkpoint(directory, prefix):
     if not files:
         return None, -1
 
-    latest_epoch = -1
+    best_loss = float('inf')
     best_file = None
+    best_epoch = -1
     
     for f_path in files:
         filename = os.path.basename(f_path)
-        match = re.search(rf"{prefix}_epoch_(\d+)", filename)
+        match = re.search(rf"{prefix}_epoch_(\d+)_([\d\.]+)", filename)
         if match:
             epoch = int(match.group(1))
-            if epoch > latest_epoch:
-                latest_epoch = epoch
+            loss = float(match.group(2))
+            if loss < best_loss:
+                best_loss = loss
                 best_file = f_path
+                best_epoch = epoch
+    
+    if best_file is None:
+        return get_latest_epoch_checkpoint(directory, prefix)
                 
-    return best_file, latest_epoch
+    return best_file, best_epoch
 
 # ======== CLIP Training ========
 def train_clip(hf_token, run: wandb, start_epoch = 0):
@@ -116,7 +123,9 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
     # Streaming dataset
     train_dataset = get_laion_streaming_dataset(
         HUGGINGFACE = hf_token, 
-        text_processor = CLIPTokenize
+        text_processor = CLIPTokenize,
+        split = "train",
+        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
     )
     train_loader = DataLoader(
         train_dataset,
@@ -125,6 +134,19 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
         pin_memory=True
     )
     
+    val_dataset = get_laion_streaming_dataset(
+        HUGGINGFACE = hf_token, 
+        text_processor = CLIPTokenize,
+        split = "val",
+        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+        collate_fn=adaptive_collate,
+        pin_memory=True
+    )
+
     # Training loop
     for epoch in range(start_epoch, HYPERPARAMS["CLIP_EPOCHS"]):
         clip_model.train()
@@ -162,13 +184,42 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
         
         if is_main_process():
             avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
-            print(f"CLIP Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
-            run.log({"clip_epoch_avg_loss": avg_epoch_loss, "clip_epoch": epoch + 1})
+            print(f"CLIP Epoch {epoch+1} Average Train Loss: {avg_epoch_loss:.4f}")
 
-            #Potentially add validation loss to filename and then implement early stopping
+        # --- VALIDATION ---
+        clip_model.eval()
+        total_val_loss = 0.0
+        iterations = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                if batch is not None:
+                    images, texts = batch
+                    images = images.to(device)
+                    
+                    text_features, image_features, logit_scale = clip_model(texts, images)
+                    logits_per_image = logit_scale * image_features @ text_features.t()
+                    logits_per_text = logit_scale * text_features @ image_features.t()
+                    loss = clip_contrastive_loss(logits_per_image, logits_per_text)
+                    
+                    total_val_loss += loss.item()
+                    iterations += 1
 
-            clip_model.store_weights(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{epoch+1}", f"clip_image_epoch_{epoch+1}", f"clip_wrapper_epoch_{epoch+1}")
-            print(f"Saved CLIP checkpoints for epoch {epoch+1}")
+        avg_val_loss = 999.9
+        if iterations > 0:
+            avg_val_loss = total_val_loss / iterations
+
+        if is_main_process():
+            print(f"CLIP Epoch {epoch+1} Single-Batch Val Loss: {avg_val_loss:.4f}")
+            run.log({"clip_epoch_val_loss": avg_val_loss, "clip_epoch": epoch + 1})
+
+            clip_model.module.store_weights(
+                HYPERPARAMS['CHECKPOINT_DIR'], 
+                f"clip_text_epoch_{epoch+1}_{avg_val_loss:.4f}", 
+                f"clip_image_epoch_{epoch+1}_{avg_val_loss:.4f}", 
+                f"clip_wrapper_epoch_{epoch+1}_{avg_val_loss:.4f}"
+            )
+            print(f"Saved CLIP checkpoints for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
     
     print("CLIP training completed.\n")
 
@@ -178,11 +229,11 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}')
 
-    # Load frozen CLIP
+    # Load CLIP and teacher
     text_encoder = create_text_encoder().to(device)
     prior_teacher = TeacherCLIP().to(device)
     
-    # Load latest CLIP checkpoint
+    # Load best CLIP checkpoint
     best_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
 
     if not best_clip_text_ckpt:
@@ -191,7 +242,7 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     print(f"Loading CLIP text from: {best_clip_text_ckpt}")
     text_encoder.load_weights(best_clip_text_ckpt)
     
-    # Freeze CLIP
+    # Freeze CLIP and teacher
     for param in text_encoder.parameters(): param.requires_grad_(False)
     text_encoder.eval()
     for param in prior_teacher.parameters(): param.requires_grad_(False)
@@ -215,11 +266,26 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
 
     # Streaming dataset (same as CLIP)
     train_dataset = get_laion_streaming_dataset(
-        HUGGINGFACE=hf_token, 
-        text_processor=CLIPTokenize
+        HUGGINGFACE = hf_token, 
+        text_processor = CLIPTokenize,
+        split = "train",
+        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
     )
     train_loader = DataLoader(
         train_dataset,
+        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+        collate_fn=adaptive_collate,
+        pin_memory=True
+    )
+    
+    val_dataset = get_laion_streaming_dataset(
+        HUGGINGFACE = hf_token, 
+        text_processor = CLIPTokenize,
+        split = "val",
+        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
+    )
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
         collate_fn=adaptive_collate,
         pin_memory=True
@@ -264,12 +330,38 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
         if is_main_process():
             avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
             print(f"Prior Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
-            run.log({"prior_epoch_avg_loss": avg_epoch_loss, "prior_epoch": epoch + 1})
-        
-            #Potentially add validation loss to filename and then implement early stopping
 
-            prior.module.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"prior_epoch_{epoch+1}")
-            print(f"Saved Prior checkpoint for epoch {epoch+1}")
+        # --- VALIDATION ---
+        prior.eval()
+        total_val_loss = 0.0
+        iterations = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                if batch is not None:
+                    images, texts = batch
+                    images = images.to(device)
+                    
+                    text_emb = text_encoder(texts)
+                    target_grid = prior_teacher(images)
+                    prior_grid = prior(text_emb)
+                    loss = PriorLoss(prior_grid, target_grid)
+                    
+                    total_val_loss += loss.item()
+                    iterations += 1
+        avg_val_loss = 999.9
+        if iterations > 0:
+            avg_val_loss = total_val_loss / iterations
+
+        if is_main_process():
+            print(f"Prior Epoch {epoch+1} Single-Batch Val Loss: {avg_val_loss:.4f}")
+            run.log({"prior_val_loss": avg_val_loss, "prior_epoch": epoch + 1})
+        
+            prior.module.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"prior_epoch_{epoch+1}_{avg_val_loss:.4f}"
+            )
+            print(f"Saved Prior checkpoint for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
     
     print("Prior training completed.\n")
 

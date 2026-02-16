@@ -1,4 +1,4 @@
-# test_pipeline.py
+# train.py
 import torch
 import os
 import time
@@ -17,13 +17,11 @@ from models.distill_model import DistilledMemoryStudent
 from data.custom400m import get_laion_streaming_dataset, adaptive_collate
 from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 
-#Implement custom weight loading/storing functions + validation set accuracy
-
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
     "CLIP_EPOCHS": 10,
     "PRIOR_EPOCHS": 10,
-    "SAM_DECODER_EPOCHS": 1,
+    "SAM_DECODER_EPOCHS": 3,
     "TEACHER_STUDENT_EPOCHS": 10,
     "CLIP_LR": 0.0001,
     "PRIOR_LR": 0.0001,
@@ -365,7 +363,7 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     print("Prior training completed.\n")
 
 # ======== SAM Teacher Training ========
-def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
+def train_SAM_decoder(train_dataloader, val_dataloader, run: wandb, start_epoch = 0):
     print("\n=== Training SAM Decoder (Teacher Component) ===")
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}')
@@ -426,8 +424,7 @@ def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
         total_loss = 0.0
         
         batch_count = 0
-        for batch_idx, batch in enumerate(dataloader):
-            total_batch_loss = 0.0
+        for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
                 continue
 
@@ -444,7 +441,6 @@ def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
                 txt = txt.to(device)
 
                 with torch.autograd.detect_anomaly():
-                    # Forward pass
                     pred_mask = teacher.forward(img, txt)
 
                     loss = iou_loss(pred_mask, mask)
@@ -470,12 +466,47 @@ def train_SAM_decoder(dataloader, run: wandb, start_epoch = 0):
             print(f"SAM Decoder Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
             run.log({"sam_decoder_epoch_avg_loss": avg_epoch_loss, "sam_decoder_epoch": epoch + 1})
 
-            teacher.sam_decoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"sam_decoder_epoch_{epoch+1}.pt")
-            print(f"Saved SAM Decoder checkpoint for epoch {epoch+1}")
+        # Full Validation Step
+        teacher.sam_decoder.eval()
+        total_val_loss = 0.0
+        iterations = 0
+        
+        with torch.no_grad():
+            for batch in val_dataloader:
+                if batch is None:
+                    continue
+                
+                images, true_masks, texts = batch
+
+                for img, mask, txt in zip(images, true_masks, texts):
+                    mask = mask.to(device).float()
+                    img = img.to(device)
+                    txt = txt.to(device)
+
+                    pred_mask = teacher.forward(img, txt)
+
+                    loss = iou_loss(pred_mask, mask)
+                    total_val_loss += loss.item()
+
+                iterations += 1
+        avg_val_loss = 999.9
+        if iterations > 0:
+            avg_val_loss = total_val_loss / iterations
+
+        if is_main_process():
+            print(f"SAM Decoder Epoch {epoch+1} Single-Batch Val Loss: {avg_val_loss:.4f}")
+            run.log({"sam_decoder_epoch_avg_loss": avg_val_loss, "sam_decoder_epoch": epoch + 1})
+        
+            teacher.sam_decoder.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"sam_decoder_epoch_{epoch+1}_{avg_val_loss:.4f}")
+
+            print(f"Saved SAM Decoder checkpoint for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
+
     print("SAM Decoder training completed.\n")
 
 # ======== SAM Student Training ========
-def train_student(dataloader, run:wandb, start_epoch = 0):
+def train_student(train_dataloader, val_dataloader, run:wandb, start_epoch = 0):
     print("\n=== Training Student (with Teacher Fine-tuning) ===")
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -559,7 +590,7 @@ def train_student(dataloader, run:wandb, start_epoch = 0):
         total_student_loss = 0.0
         batch_count = 0
 
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
                 continue
 
@@ -629,13 +660,49 @@ def train_student(dataloader, run:wandb, start_epoch = 0):
                 "student_phase_epoch": epoch + 1
             })
 
+        # Full Validation Step
+        teacher.sam_decoder.eval()
+        student.eval()
+        total_teacher_val_loss = 0.0
+        total_student_val_loss = 0.0
+        iterations = 0
+        
+        with torch.no_grad():
+            for batch in val_dataloader:
+                if batch is not None:
+                    for img, mask, txt in zip(images, true_masks, texts):
+                        teacher_out = teacher(img, txt)
+                        student_out = student(img, txt)
+
+                        teacher_loss = iou_loss(teacher_out, mask)
+                        student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask)
+
+                        total_teacher_val_loss += teacher_loss.item()
+                        total_student_val_loss += student_loss.item()
+
+                    iterations += 1
+        avg_teacher_val_loss = 999.9
+        avg_student_val_loss = 999.9
+        if iterations > 0:
+            avg_teacher_val_loss = total_teacher_val_loss / iterations
+            avg_student_val_loss = total_student_val_loss / iterations
+
+        if is_main_process():
+            print(f"SAM Decoder Epoch {epoch+1} Single-Batch Val Loss: {avg_teacher_val_loss:.4f}")
+            run.log({"sam_decoder_epoch_avg_loss": avg_teacher_val_loss, "sam_decoder_epoch": epoch + 1})
+        
             # Save checkpoints for this phase
             # Teacher components (text encoder and prior are frozen, but saved if that's the desired package)
             # teacher.text_encoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_text_encoder_epoch_{epoch+1}")
             # teacher.prior.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_prior_epoch_{epoch+1}")
-            teacher.sam_decoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_sam_decoder_epoch_{epoch+1}")
-            torch.save(student.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_student_epoch_{epoch+1}.pt"))
-            print(f"Saved Student Phase checkpoints for epoch {epoch+1}")
+            teacher.sam_decoder.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"student_phase_teacher_sam_decoder_epoch_{epoch+1}_{avg_teacher_val_loss:.4f}"
+            )
+
+            torch.save(student.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_student_epoch_{epoch+1}_{avg_student_val_loss:.4f}"))
+
+            print(f"Saved Student Phase checkpoints for epoch {epoch+1} (Teacher Val Loss: {avg_teacher_val_loss:.4f}, Student Val Loss: {avg_student_val_loss:.4f})")
 
     print("Student training completed.\n")
 
@@ -645,6 +712,45 @@ def setup_ddp():
 
 def is_main_process():
     return dist.get_rank() == 0
+
+def get_dataset(dataset_cls, file_list, cache_prefix, split_name, val_size):
+    cache_path = f"{cache_prefix}_{split_name}.pth"
+        
+    if os.path.exists(cache_path):
+        print(f"\nLoading cached {split_name} dataset from {cache_path}...")
+        start = time.time()
+        cache = torch.load(cache_path)
+            
+        # Create without index build
+        dataset = dataset_cls(
+            root_dir="./data", 
+            file_list=file_list,
+            build_index=False,
+            verify_files=False,
+            split=split_name,
+            val_size=val_size
+        )
+        # Restore state
+        dataset.samples = cache['samples']
+        dataset.available_files = cache['available_files']
+        print(f"Loaded {split_name} dataset in {time.time()-start:.1f}s")
+    else:
+        print(f"\nBuilding {split_name} dataset index...")
+        dataset = dataset_cls(
+            root_dir="./data",
+            file_list=file_list,
+            build_index=True,
+            verify_files=True,
+            split=split_name,
+            val_size=val_size
+        )
+        if is_main_process():
+            print(f"Caching {split_name} dataset...")
+            torch.save({
+                'samples': dataset.samples,
+                'available_files': dataset.available_files
+            }, cache_path)
+    return dataset
 
 def main(hf_token, wandb_key):
     setup_ddp()
@@ -693,105 +799,55 @@ def main(hf_token, wandb_key):
         with open(file_path) as f:
             return [line.strip().split('\t') for line in f.readlines()[1:]]
 
-    print("Initializing SA-1B dataset")
+    print("Initializing SAM datasets")
     sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
-
-    print("Initializing SA-V dataset")
     sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
 
-    CACHE_PATH = "img_dataset_cache.pth"
+    # 1. Instantiate Training Datasets
+    sa1b_train = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "train", HYPERPARAMS["SA_VAL_SIZE"])
+    sav_train = get_dataset(SAVDataset, sav_files, "sav_cache", "train", HYPERPARAMS["SAV_VAL_SIZE"])
+    
+    # 2. Instantiate Validation Datasets
+    sa1b_val = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "val", HYPERPARAMS["SA_VAL_SIZE"])
+    sav_val = get_dataset(SAVDataset, sav_files, "sav_cache", "val", HYPERPARAMS["SAV_VAL_SIZE"])
 
-    # Try loading cached dataset FIRST
-    if os.path.exists(CACHE_PATH):
-        print("\nLoading cached dataset...")
-        start = time.time()
-        cache = torch.load(CACHE_PATH)
-        
-        # Create dataset WITHOUT building index
-        sa1b_dataset = SA1BDataset(
-            root_dir="./data", 
-            file_list=sa1b_files,
-            build_index=False,
-            verify_files=False
-        )
-        
-        # Restore cached state
-        sa1b_dataset.samples = cache['samples']
-        sa1b_dataset.available_files = cache['available_files']
-        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
-    else:
-        # Create dataset WITH index building
-        sa1b_dataset = SA1BDataset(
-            root_dir="./data",
-            file_list=sa1b_files,
-            build_index=True,
-            verify_files=True
-        )
-        # Save cache
-        print("\nCaching dataset...")
-        torch.save({
-            'samples': sa1b_dataset.samples,
-            'available_files': sa1b_dataset.available_files
-        }, CACHE_PATH)
+    # 3. Create Datasets
+    train_dataset = torch.utils.data.ConcatDataset([sa1b_train, sav_train])
+    val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
 
-    VIDEO_CACHE_PATH = "video_dataset_cache.pth"
+    train_sampler = DistributedSampler(train_dataset)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
 
-    if os.path.exists(VIDEO_CACHE_PATH):
-        print("\nLoading cached dataset...")
-        start = time.time()
-        cache = torch.load(VIDEO_CACHE_PATH)
-        
-        # Create dataset WITHOUT building index
-        sav_dataset = SAVDataset(
-            root_dir="./data",
-            file_list=sav_files,
-            build_index=False,
-            verify_files=False
-        )
-        
-        # Restore cached state
-        sav_dataset.samples = cache['samples']
-        sav_dataset.available_files = cache['available_files']
-        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
-    else:
-        # Create dataset WITH index building
-        sav_dataset = SAVDataset(
-            root_dir="./data", 
-            file_list=sav_files,
-            build_index=True,
-            verify_files=True
-        )
-        # Save cache
-        print("\nCaching dataset...")
-        torch.save({
-            'samples': sav_dataset.samples,
-            'available_files': sav_dataset.available_files
-        }, VIDEO_CACHE_PATH)
-
-    combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
-    sampler = DistributedSampler(combined_dataset)
-    dataloader = DataLoader(combined_dataset, 
+    train_dataloader = DataLoader(train_dataset, 
                             batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
                             shuffle=False, 
                             num_workers=10, 
                             collate_fn=SAM_adaptive_collate, 
                             pin_memory=True,
-                            sampler=sampler)
+                            sampler=train_sampler)
+    
+    val_dataloader = DataLoader(val_dataset, 
+                            batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+                            shuffle=False, 
+                            num_workers=10, 
+                            collate_fn=SAM_adaptive_collate, 
+                            pin_memory=True,
+                            sampler=val_sampler)
 
     if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
         print("\n🚀 Starting SAM Decoder Training Phase")
-        train_SAM_decoder(dataloader, start_epoch=sam_decoder_start_epoch + 1, run=run)
+        train_SAM_decoder(train_dataloader, val_dataloader, start_epoch=sam_decoder_start_epoch + 1, run=run)
     else:
         print("\n✅ SAM Decoder training already completed or up to date.")
 
     if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
         print("\n🚀 Starting Student Training Phase")
-        train_student(dataloader, start_epoch=student_start_epoch + 1, run=run)
+        train_student(train_dataloader, val_dataloader, start_epoch=student_start_epoch + 1, run=run)
     else:
         print("\n✅ Student training already completed or up to date.")
     
     print("\n🏁 All training phases processed!")
-    run.finish() # Finish W&B run
+    run.finish()
 
 # ======== Main ========
 if __name__ == "__main__":

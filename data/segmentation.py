@@ -177,13 +177,29 @@ class BaseTarDataset(Dataset):
 
 class SA1BDataset(BaseTarDataset):
     def __init__(self, root_dir, file_list, 
-                 device='cuda' if torch.cuda.is_available() else 'cpu', build_index = True, verify_files=True):
+                 device='cuda' if torch.cuda.is_available() else 'cpu', 
+                 build_index = True, 
+                 verify_files=True,
+                 split="train",
+                 val_size=1000,
+                 seed=42):
         super().__init__(root_dir, file_list, max_retries=3, verify_files=verify_files)
         self.device = device
+        self.split = split
+        self.val_size = val_size
+        self.seed = seed
 
         if build_index:
-            self.samples = self._build_index()
-            random.shuffle(self.samples)
+            all_samples = self._build_index()
+            rng = random.Random(self.seed)
+            rng.shuffle(all_samples)
+            
+            if self.split == 'train':
+                self.samples = all_samples[self.val_size:]
+            elif self.split == 'val':
+                self.samples = all_samples[:self.val_size]
+            else:
+                raise ValueError(f"Invalid split '{self.split}'. Must be 'train' or 'val'.")
         else:
             self.samples = []
         
@@ -219,16 +235,14 @@ class SA1BDataset(BaseTarDataset):
                             continue
                         
                         valid_ann_indices = []
-                        print(f"Found {len(data['annotations'])} annotations")
                         for ann_idx in range(len(data['annotations'])):
                             try:
                                 ann = data['annotations'][ann_idx]
-                                # Validate with pycocotools
                                 rle = {
                                     'counts': ann['segmentation']['counts'],
                                     'size': ann['segmentation']['size']
                                 }
-                                coco_mask.decode(rle)  # This performs the validation
+                                coco_mask.decode(rle)
                                 valid_ann_indices.append(ann_idx)
                             except Exception as e:
                                 print(f"Skipping invalid annotation {ann_idx}: {str(e)}")
@@ -286,16 +300,31 @@ class SA1BDataset(BaseTarDataset):
 
 class SAVDataset(BaseTarDataset):
     def __init__(self, root_dir, file_list,
-                 device='cuda' if torch.cuda.is_available() else 'cpu', build_index=True,
-                 verify_files=True):
+                 device='cuda' if torch.cuda.is_available() else 'cpu', 
+                 build_index=True,
+                 verify_files=True,
+                 split="train",
+                 val_size=1000,
+                 seed=42):
         super().__init__(root_dir, file_list, max_retries=3, verify_files=verify_files)
         self.device = device
         self.sav_helper = SAVDatasetHelper(root_dir)
         self.transform = transforms.Compose([transforms.ToTensor()])
+        self.split = split
+        self.val_size = val_size
+        self.seed = seed
 
         if build_index:
-            self.samples = self._build_index()
-            random.shuffle(self.samples)
+            all_samples = self._build_index()
+            rng = random.Random(self.seed)
+            rng.shuffle(all_samples)
+            
+            if self.split == 'train':
+                self.samples = all_samples[self.val_size:]
+            elif self.split == 'val':
+                self.samples = all_samples[:self.val_size]
+            else:
+                raise ValueError(f"Invalid split '{self.split}'. Must be 'train' or 'val'.")
         else:
             self.samples = []
 

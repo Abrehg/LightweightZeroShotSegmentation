@@ -228,40 +228,40 @@ class VideoSAM(nn.Module):
             os.makedirs(path, exist_ok=True)
         torch.save(self.state_dict(), os.path.join(path, filename))
 
-# input: (batch, num_frames (1 for images), num_channels, height, width) (height and width have to be greater than 16 and divisible by 8)
-# output: (batch, num_frames (1 for images), height, width)
+# # input: (batch, num_frames (1 for images), num_channels, height, width) (height and width have to be greater than 16 and divisible by 8)
+# # output: (batch, num_frames (1 for images), height, width)
 
-from clip_model import create_text_encoder, CLIPTokenize
-from prior_model import create_prior
-model = create_SAM()
-text_encoder = create_text_encoder()
-prior = create_prior()
-input_texts = ["Input string","Another input string"]
-tokens = CLIPTokenize(input_texts)
-encodings = text_encoder(tokens)
-prior_emb = prior(encodings)
+# from clip_model import create_text_encoder, CLIPTokenize
+# from prior_model import create_prior
+# model = create_SAM()
+# text_encoder = create_text_encoder()
+# prior = create_prior()
+# input_texts = ["Input string","Another input string"]
+# tokens = CLIPTokenize(input_texts)
+# encodings = text_encoder(tokens)
+# prior_emb = prior(encodings)
 
-# Test with image input
-image = torch.randn(2, 1, 3, 224, 224)  # Batch of 2 images (B, 1, C, H, W)
-masks = model(image, prior_emb)
-print(f"Image test output shape: {masks.size()}")  # Should output: torch.Size([2, 1, 224, 224])
+# # Test with image input
+# image = torch.randn(2, 1, 3, 224, 224)  # Batch of 2 images (B, 1, C, H, W)
+# masks = model(image, prior_emb)
+# print(f"Image test output shape: {masks.size()}")  # Should output: torch.Size([2, 1, 224, 224])
 
-# Test with video input
-video = torch.randn(2, 8, 3, 512, 512)  # Batch of 2 videos (B, T, C, H, W)
-masks = model(video, prior_emb)
-print(f"Video test output shape {masks.size()}")  # Should output: torch.Size([2, 8, 512, 512])
+# # Test with video input
+# video = torch.randn(2, 8, 3, 512, 512)  # Batch of 2 videos (B, T, C, H, W)
+# masks = model(video, prior_emb)
+# print(f"Video test output shape {masks.size()}")  # Should output: torch.Size([2, 8, 512, 512])
 
-model.store_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models", "SAMWeights")
+# model.store_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models", "SAMWeights")
 
-new_model = create_SAM()
-new_model.load_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models/SAMWeights")
+# new_model = create_SAM()
+# new_model.load_weights("/Users/adityaasuratkal/Downloads/GitHub/ImgResearch/models/SAMWeights")
 
-# Test with image input
-image = torch.randn(2, 1, 3, 224, 224)  # Batch of 2 images (B, 1, C, H, W)
-new_masks = new_model(image, prior_emb)
-print(f"New Image test output shape: {new_masks.size()}")  # Should output: torch.Size([2, 1, 224, 224])
+# # Test with image input
+# image = torch.randn(2, 1, 3, 224, 224)  # Batch of 2 images (B, 1, C, H, W)
+# new_masks = new_model(image, prior_emb)
+# print(f"New Image test output shape: {new_masks.size()}")  # Should output: torch.Size([2, 1, 224, 224])
 
-# Test with video input
-video = torch.randn(2, 8, 3, 512, 512)  # Batch of 2 videos (B, T, C, H, W)
-new_masks = new_model(video, prior_emb)
-print(f"New Video test output shape {new_masks.size()}")  # Should output: torch.Size([2, 8, 512, 512])
+# # Test with video input
+# video = torch.randn(2, 8, 3, 512, 512)  # Batch of 2 videos (B, T, C, H, W)
+# new_masks = new_model(video, prior_emb)
+# print(f"New Video test output shape {new_masks.size()}")  # Should output: torch.Size([2, 8, 512, 512])

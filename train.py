@@ -54,7 +54,7 @@ def get_latest_epoch_checkpoint(directory, prefix):
     
     for f_path in files:
         filename = os.path.basename(f_path)
-        match = re.search(rf"{prefix}_epoch_(\d+)", filename)
+        match = re.search(rf"{prefix}_epoch_(\d+)_([\d\.]+)", filename)
         if match:
             epoch = int(match.group(1))
             if epoch > latest_epoch:
@@ -92,7 +92,7 @@ def get_best_weights_checkpoint(directory, prefix):
     return best_file, best_epoch
 
 # ======== CLIP Training ========
-def train_clip(hf_token, run: wandb, start_epoch = 0):
+def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, wrapper_start_weights, run: wandb, start_epoch = 0):
     print("\n=== Training CLIP ===")
     
     # Initialize components
@@ -106,43 +106,14 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
     optimizer = torch.optim.Adam(clip_model.parameters(), lr=HYPERPARAMS["CLIP_LR"])
     
     if start_epoch > 0:
-        text_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_text_epoch_{start_epoch}")
-        image_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_image_epoch_{start_epoch}")
-        wrapper_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"clip_wrapper_epoch_{start_epoch}")
-        if os.path.exists(text_ckpt_to_load) and os.path.exists(image_ckpt_to_load) and os.path.exists(wrapper_ckpt_to_load):
+        if os.path.exists(text_start_weights) and os.path.exists(img_start_weights) and os.path.exists(wrapper_start_weights):
             print(f"Resuming CLIP training from epoch {start_epoch}")
-            clip_model.load_weights(wrapper_ckpt_to_load, image_ckpt_to_load, text_ckpt_to_load)
+            clip_model.load_weights(wrapper_start_weights, img_start_weights, text_start_weights)
         else:
             print(f"Warning: Checkpoint for epoch {start_epoch} not found. Starting CLIP from scratch.")
             start_epoch = 0
 
     clip_model = DDP(clip_model, device_ids=[local_rank])
-    # Streaming dataset
-    train_dataset = get_laion_streaming_dataset(
-        HUGGINGFACE = hf_token, 
-        text_processor = CLIPTokenize,
-        split = "train",
-        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
-        collate_fn=adaptive_collate,
-        pin_memory=True
-    )
-    
-    val_dataset = get_laion_streaming_dataset(
-        HUGGINGFACE = hf_token, 
-        text_processor = CLIPTokenize,
-        split = "val",
-        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
-        collate_fn=adaptive_collate,
-        pin_memory=True
-    )
 
     # Training loop
     for epoch in range(start_epoch, HYPERPARAMS["CLIP_EPOCHS"]):
@@ -218,10 +189,10 @@ def train_clip(hf_token, run: wandb, start_epoch = 0):
             )
             print(f"Saved CLIP checkpoints for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
     
-    print("CLIP training completed.\n")
+    print("CLIP training completed.")
 
 # ======== Prior Training ========
-def train_prior(hf_token, run: wandb, start_epoch = 0):
+def train_prior(hf_token, start_weights, run: wandb, start_epoch = 0):
     print("\n=== Training Prior ===")
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}')
@@ -251,10 +222,9 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     optimizer = torch.optim.Adam(prior_model.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
 
     if start_epoch > 0:
-        prior_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"prior_epoch_{start_epoch}")
-        if os.path.exists(prior_ckpt_to_load):
+        if os.path.exists(start_weights):
             print(f"Resuming Prior training from epoch {start_epoch}")
-            prior_model.load_weights(prior_ckpt_to_load)
+            prior_model.load_weights(start_weights)
         else:
             print(f"Warning: Prior checkpoint for epoch {start_epoch} not found. Starting Prior from scratch.")
             start_epoch = 0
@@ -363,7 +333,7 @@ def train_prior(hf_token, run: wandb, start_epoch = 0):
     print("Prior training completed.\n")
 
 # ======== SAM Teacher Training ========
-def train_SAM_decoder(train_dataloader, val_dataloader, run: wandb, start_epoch = 0):
+def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wandb, start_epoch = 0):
     print("\n=== Training SAM Decoder (Teacher Component) ===")
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}')
@@ -386,9 +356,8 @@ def train_SAM_decoder(train_dataloader, val_dataloader, run: wandb, start_epoch 
 
     # Load SAM Decoder's own latest checkpoint if resuming
     if start_epoch > 0:
-        sam_decoder_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"sam_decoder_epoch_{start_epoch}.pt")
-        if os.path.exists(sam_decoder_ckpt_to_load):
-            sam_decoder.load_weights(sam_decoder_ckpt_to_load)
+        if os.path.exists(start_weights):
+            sam_decoder.load_weights(start_weights)
         else:
             print(f"Warning: SAM Decoder checkpoint for epoch {start_epoch} not found. Starting fresh.")
             start_epoch = 0
@@ -506,7 +475,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, run: wandb, start_epoch 
     print("SAM Decoder training completed.\n")
 
 # ======== SAM Student Training ========
-def train_student(train_dataloader, val_dataloader, run:wandb, start_epoch = 0):
+def train_student(train_dataloader, val_dataloader, teacher_start_weights, student_start_weights, run:wandb, start_epoch = 0):
     print("\n=== Training Student (with Teacher Fine-tuning) ===")
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -560,28 +529,25 @@ def train_student(train_dataloader, val_dataloader, run:wandb, start_epoch = 0):
     device = torch.device(f'cuda:{local_rank}')
 
     student = DistilledMemoryStudent().to(device)
-    student.register_teacher(teacher)
-    student = DDP(student, device_ids=[local_rank])
 
     if start_epoch > 0:
-        student_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"student_phase_student_epoch_{start_epoch}.pt")
-        teacher_sam_decoder_ckpt_to_load = os.path.join(HYPERPARAMS['CHECKPOINT_DIR'], f"student_phase_teacher_sam_decoder_epoch_{start_epoch}.pt")
-
-        if os.path.exists(student_ckpt_to_load):
+        if os.path.exists(student_start_weights):
             print(f"Resuming Student training from epoch {start_epoch}")
-            student.module.load_state_dict(torch.load(student_ckpt_to_load, map_location=device))
-            if os.path.exists(teacher_sam_decoder_ckpt_to_load):
-                teacher.sam_decoder.load_weights(teacher_sam_decoder_ckpt_to_load)
+            student.load_weights(student_start_weights)
+            if os.path.exists(teacher_start_weights):
+                teacher.sam_decoder.load_weights(teacher_start_weights)
             else:
                 print(f"Warning: Student phase teacher SAM decoder checkpoint for epoch {start_epoch} not found. Using SAM decoder from dedicated training.")
         else:
             print(f"Warning: Student checkpoint for epoch {start_epoch} not found. Starting Student training fresh for this phase.")
             start_epoch = 0
-            
+    
+    student = DDP(student, device_ids=[local_rank])
+
     optimizer_teacher_finetune = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["TEACHER_LR"])
     optimizer_student = torch.optim.Adam(student.parameters(), lr=HYPERPARAMS["STUDENT_LR"])
 
-    print("[Joint Training] Starting joint training...")
+    print("[Joint Training] Starting joint training")
     for epoch in range(start_epoch, HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]):
         teacher.sam_decoder.train()
         student.train()
@@ -613,7 +579,7 @@ def train_student(train_dataloader, val_dataloader, run:wandb, start_epoch = 0):
                     # Forward pass
                     teacher_out = teacher(img, txt)
                     student_out = student(img, txt)
-                    with torch.no_grad(): # Get teacher output for student distillation without tracking its gradients here
+                    with torch.no_grad():
                         teacher_out_for_student = teacher(img, txt).detach()
 
                     # Compute losses
@@ -688,9 +654,6 @@ def train_student(train_dataloader, val_dataloader, run:wandb, start_epoch = 0):
             avg_student_val_loss = total_student_val_loss / iterations
 
         if is_main_process():
-            print(f"SAM Decoder Epoch {epoch+1} Single-Batch Val Loss: {avg_teacher_val_loss:.4f}")
-            run.log({"sam_decoder_epoch_avg_loss": avg_teacher_val_loss, "sam_decoder_epoch": epoch + 1})
-        
             # Save checkpoints for this phase
             # Teacher components (text encoder and prior are frozen, but saved if that's the desired package)
             # teacher.text_encoder.store_weights(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_teacher_text_encoder_epoch_{epoch+1}")
@@ -700,8 +663,13 @@ def train_student(train_dataloader, val_dataloader, run:wandb, start_epoch = 0):
                 f"student_phase_teacher_sam_decoder_epoch_{epoch+1}_{avg_teacher_val_loss:.4f}"
             )
 
-            torch.save(student.state_dict(), os.path.join(HYPERPARAMS["CHECKPOINT_DIR"], f"student_phase_student_epoch_{epoch+1}_{avg_student_val_loss:.4f}"))
+            student.module.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"student_phase_student_epoch_{epoch+1}_{avg_student_val_loss:.4f}"
+                )
 
+            run.log({"codistillation_teacher_epoch_avg_loss": avg_teacher_val_loss, "codistillation_teacher_epoch": epoch + 1})
+            run.log({"codistillation_student_epoch_avg_loss": avg_student_val_loss, "codistillation_student_epoch": epoch + 1})
             print(f"Saved Student Phase checkpoints for epoch {epoch+1} (Teacher Val Loss: {avg_teacher_val_loss:.4f}, Student Val Loss: {avg_student_val_loss:.4f})")
 
     print("Student training completed.\n")
@@ -777,76 +745,128 @@ def main(hf_token, wandb_key):
         run = wandb.init(mode="disabled")
 
     # Determine start epochs for each phase by checking for existing checkpoints
-    _, clip_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
-    _, prior_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
-    _, sam_decoder_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
-    _, student_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
+    clip_text_start_weights, clip_text_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+    clip_img_start_weights, clip_img_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_image")
+    clip_wrapper_start_weights, clip_wrapper_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_wrapper")
+    prior_start_weights, prior_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
+    sam_decoder_start_weights, sam_decoder_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
+    teacher_start_weights, teacher_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_teacher")
+    student_start_weights, student_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
     
-    if clip_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
-        print("\n🚀 Starting CLIP Training Phase")
-        train_clip(hf_token, start_epoch=clip_start_epoch + 1, run=run)
-    else:
-        print("\n✅ CLIP training already completed or up to date.")
-
-    if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
-        print("\n🚀 Starting Prior Training Phase")
-        train_prior(hf_token, start_epoch=prior_start_epoch + 1, run=run)
-    else:
-        print("\n✅ Prior training already completed or up to date.")
-
-    # Phase 1: Mixed Dataset loading
-    def load_file_list(file_path):
-        with open(file_path) as f:
-            return [line.strip().split('\t') for line in f.readlines()[1:]]
-
-    print("Initializing SAM datasets")
-    sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
-    sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
-
-    # 1. Instantiate Training Datasets
-    sa1b_train = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "train", HYPERPARAMS["SA_VAL_SIZE"])
-    sav_train = get_dataset(SAVDataset, sav_files, "sav_cache", "train", HYPERPARAMS["SAV_VAL_SIZE"])
+    if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"] or prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+        # Streaming LAION dataset
+        LAION_train_dataset = get_laion_streaming_dataset(
+            HUGGINGFACE = hf_token, 
+            text_processor = CLIPTokenize,
+            split = "train",
+            val_size=HYPERPARAMS["LAION_VAL_SIZE"]
+        )
+        LAION_train_loader = DataLoader(
+            LAION_train_dataset,
+            batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+            collate_fn=adaptive_collate,
+            pin_memory=True
+        )
     
-    # 2. Instantiate Validation Datasets
-    sa1b_val = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "val", HYPERPARAMS["SA_VAL_SIZE"])
-    sav_val = get_dataset(SAVDataset, sav_files, "sav_cache", "val", HYPERPARAMS["SAV_VAL_SIZE"])
+        LAION_val_dataset = get_laion_streaming_dataset(
+            HUGGINGFACE = hf_token, 
+            text_processor = CLIPTokenize,
+            split = "val",
+            val_size=HYPERPARAMS["LAION_VAL_SIZE"]
+        )
+        LAION_val_loader = DataLoader(
+            LAION_val_dataset,
+            batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+            collate_fn=adaptive_collate,
+            pin_memory=True
+        )
 
-    # 3. Create Datasets
-    train_dataset = torch.utils.data.ConcatDataset([sa1b_train, sav_train])
-    val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
+        if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
+            print("Starting CLIP Training Phase")
+            train_clip(train_loader=LAION_train_loader,
+                       val_loader=LAION_val_loader, 
+                       text_start_weights=clip_text_start_weights, 
+                       img_start_weights=clip_img_start_weights,
+                       wrapper_start_weights=clip_wrapper_start_weights,
+                       start_epoch=clip_text_start_epoch + 1, 
+                       run=run)
+        else:
+            print("CLIP training already completed or up to date.")
 
-    train_sampler = DistributedSampler(train_dataset)
-    val_sampler = DistributedSampler(val_dataset, shuffle=False)
-
-    train_dataloader = DataLoader(train_dataset, 
-                            batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
-                            shuffle=False, 
-                            num_workers=10, 
-                            collate_fn=SAM_adaptive_collate, 
-                            pin_memory=True,
-                            sampler=train_sampler)
-    
-    val_dataloader = DataLoader(val_dataset, 
-                            batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
-                            shuffle=False, 
-                            num_workers=10, 
-                            collate_fn=SAM_adaptive_collate, 
-                            pin_memory=True,
-                            sampler=val_sampler)
-
-    if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
-        print("\n🚀 Starting SAM Decoder Training Phase")
-        train_SAM_decoder(train_dataloader, val_dataloader, start_epoch=sam_decoder_start_epoch + 1, run=run)
+        if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+            print("Starting Prior Training Phase")
+            train_prior(train_loader=LAION_train_loader,
+                        val_loader=LAION_val_loader, 
+                        start_weights=prior_start_weights, 
+                        start_epoch=prior_start_epoch + 1, 
+                        run=run)
+        else:
+            print("Prior training already completed or up to date.")
     else:
-        print("\n✅ SAM Decoder training already completed or up to date.")
+        print("CLIP and Prior already trained")
 
-    if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
-        print("\n🚀 Starting Student Training Phase")
-        train_student(train_dataloader, val_dataloader, start_epoch=student_start_epoch + 1, run=run)
-    else:
-        print("\n✅ Student training already completed or up to date.")
+
+    if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+        # Mixed Dataset loading
+        def load_file_list(file_path):
+            with open(file_path) as f:
+                return [line.strip().split('\t') for line in f.readlines()[1:]]
+
+        print("Initializing SAM datasets")
+        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
+        sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
+
+        sa1b_train = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "train", HYPERPARAMS["SA_VAL_SIZE"])
+        sav_train = get_dataset(SAVDataset, sav_files, "sav_cache", "train", HYPERPARAMS["SAV_VAL_SIZE"])
     
-    print("\n🏁 All training phases processed!")
+        sa1b_val = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "val", HYPERPARAMS["SA_VAL_SIZE"])
+        sav_val = get_dataset(SAVDataset, sav_files, "sav_cache", "val", HYPERPARAMS["SAV_VAL_SIZE"])
+
+        # Create Datasets
+        train_dataset = torch.utils.data.ConcatDataset([sa1b_train, sav_train])
+        val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
+
+        train_sampler = DistributedSampler(train_dataset)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+
+        train_dataloader = DataLoader(train_dataset, 
+                                      batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+                                      shuffle=False, 
+                                      num_workers=10, 
+                                      collate_fn=SAM_adaptive_collate, 
+                                      pin_memory=True,
+                                      sampler=train_sampler)
+    
+        val_dataloader = DataLoader(val_dataset, 
+                                    batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+                                    shuffle=False, 
+                                    num_workers=10, 
+                                    collate_fn=SAM_adaptive_collate, 
+                                    pin_memory=True,
+                                    sampler=val_sampler)
+
+        if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
+            print("Starting SAM Decoder Training Phase")
+            train_SAM_decoder(train_dataloader, 
+                              val_dataloader, 
+                              start_weights=sam_decoder_start_weights,
+                              start_epoch=sam_decoder_start_epoch + 1, 
+                              run=run)
+        else:
+            print("SAM Decoder training already completed or up to date.")
+
+        if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+            print("Starting Student Training Phase")
+            train_student(train_dataloader, 
+                          val_dataloader, 
+                          teacher_start_weights=teacher_start_weights,
+                          student_start_weights=student_start_weights,
+                          start_epoch=student_start_epoch + 1, 
+                          run=run)
+        else:
+            print("Student training already completed or up to date.")
+    
+    print("All training phases completed")
     run.finish()
 
 # ======== Main ========

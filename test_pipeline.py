@@ -16,10 +16,10 @@ from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
-    "CLIP_EPOCHS": 1,
-    "PRIOR_EPOCHS": 1,
-    "SAM_DECODER_EPOCHS": 3,
-    "TEACHER_STUDENT_EPOCHS": 1,
+    "CLIP_EPOCHS": 2,
+    "PRIOR_EPOCHS": 2,
+    "SAM_DECODER_EPOCHS": 2,
+    "TEACHER_STUDENT_EPOCHS": 2,
     "CLIP_LR": 0.0001,
     "PRIOR_LR": 0.0001,
     "DECODER_LR": 0.0001, # For SAM Decoder training
@@ -131,8 +131,8 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
             if batch_idx >= 10: break
             
             images, texts = batch
-            print(images)
-            print(texts)
+            print(images.size())
+            print(texts.size())
             images = images.to(device)
             texts = texts.to(device)
             optimizer.zero_grad()
@@ -250,8 +250,8 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
             if batch_idx >= 10: break
 
             images, texts = batch
-            print(images)
-            print(texts)
+            print(images.size())
+            print(texts.size())
             images = images.to(device)
             texts = texts.to(device)
             optimizer.zero_grad()
@@ -388,9 +388,9 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
             optimizer_sam_decoder.zero_grad()
 
             for img, mask, txt in zip(images, true_masks, texts):
-                print(img)
-                print(mask)
-                print(txt)
+                print(img.size())
+                print(mask.size())
+                print(txt.size())
                 mask = mask.to(device).float()
                 img = img.to(device)
                 txt = txt.to(device)
@@ -547,9 +547,9 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
             optimizer_student.zero_grad()
 
             for img, mask, txt in zip(images, true_masks, texts):
-                print(img)
-                print(mask)
-                print(txt)
+                print(img.size())
+                print(mask.size())
+                print(txt.size())
 
                 mask = mask.to(device).float()
                 img = img.to(device)
@@ -756,7 +756,7 @@ def main(hf_token, wandb_key):
                        text_start_weights=clip_text_start_weights, 
                        img_start_weights=clip_img_start_weights,
                        wrapper_start_weights=clip_wrapper_start_weights,
-                       start_epoch=clip_text_start_epoch + 1, 
+                       start_epoch=clip_text_start_epoch, 
                        run=run)
         else:
             print("CLIP training already completed or up to date.")
@@ -766,7 +766,7 @@ def main(hf_token, wandb_key):
             train_prior(train_loader=LAION_train_loader,
                         val_loader=LAION_val_loader, 
                         start_weights=prior_start_weights, 
-                        start_epoch=prior_start_epoch + 1, 
+                        start_epoch=prior_start_epoch, 
                         run=run)
         else:
             print("Prior training already completed or up to date.")
@@ -818,7 +818,7 @@ def main(hf_token, wandb_key):
             train_SAM_decoder(train_dataloader, 
                               val_dataloader, 
                               start_weights=sam_decoder_start_weights,
-                              start_epoch=sam_decoder_start_epoch + 1, 
+                              start_epoch=sam_decoder_start_epoch, 
                               run=run)
         else:
             print("SAM Decoder training already completed or up to date.")
@@ -829,7 +829,7 @@ def main(hf_token, wandb_key):
                           val_dataloader, 
                           teacher_start_weights=teacher_start_weights,
                           student_start_weights=student_start_weights,
-                          start_epoch=student_start_epoch + 1, 
+                          start_epoch=student_start_epoch, 
                           run=run)
         else:
             print("Student training already completed or up to date.")

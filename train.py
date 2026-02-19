@@ -769,7 +769,7 @@ def main(hf_token, wandb_key):
                        text_start_weights=clip_text_start_weights, 
                        img_start_weights=clip_img_start_weights,
                        wrapper_start_weights=clip_wrapper_start_weights,
-                       start_epoch=clip_text_start_epoch + 1, 
+                       start_epoch=clip_text_start_epoch, 
                        run=run)
         else:
             print("CLIP training already completed or up to date.")
@@ -779,7 +779,7 @@ def main(hf_token, wandb_key):
             train_prior(train_loader=LAION_train_loader,
                         val_loader=LAION_val_loader, 
                         start_weights=prior_start_weights, 
-                        start_epoch=prior_start_epoch + 1, 
+                        start_epoch=prior_start_epoch, 
                         run=run)
         else:
             print("Prior training already completed or up to date.")
@@ -831,7 +831,7 @@ def main(hf_token, wandb_key):
             train_SAM_decoder(train_dataloader, 
                               val_dataloader, 
                               start_weights=sam_decoder_start_weights,
-                              start_epoch=sam_decoder_start_epoch + 1, 
+                              start_epoch=sam_decoder_start_epoch, 
                               run=run)
         else:
             print("SAM Decoder training already completed or up to date.")
@@ -842,7 +842,7 @@ def main(hf_token, wandb_key):
                           val_dataloader, 
                           teacher_start_weights=teacher_start_weights,
                           student_start_weights=student_start_weights,
-                          start_epoch=student_start_epoch + 1, 
+                          start_epoch=student_start_epoch, 
                           run=run)
         else:
             print("Student training already completed or up to date.")

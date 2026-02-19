@@ -6,7 +6,7 @@ import re
 import glob
 import wandb
 import argparse
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ChainDataset
 from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
 from models.prior_model import create_prior, PriorLoss, TeacherCLIP
 from models.SAM_model import iou_loss, create_SAM
@@ -27,8 +27,8 @@ HYPERPARAMS = {
     "STUDENT_LR": 0.0001,
     "LAION_VAL_SIZE": 20,
     "LAION_BATCH_SIZE": 2,
-    "SA_VAL_SIZE": 20,
-    "SAV_VAL_SIZE": 10,
+    "SA_VAL_TAR_COUNT": 1,  
+    "SAV_VAL_TAR_COUNT": 1,
     "SAM_BATCH_SIZE": 2,
     "CHECKPOINT_DIR": "weights_test",
     "WANDB_PROJECT_NAME": "Zero_Shot_Segmentation_Laptop_Test",
@@ -650,43 +650,18 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
 
     print("Student training completed.\n")
 
-def get_dataset(dataset_cls, file_list, cache_prefix, split_name, val_size):
-    cache_path = f"{cache_prefix}_{split_name}.pth"
-        
-    if os.path.exists(cache_path):
-        print(f"\nLoading cached {split_name} dataset from {cache_path}...")
-        start = time.time()
-        cache = torch.load(cache_path)
-            
-        # Create without index build
-        dataset = dataset_cls(
-            root_dir="./data", 
-            file_list=file_list,
-            build_index=False,
-            verify_files=False,
-            split=split_name,
-            val_size=val_size
-        )
-        # Restore state
-        dataset.samples = cache['samples']
-        dataset.available_files = cache['available_files']
-        print(f"Loaded {split_name} dataset in {time.time()-start:.1f}s")
-    else:
-        print(f"\nBuilding {split_name} dataset index...")
-        dataset = dataset_cls(
-            root_dir="./data",
-            file_list=file_list,
-            build_index=True,
-            verify_files=True,
-            split=split_name,
-            val_size=val_size
-        )
-        if is_main_process():
-            print(f"Caching {split_name} dataset...")
-            torch.save({
-                'samples': dataset.samples,
-                'available_files': dataset.available_files
-            }, cache_path)
+def get_dataset(dataset_cls, file_list, split_name, val_size):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(base_dir, "data", "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    dataset = dataset_cls(
+        file_list=file_list,
+        cache_dir=cache_dir,
+        device=device,
+        split=split_name,
+        val_size=val_size
+    )
     return dataset
 
 def main(hf_token, wandb_key):
@@ -773,45 +748,44 @@ def main(hf_token, wandb_key):
     else:
         print("CLIP and Prior already trained")
 
-
-    if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
-        # Mixed Dataset loading
-        def load_file_list(file_path):
-            with open(file_path) as f:
-                return [line.strip().split('\t') for line in f.readlines()[1:]]
-
-        print("Initializing SAM datasets")
-        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
-        sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
-
-        sa1b_train = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "train", HYPERPARAMS["SA_VAL_SIZE"])
-        sav_train = get_dataset(SAVDataset, sav_files, "sav_cache", "train", HYPERPARAMS["SAV_VAL_SIZE"])
+    num_workers = 0 if device == 'mps' else 10
     
-        sa1b_val = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "val", HYPERPARAMS["SA_VAL_SIZE"])
-        sav_val = get_dataset(SAVDataset, sav_files, "sav_cache", "val", HYPERPARAMS["SAV_VAL_SIZE"])
+    if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+        def load_file_list(file_path):
+            try:
+                with open(file_path) as f:
+                    return [line.strip().split('\t') for line in f.readlines()[1:]]
+            except FileNotFoundError:
+                return []
 
-        # Create Datasets
-        train_dataset = torch.utils.data.ConcatDataset([sa1b_train, sav_train])
-        val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
+        print("Initializing Iterable SAM datasets...")
+        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset.txt")
+        sav_files = load_file_list("data/Datasets/SA-V_dataset.txt")
 
-        train_sampler = None
-        val_sampler = None
+        sa1b_train = get_dataset(SA1BDataset, sa1b_files, "train", HYPERPARAMS["SA_VAL_TAR_COUNT"])
+        sav_train = get_dataset(SAVDataset, sav_files, "train", HYPERPARAMS["SAV_VAL_TAR_COUNT"])
+        sa1b_val = get_dataset(SA1BDataset, sa1b_files, "val", HYPERPARAMS["SA_VAL_TAR_COUNT"])
+        sav_val = get_dataset(SAVDataset, sav_files, "val", HYPERPARAMS["SAV_VAL_TAR_COUNT"])
 
+        # Use ChainDataset to concatenate IterableDatasets seamlessly
+        train_dataset = ChainDataset([sa1b_train, sav_train])
+        val_dataset = ChainDataset([sa1b_val, sav_val])
+
+        # Iterables do not support samplers. Sharding is handled inside the Dataset via get_worker_info().
         train_dataloader = DataLoader(train_dataset, 
                                       batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
                                       shuffle=False, 
-                                      num_workers=10, 
+                                      num_workers=num_workers, 
                                       collate_fn=SAM_adaptive_collate, 
-                                      pin_memory=True,
-                                      sampler=train_sampler)
-    
+                                      pin_memory=True, 
+                                      sampler=None)
         val_dataloader = DataLoader(val_dataset, 
                                     batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
                                     shuffle=False, 
-                                    num_workers=10, 
+                                    num_workers=num_workers, 
                                     collate_fn=SAM_adaptive_collate, 
-                                    pin_memory=True,
-                                    sampler=val_sampler)
+                                    pin_memory=True, 
+                                    sampler=None)
 
         if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
             print("Starting SAM Decoder Training Phase")

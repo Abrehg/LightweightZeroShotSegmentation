@@ -11,9 +11,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
-from models.prior_model import create_prior, Prior, PriorLoss, TeacherCLIP
-from models.SAM_model import VideoSAM, iou_loss, create_SAM
-from models.distill_model import DistilledMemoryStudent
+from models.prior_model import create_prior, PriorLoss, TeacherCLIP
+from models.SAM_model import iou_loss, create_SAM
+from models.distill_model import create_Student
 from data.custom400m import get_laion_streaming_dataset, adaptive_collate
 from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 
@@ -38,7 +38,21 @@ HYPERPARAMS = {
     "WANDB_ENTITY_NAME": "adityaasuratkal-rensselaer-polytechnic-institute"
 }
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def get_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif torch.backends.mps.is_available():
+        return 'mps'
+    else:
+        return 'cpu'
+device = get_device()
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+def is_main_process():
+    return dist.get_rank() == 0
 
 # ======== Helper Function for Checkpoints ========
 def get_latest_epoch_checkpoint(directory, prefix):
@@ -126,6 +140,7 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
             
             images, texts = batch
             images = images.to(device)
+            texts = texts.to(device)
             optimizer.zero_grad()
             
             # Forward pass
@@ -164,6 +179,7 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
                 if batch is not None:
                     images, texts = batch
                     images = images.to(device)
+                    texts = texts.to(device)
                     
                     text_features, image_features, logit_scale = clip_model(texts, images)
                     logits_per_image = logit_scale * image_features @ text_features.t()
@@ -192,7 +208,7 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
     print("CLIP training completed.")
 
 # ======== Prior Training ========
-def train_prior(hf_token, start_weights, run: wandb, start_epoch = 0):
+def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch = 0):
     print("\n=== Training Prior ===")
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}')
@@ -217,7 +233,7 @@ def train_prior(hf_token, start_weights, run: wandb, start_epoch = 0):
     prior_teacher.eval()
 
     # Initialize Prior
-    prior_model:Prior = create_prior().to(device)
+    prior_model = create_prior().to(device)
     
     optimizer = torch.optim.Adam(prior_model.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
 
@@ -231,33 +247,6 @@ def train_prior(hf_token, start_weights, run: wandb, start_epoch = 0):
     
     prior = DDP(prior_model, device_ids=[local_rank])
 
-    # Streaming dataset (same as CLIP)
-    train_dataset = get_laion_streaming_dataset(
-        HUGGINGFACE = hf_token, 
-        text_processor = CLIPTokenize,
-        split = "train",
-        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
-        collate_fn=adaptive_collate,
-        pin_memory=True
-    )
-    
-    val_dataset = get_laion_streaming_dataset(
-        HUGGINGFACE = hf_token, 
-        text_processor = CLIPTokenize,
-        split = "val",
-        val_size=HYPERPARAMS["LAION_VAL_SIZE"]
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
-        collate_fn=adaptive_collate,
-        pin_memory=True
-    )
-    
     # Training loop
     for epoch in range(start_epoch, HYPERPARAMS["PRIOR_EPOCHS"]):
         prior.train()
@@ -269,6 +258,7 @@ def train_prior(hf_token, start_weights, run: wandb, start_epoch = 0):
             
             images, texts = batch
             images = images.to(device)
+            texts = texts.to(device)
             optimizer.zero_grad()
             
             # Get frozen embeddings
@@ -308,6 +298,7 @@ def train_prior(hf_token, start_weights, run: wandb, start_epoch = 0):
                 if batch is not None:
                     images, texts = batch
                     images = images.to(device)
+                    texts = texts.to(device)
                     
                     text_emb = text_encoder(texts)
                     target_grid = prior_teacher(images)
@@ -378,7 +369,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
             result = self.sam_decoder(x, prior_emb)
             return result
 
-    teacher = TeacherModel()
+    teacher = TeacherModel().to(device)
 
     for param in teacher.text_encoder.parameters(): param.requires_grad_(False)
     for param in teacher.prior.parameters(): param.requires_grad_(False)
@@ -523,12 +514,9 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
             result = self.sam_decoder(x, prior_emb)
             return result
 
-    teacher = TeacherModel()
+    teacher = TeacherModel().to(device)
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device(f'cuda:{local_rank}')
-
-    student = DistilledMemoryStudent().to(device)
+    student = create_Student().to(device)
 
     if start_epoch > 0:
         if os.path.exists(student_start_weights):
@@ -674,13 +662,6 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
 
     print("Student training completed.\n")
 
-def setup_ddp():
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-
-def is_main_process():
-    return dist.get_rank() == 0
-
 def get_dataset(dataset_cls, file_list, cache_prefix, split_name, val_size):
     cache_path = f"{cache_prefix}_{split_name}.pth"
         
@@ -813,8 +794,8 @@ def main(hf_token, wandb_key):
                 return [line.strip().split('\t') for line in f.readlines()[1:]]
 
         print("Initializing SAM datasets")
-        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
-        sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
+        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset.txt")
+        sav_files = load_file_list("data/Datasets/SA-V_dataset.txt")
 
         sa1b_train = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "train", HYPERPARAMS["SA_VAL_SIZE"])
         sav_train = get_dataset(SAVDataset, sav_files, "sav_cache", "train", HYPERPARAMS["SAV_VAL_SIZE"])

@@ -152,7 +152,7 @@ class VideoSAM(nn.Module):
                  prior_dim=768,
                  mem_size=1,
                  max_memory_length=10,
-                 fixed_encoder_size=(16, 16)):
+                 fixed_encoder_size=(14, 14)):
         super().__init__()
         self.embed_dim = embed_dim
         self.mem_size = mem_size

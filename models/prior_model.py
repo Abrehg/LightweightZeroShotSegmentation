@@ -9,9 +9,9 @@ def create_prior():
     return Prior()
 
 # Input encoding shape: (1, seq_len, 768) (max seq_len is 77)
-# Output shape: (1, 256, 768)
+# Output shape: (1, 196, 768)
 class Prior(nn.Module):
-    def __init__(self, text_dim=768, vision_dim=768, num_patches=256, num_layers=12):
+    def __init__(self, text_dim=768, vision_dim=768, num_patches=196, num_layers=12):
         super().__init__()
         self.num_patches = num_patches
         self.vision_dim = vision_dim
@@ -33,7 +33,7 @@ class Prior(nn.Module):
         self.output_proj = nn.Linear(vision_dim, vision_dim)
 
     def forward(self, text_emb):
-        B, seq_len, _ = text_emb.shape
+        B, _, _ = text_emb.shape
         
         memory = self.text_proj(text_emb) 
         target = self.query.expand(B, -1, -1)
@@ -62,7 +62,7 @@ class TeacherCLIP(nn.Module):
         for param in self.vision_model.parameters():
             param.requires_grad = False
             
-    def get_feature_grid(self, pixel_values):
+    def forward(self, pixel_values):
         with torch.no_grad():
             outputs = self.vision_model(pixel_values=pixel_values)
             features = outputs.last_hidden_state[:, 1:, :] 

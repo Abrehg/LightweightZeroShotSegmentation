@@ -1,401 +1,850 @@
 # test_pipeline.py
 import torch
-from torch.utils.data import DataLoader
-from data.custom400m import adaptive_collate, get_laion_test_dataset
-from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
-import argparse
-import time
 import os
+import time
+import re
+import glob
+import wandb
+import argparse
+from torch.utils.data import DataLoader
+from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
+from models.prior_model import create_prior, PriorLoss, TeacherCLIP
+from models.SAM_model import iou_loss, create_SAM
+from models.distill_model import create_Student
+from data.custom400m import get_laion_streaming_dataset, adaptive_collate
+from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset
 
-parser = argparse.ArgumentParser(description="Load LAION-400M dataset from Hugging Face.")
-parser.add_argument("--token", type=str, required=True, help="Hugging Face API token")
+# ======== Hyperparameters & Setup ========
+HYPERPARAMS = {
+    "CLIP_EPOCHS": 1,
+    "PRIOR_EPOCHS": 1,
+    "SAM_DECODER_EPOCHS": 3,
+    "TEACHER_STUDENT_EPOCHS": 1,
+    "CLIP_LR": 0.0001,
+    "PRIOR_LR": 0.0001,
+    "DECODER_LR": 0.0001, # For SAM Decoder training
+    "TEACHER_LR": 0.00001, # For teacher fine-tuning during student training
+    "STUDENT_LR": 0.0001,
+    "LAION_VAL_SIZE": 20,
+    "LAION_BATCH_SIZE": 2,
+    "SA_VAL_SIZE": 20,
+    "SAV_VAL_SIZE": 10,
+    "SAM_BATCH_SIZE": 2,
+    "CHECKPOINT_DIR": "weights_test",
+    "WANDB_PROJECT_NAME": "Zero_Shot_Segmentation_Laptop_Test",
+    "WANDB_ENTITY_NAME": "adityaasuratkal-rensselaer-polytechnic-institute"
+}
 
-args = parser.parse_args()
-HUGGINGFACE_TOKEN = args.token
+def get_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif torch.backends.mps.is_available():
+        print("✅ Using Apple MPS (Metal Performance Shaders)")
+        return 'mps'
+    else:
+        return 'cpu'
+device = get_device()
 
-def main():
-    # Main Test ###################################################################
+def setup_ddp():
+    return False
+
+def is_main_process():
+    return True
+
+# ======== Helper Function for Checkpoints ========
+def get_latest_epoch_checkpoint(directory, prefix):
+    if not os.path.isdir(directory):
+        return None, -1
     
-    # Test CLIP training
-    print("\n[CLIP Test] Initializing CLIP components...")
-    from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize,CLIPWrapper, clip_contrastive_loss
-    text_encoder = create_text_encoder()
-    image_encoder = create_image_encoder()
-    clip_model = CLIPWrapper(text_encoder, image_encoder)
-    
-    print("[CLIP Test] Creating test dataset...")
-    test_dataset = get_laion_test_dataset(HUGGINGFACE_TOKEN, num_samples=5, val_boundary=5, text_processor=CLIPTokenize, split="train")
-    val_dataset = get_laion_test_dataset(HUGGINGFACE_TOKEN, num_samples=5, val_boundary=5, text_processor=CLIPTokenize, split="val")
-    print(f"[CLIP Test] Dataset size: {len(test_dataset)} samples")
-    print(f"[CLIP Val] Dataset size: {len(val_dataset)} samples")
+    files = glob.glob(os.path.join(directory, f"{prefix}_epoch_*"))
+    if not files:
+        return None, -1
 
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=2,
-        num_workers=1,
-        collate_fn=adaptive_collate,
-        persistent_workers=True, 
-        pin_memory=True
-    )
+    latest_epoch = -1
+    latest_file = None
     
-    print("[CLIP Test] Starting training step...")
-    optimizer = torch.optim.Adam(clip_model.parameters(), lr=1e-4)
+    for f_path in files:
+        filename = os.path.basename(f_path)
+        match = re.search(rf"{prefix}_epoch_(\d+)_([\d\.]+)", filename)
+        if match:
+            epoch = int(match.group(1))
+            if epoch > latest_epoch:
+                latest_epoch = epoch
+                latest_file = f_path
+                
+    return latest_file, latest_epoch
+
+def get_best_weights_checkpoint(directory, prefix):
+    if not os.path.isdir(directory):
+        return None, -1
     
-    for batch in test_loader:
-        if batch is None:
-            print(f"Skipping empty batch")
-            continue
-        optimizer.zero_grad()
-        images, texts = batch
+    files = glob.glob(os.path.join(directory, f"{prefix}_epoch_*"))
+    if not files:
+        return None, -1
 
-        if isinstance(texts, (list, tuple)):
-            texts = torch.stack(texts, dim=0)
+    best_loss = float('inf')
+    best_file = None
+    best_epoch = -1
+    
+    for f_path in files:
+        filename = os.path.basename(f_path)
+        match = re.search(rf"{prefix}_epoch_(\d+)_([\d\.]+)", filename)
+        if match:
+            epoch = int(match.group(1))
+            loss = float(match.group(2))
+            if loss < best_loss:
+                best_loss = loss
+                best_file = f_path
+                best_epoch = epoch
+    
+    if best_file is None:
+        return get_latest_epoch_checkpoint(directory, prefix)
+                
+    return best_file, best_epoch
 
-        print(texts.shape)
+# ======== CLIP Training ========
+def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, wrapper_start_weights, run: wandb, start_epoch = 0):
+    print("\n=== Training CLIP ===")
+
+    text_encoder = create_text_encoder().to(device)
+    image_encoder = create_image_encoder().to(device)
+
+    clip_model:CLIPWrapper = CLIPWrapper(text_encoder, image_encoder).to(device)
+    optimizer = torch.optim.Adam(clip_model.parameters(), lr=HYPERPARAMS["CLIP_LR"])
+    
+    if start_epoch > 0:
+        if os.path.exists(text_start_weights) and os.path.exists(img_start_weights) and os.path.exists(wrapper_start_weights):
+            print(f"Resuming CLIP training from epoch {start_epoch}")
+            clip_model.load_weights(wrapper_start_weights, img_start_weights, text_start_weights)
+        else:
+            print(f"Warning: Checkpoint for epoch {start_epoch} not found. Starting CLIP from scratch.")
+            start_epoch = 0
+
+    # Training loop
+    for epoch in range(start_epoch, HYPERPARAMS["CLIP_EPOCHS"]):
+        clip_model.train()
+        total_loss = 0.0
         
-        # Forward pass
-        text_features, image_features, logit_scale = clip_model(texts, images)
+        for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
+            if batch_idx >= 10: break
+            
+            images, texts = batch
+            print(images)
+            print(texts)
+            images = images.to(device)
+            texts = texts.to(device)
+            optimizer.zero_grad()
+            
+            # Forward pass
+            text_features, image_features, logit_scale = clip_model(texts, images)
+            
+            # Contrastive loss
+            logits_per_image = logit_scale * image_features @ text_features.t()
+            logits_per_text = logit_scale * text_features @ image_features.t()
+            loss = clip_contrastive_loss(logits_per_image, logits_per_text)
+            
+            # Backprop
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            if batch_idx % 100 == 0 and is_main_process():
+                print(f"CLIP Epoch {epoch+1}/{HYPERPARAMS['CLIP_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+                run.log({
+                    "clip_batch_loss": loss.item(), 
+                    "clip_epoch": epoch + 1,
+                    "clip_batch_idx": batch_idx
+                })
+        
+        if is_main_process():
+            avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
+            print(f"CLIP Epoch {epoch+1} Average Train Loss: {avg_epoch_loss:.4f}")
 
-        print(f"Text features shape: {text_features.shape}")
-        print(f"Image features shape: {image_features.shape}")
+        # --- VALIDATION ---
+        clip_model.eval()
+        total_val_loss = 0.0
+        iterations = 0
         
-        # Calculate similarity matrix
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logit_scale * text_features @ image_features.t()
-        
-        # Compute loss
-        loss = clip_contrastive_loss(logits_per_image, logits_per_text)
-        
-        loss.backward()
-        optimizer.step()
-        print(f"CLIP Training Step: ✓ (Loss: {loss.item():.4f})")
-        break
-
-    # Test Prior training
-    print("\n[Prior Test] Initializing Prior model...")
-    from models.prior_model import create_prior
-    prior = create_prior()
-    
-    print("[Prior Test] Freezing CLIP encoders...")
-    for param in clip_model.parameters():
-        param.requires_grad_(False)
-    
-    print("[Prior Test] Starting training loop...")
-    optimizer = torch.optim.Adam(prior.parameters(), lr=1e-4)
-    for batch_idx, batch in enumerate(test_loader):
-        if batch is None:
-            print(f"Skipping empty batch {batch_idx+1}")
-            continue
-        print(f"\n[Prior Test] Processing batch {batch_idx+1}")
-        images, texts = batch
         with torch.no_grad():
-            print("[Prior Test] Generating CLIP embeddings...")
-            text_emb = text_encoder(texts)
-            image_emb = image_encoder(images)
-        
-        optimizer.zero_grad()
-        print("[Prior Test] Running prior model...")
-        prior_emb = prior(text_emb)
+            for batch in val_loader:
+                if batch is not None:
+                    images, texts = batch
+                    images = images.to(device)
+                    texts = texts.to(device)
+                    
+                    text_features, image_features, logit_scale = clip_model(texts, images)
+                    logits_per_image = logit_scale * image_features @ text_features.t()
+                    logits_per_text = logit_scale * text_features @ image_features.t()
+                    loss = clip_contrastive_loss(logits_per_image, logits_per_text)
+                    
+                    total_val_loss += loss.item()
+                    iterations += 1
 
-        print(f"Text embeddings shape: {text_emb.shape}")
-        print(f"Image embeddings shape: {image_emb.shape}")
-        print(f"Prior embeddings shape: {prior_emb.shape}")
+        avg_val_loss = 999.9
+        if iterations > 0:
+            avg_val_loss = total_val_loss / iterations
 
-        loss = torch.mean((prior_emb - image_emb)**2)
-        loss.backward()
-        optimizer.step()
-        print(f"[Prior Test] Batch {batch_idx+1} completed - Loss: {loss.item():.4f}")
-        break
+        if is_main_process():
+            print(f"CLIP Epoch {epoch+1} Single-Batch Val Loss: {avg_val_loss:.4f}")
+            run.log({"clip_epoch_val_loss": avg_val_loss, "clip_epoch": epoch + 1})
 
-    # Test Segmentation training
-    print("\n[Teacher Training] Initializing Teacher Model...")
-    from models.clip_model import create_text_encoder
-    from models.prior_model import create_prior
-    from models.SAM_model import VideoSAM, iou_loss
+            clip_model.store_weights(
+                HYPERPARAMS['CHECKPOINT_DIR'], 
+                f"clip_text_epoch_{epoch+1}_{avg_val_loss:.4f}", 
+                f"clip_image_epoch_{epoch+1}_{avg_val_loss:.4f}", 
+                f"clip_wrapper_epoch_{epoch+1}_{avg_val_loss:.4f}"
+            )
+            print(f"Saved CLIP checkpoints for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
     
-    #device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    device = torch.device('cpu')
-    print(f"\nUsing device: {device}\n")
+    print("CLIP training completed.")
+
+# ======== Prior Training ========
+def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch = 0):
+    print("\n=== Training Prior ===")
+
+    # Load CLIP and teacher
+    text_encoder = create_text_encoder().to(device)
+    prior_teacher = TeacherCLIP().to(device)
+    
+    # Load best CLIP checkpoint
+    best_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+
+    if not best_clip_text_ckpt:
+        raise FileNotFoundError("Latest CLIP text or image checkpoints not found. Train CLIP first.")
+    
+    print(f"Loading CLIP text from: {best_clip_text_ckpt}")
+    text_encoder.load_weights(best_clip_text_ckpt)
+    
+    # Freeze CLIP and teacher
+    for param in text_encoder.parameters(): param.requires_grad_(False)
+    text_encoder.eval()
+    for param in prior_teacher.parameters(): param.requires_grad_(False)
+    prior_teacher.eval()
+
+    # Initialize Prior
+    prior_model = create_prior().to(device)
+    
+    optimizer = torch.optim.Adam(prior_model.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
+
+    if start_epoch > 0:
+        if os.path.exists(start_weights):
+            print(f"Resuming Prior training from epoch {start_epoch}")
+            prior_model.load_weights(start_weights)
+        else:
+            print(f"Warning: Prior checkpoint for epoch {start_epoch} not found. Starting Prior from scratch.")
+            start_epoch = 0
+    
+    prior = prior_model
+    
+    # Training loop
+    for epoch in range(start_epoch, HYPERPARAMS["PRIOR_EPOCHS"]):
+        prior.train()
+        total_loss = 0.0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
+            if batch_idx >= 10: break
+
+            images, texts = batch
+            print(images)
+            print(texts)
+            images = images.to(device)
+            texts = texts.to(device)
+            optimizer.zero_grad()
+            
+            # Get frozen embeddings
+            with torch.no_grad():
+                text_emb = text_encoder(texts)
+                target_grid = prior_teacher(images)
+            
+            # Prior forward
+            prior_grid = prior(text_emb)
+            loss = PriorLoss(prior_grid, target_grid)
+            
+            # Backprop
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            if batch_idx % 100 == 0 and is_main_process():
+                print(f"Prior Epoch {epoch+1}/{HYPERPARAMS['PRIOR_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+                run.log({
+                    "prior_batch_loss": loss.item(), 
+                    "prior_epoch": epoch + 1,
+                    "prior_batch_idx": batch_idx
+                })
+
+        if is_main_process():
+            avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
+            print(f"Prior Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
+
+        # --- VALIDATION ---
+        prior.eval()
+        total_val_loss = 0.0
+        iterations = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                if batch is not None:
+                    images, texts = batch
+                    images = images.to(device)
+                    texts = texts.to(device)
+                    
+                    text_emb = text_encoder(texts)
+                    target_grid = prior_teacher(images)
+                    prior_grid = prior(text_emb)
+                    loss = PriorLoss(prior_grid, target_grid)
+                    
+                    total_val_loss += loss.item()
+                    iterations += 1
+        avg_val_loss = 999.9
+        if iterations > 0:
+            avg_val_loss = total_val_loss / iterations
+
+        if is_main_process():
+            print(f"Prior Epoch {epoch+1} Single-Batch Val Loss: {avg_val_loss:.4f}")
+            run.log({"prior_val_loss": avg_val_loss, "prior_epoch": epoch + 1})
+        
+            prior.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"prior_epoch_{epoch+1}_{avg_val_loss:.4f}"
+            )
+            print(f"Saved Prior checkpoint for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
+    
+    print("Prior training completed.\n")
+
+# ======== SAM Teacher Training ========
+def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wandb, start_epoch = 0):
+    print("\n=== Training SAM Decoder (Teacher Component) ===")
+
+    text_encoder = create_text_encoder().to(device)
+    prior = create_prior().to(device)
+    sam_decoder = create_SAM().to(device)
+
+    # Load latest CLIP Text Encoder
+    latest_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+    if not latest_clip_text_ckpt: raise FileNotFoundError("CLIP text checkpoint not found for SAM Decoder training.")
+    print(f"Loading CLIP text for SAM Decoder from: {latest_clip_text_ckpt}")
+    text_encoder.load_weights(latest_clip_text_ckpt)
+
+    # Load latest Prior
+    latest_prior_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
+    if not latest_prior_ckpt: raise FileNotFoundError("Prior checkpoint not found for SAM Decoder training.")
+    print(f"Loading Prior for SAM Decoder from: {latest_prior_ckpt}")
+    prior.load_weights(latest_prior_ckpt)
+
+    # Load SAM Decoder's own latest checkpoint if resuming
+    if start_epoch > 0:
+        if os.path.exists(start_weights):
+            sam_decoder.load_weights(start_weights)
+        else:
+            print(f"Warning: SAM Decoder checkpoint for epoch {start_epoch} not found. Starting fresh.")
+            start_epoch = 0
 
     class TeacherModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.text_encoder = create_text_encoder().to(device)
-            self.prior = create_prior().to(device)
-            self.sam_decoder = VideoSAM().to(device)
+            self.text_encoder = text_encoder
+            self.prior = prior
+            self.sam_decoder = sam_decoder
 
         def forward(self, x, text_tokens):
-            text_emb = self.text_encoder(text_tokens)
-            prior_emb = self.prior(text_emb)
-            return self.sam_decoder(x, prior_emb)
+            with torch.no_grad():
+                text_emb = self.text_encoder(text_tokens)
+                prior_emb = self.prior(text_emb)
+            result = self.sam_decoder(x, prior_emb)
+            return result
 
-    teacher = TeacherModel()
+    teacher = TeacherModel().to(device)
 
-    # Freeze text_encoder and prior
-    for param in teacher.text_encoder.parameters():
-        param.requires_grad_(False)
-    for param in teacher.prior.parameters():
-        param.requires_grad_(False)
-
-    # Create datasets and dataloader
-    def load_file_list(file_path):
-        with open(file_path) as f:
-            return [line.strip().split('\t') for line in f.readlines()[1:]]
-
-    print("Initializing SA-1B dataset")
-    sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
-
-    print("Initializing SA-V dataset")
-    sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
-
-    CACHE_PATH = "img_dataset_cache.pth"
-
-    # if os.path.exists(CACHE_PATH):
-    #     os.remove(CACHE_PATH)
-
-    # Try loading cached dataset FIRST
-    if os.path.exists(CACHE_PATH):
-        print("\nLoading cached dataset...")
-        start = time.time()
-        cache = torch.load(CACHE_PATH)
-        
-        # Create dataset WITHOUT building index
-        sa1b_dataset = SA1BDataset(
-            root_dir="./data", 
-            file_list=sa1b_files,
-            build_index=False,
-            verify_files=False
-        )
-        
-        # Restore cached state
-        sa1b_dataset.samples = cache['samples']
-        sa1b_dataset.available_files = cache['available_files']
-        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
-    else:
-        # Create dataset WITH index building
-        sa1b_dataset = SA1BDataset(
-            root_dir="./data",
-            file_list=sa1b_files,
-            build_index=True,
-            verify_files=True
-        )
-        # Save cache
-        print("\nCaching dataset...")
-        torch.save({
-            'samples': sa1b_dataset.samples,
-            'available_files': sa1b_dataset.available_files
-        }, CACHE_PATH)
-
-    VIDEO_CACHE_PATH = "video_dataset_cache.pth"
-
-    # if os.path.exists(VIDEO_CACHE_PATH):
-    #     os.remove(VIDEO_CACHE_PATH)
-
-    if os.path.exists(VIDEO_CACHE_PATH):
-        print("\nLoading cached dataset...")
-        start = time.time()
-        cache = torch.load(VIDEO_CACHE_PATH)
-        
-        # Create dataset WITHOUT building index
-        sav_dataset = SAVDataset(
-            root_dir="./data",
-            file_list=sav_files,
-            build_index=False,
-            verify_files=False
-        )
-        
-        # Restore cached state
-        sav_dataset.samples = cache['samples']
-        sav_dataset.available_files = cache['available_files']
-        print(f"Loaded cached dataset in {time.time()-start:.1f}s")
-    else:
-        # Create dataset WITH index building
-        sav_dataset = SAVDataset(
-            root_dir="./data", 
-            file_list=sav_files,
-            build_index=True,
-            verify_files=True
-        )
-        # Save cache
-        print("\nCaching dataset...")
-        torch.save({
-            'samples': sav_dataset.samples,
-            'available_files': sav_dataset.available_files
-        }, VIDEO_CACHE_PATH)
-
-    combined_dataset = torch.utils.data.ConcatDataset([sa1b_dataset, sav_dataset])
-    dataloader = DataLoader(sav_dataset, 
-                            batch_size=1, 
-                            shuffle=True, 
-                            num_workers=1, 
-                            collate_fn=SAM_adaptive_collate, 
-                            pin_memory=True)
-
-    # Train teacher only
+    for param in teacher.text_encoder.parameters(): param.requires_grad_(False)
+    for param in teacher.prior.parameters(): param.requires_grad_(False)
+    teacher.text_encoder.eval()
+    teacher.prior.eval()
+            
     print("[Teacher Training] Training SAM decoder...")
-    optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=0.001)
+    optimizer_sam_decoder = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["DECODER_LR"])
 
-    for batch in dataloader:
-        if batch is None:
-            continue
-
-        images, true_masks, texts = batch
-
-        target_size = 256
-        vid_target_size = 64
-
-        losses = []
-        import torchvision.transforms.functional as F
-
-        optimizer_teacher.zero_grad()
-
-        for img, mask, txt in zip(images, true_masks, texts):
-            # Image resizing
-            # Get original dimensions
-            print(f"Image shape: {img.shape}")
-            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+    for epoch in range(start_epoch, HYPERPARAMS["SAM_DECODER_EPOCHS"]):
+        teacher.sam_decoder.train()
+        total_loss = 0.0
         
-            # # Calculate new size while preserving aspect ratio
-            # scale = target_size / max(H, W)
-            # new_H, new_W = int(H * scale), int(W * scale)
+        batch_count = 0
+        for batch_idx, batch in enumerate(train_dataloader):
+            if batch is None:
+                continue
+            if batch_idx >= 10: break
+
+            images, true_masks, texts = batch
+
+            current_batch_loss_sum = 0
+            num_samples_in_batch = 0
+
+            optimizer_sam_decoder.zero_grad()
+
+            for img, mask, txt in zip(images, true_masks, texts):
+                print(img)
+                print(mask)
+                print(txt)
+                mask = mask.to(device).float()
+                img = img.to(device)
+                txt = txt.to(device)
+
+                with torch.autograd.detect_anomaly():
+                    pred_mask = teacher.forward(img, txt)
+
+                    loss = iou_loss(pred_mask, mask)
+                    loss.backward()
+                    current_batch_loss_sum += loss.item()
+                    num_samples_in_batch +=1
         
-            # # Resize image with bilinear interpolation
-            # img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
+            optimizer_sam_decoder.step()
+
+            if batch_idx % 100 == 0 and is_main_process():
+                avg_batch_item_loss = current_batch_loss_sum / num_samples_in_batch
+                total_loss += avg_batch_item_loss
+                print(f"SAM Decoder Epoch {epoch+1}/{HYPERPARAMS['SAM_DECODER_EPOCHS']} | Batch {batch_idx} Avg Item Loss: {avg_batch_item_loss:.4f}")
+                run.log({
+                    "sam_decoder_batch_avg_item_loss": avg_batch_item_loss,
+                    "sam_decoder_epoch": epoch + 1,
+                    "sam_decoder_batch_idx": batch_idx
+                })
+            batch_count = batch_count + 1
+            
+        if is_main_process():
+            avg_epoch_loss = total_loss / batch_count if batch_count > 0 else 0
+            print(f"SAM Decoder Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
+            run.log({"sam_decoder_epoch_avg_loss": avg_epoch_loss, "sam_decoder_epoch": epoch + 1})
+
+        # Full Validation Step
+        teacher.sam_decoder.eval()
+        total_val_loss = 0.0
+        iterations = 0
         
-            # # Resize mask with nearest neighbor (preserve integer labels)
-            # mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
+        with torch.no_grad():
+            for batch in val_dataloader:
+                if batch is None:
+                    continue
+                if iterations >= 5: break
+                
+                images, true_masks, texts = batch
 
-            # # Video resizing
-            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
+                for img, mask, txt in zip(images, true_masks, texts):
+                    mask = mask.to(device).float()
+                    img = img.to(device)
+                    txt = txt.to(device)
+
+                    pred_mask = teacher.forward(img, txt)
+
+                    loss = iou_loss(pred_mask, mask)
+                    total_val_loss += loss.item()
+
+                iterations += 1
+        avg_val_loss = 999.9
+        if iterations > 0:
+            avg_val_loss = total_val_loss / iterations
+
+        if is_main_process():
+            print(f"SAM Decoder Epoch {epoch+1} Single-Batch Val Loss: {avg_val_loss:.4f}")
+            run.log({"sam_decoder_epoch_avg_loss": avg_val_loss, "sam_decoder_epoch": epoch + 1})
         
-            # # Calculate new size while preserving aspect ratio
-            # scale = vid_target_size / max(H, W)
-            # new_H, new_W = int(H * scale), int(W * scale)
-            # resized_img = []
-            # resized_mask = []
-            # for i in range(img.shape[1]):
-            #     resized_img.append(F.resize(img[i], [new_H, new_W]))  # [T, C, H, W]
-            #     resized_mask.append(F.resize(mask[i], [new_H, new_W],
-            #                     interpolation=F.InterpolationMode.NEAREST))  # [T, 1, H, W]
+            teacher.sam_decoder.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"sam_decoder_epoch_{epoch+1}_{avg_val_loss:.4f}")
 
-            # img = torch.stack(resized_img, dim=0)
-            # mask = torch.stack(resized_mask, dim=0)
+            print(f"Saved SAM Decoder checkpoint for epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
 
-            mask = mask.to(device).float()
-            img = img.to(device)
-            txt = txt.to(device)
+    print("SAM Decoder training completed.\n")
 
-            print(f"Resized image: {img.shape}")
-            print(f"Resized mask: {mask.shape}")
+# ======== SAM Student Training ========
+def train_student(train_dataloader, val_dataloader, teacher_start_weights, student_start_weights, run:wandb, start_epoch = 0):
+    print("\n=== Training Student (with Teacher Fine-tuning) ===")
 
-            with torch.autograd.detect_anomaly():
-                # Forward pass
-                text_emb = teacher.text_encoder(txt)
-                prior_emb = teacher.prior(text_emb)
-                pred_mask = teacher.sam_decoder(img, prior_emb)
+    text_encoder = create_text_encoder().to(device)
+    prior = create_prior().to(device)
+    sam_decoder = create_SAM().to(device)
 
-                print(f"Output mask: {mask.shape}")
+    # Load latest CLIP Text Encoder
+    latest_clip_text_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+    latest_prior_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
+    latest_sam_decoder_ckpt, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
 
-                loss = iou_loss(pred_mask, mask)
-                loss.backward()
-                losses.append(loss.item())
+    if not latest_clip_text_ckpt: raise FileNotFoundError("CLIP text ckpt not found for Student training.")
+    if not latest_prior_ckpt: raise FileNotFoundError("Prior ckpt not found for Student training.")
+    if not latest_sam_decoder_ckpt: raise FileNotFoundError("SAM Decoder ckpt not found for Student training.")
+
+    print(f"Loading for Teacher (Student Phase) - CLIP Text: {latest_clip_text_ckpt}")
+    text_encoder.load_weights(latest_clip_text_ckpt)
+    print(f"Loading for Teacher (Student Phase) - Prior: {latest_prior_ckpt}")
+    prior.load_weights(latest_prior_ckpt)
+    print(f"Loading for Teacher (Student Phase) - SAM Decoder: {latest_sam_decoder_ckpt}")
+    sam_decoder.load_weights(latest_sam_decoder_ckpt)
+
+    # Freeze text_encoder and prior for teacher during student training
+    for param in text_encoder.parameters(): param.requires_grad_(False)
+    text_encoder.eval()
+    for param in prior.parameters(): param.requires_grad_(False)
+    prior.eval()
+
+    class TeacherModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.text_encoder = text_encoder
+            self.prior = prior
+            self.sam_decoder = sam_decoder
+
+        def forward(self, x, text_tokens):
+            with torch.no_grad():
+                text_emb = self.text_encoder(text_tokens)
+                prior_emb = self.prior(text_emb)
+            result = self.sam_decoder(x, prior_emb)
+            return result
+
+    teacher = TeacherModel().to(device)
+    student = create_Student().to(device)
+
+    if start_epoch > 0:
+        if os.path.exists(student_start_weights):
+            print(f"Resuming Student training from epoch {start_epoch}")
+            student.load_weights(student_start_weights)
+            if os.path.exists(teacher_start_weights):
+                teacher.sam_decoder.load_weights(teacher_start_weights)
+            else:
+                print(f"Warning: Student phase teacher SAM decoder checkpoint for epoch {start_epoch} not found. Using SAM decoder from dedicated training.")
+        else:
+            print(f"Warning: Student checkpoint for epoch {start_epoch} not found. Starting Student training fresh for this phase.")
+            start_epoch = 0
+
+    optimizer_teacher_finetune = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["TEACHER_LR"])
+    optimizer_student = torch.optim.Adam(student.parameters(), lr=HYPERPARAMS["STUDENT_LR"])
+
+    print("[Joint Training] Starting joint training")
+    for epoch in range(start_epoch, HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]):
+        teacher.sam_decoder.train()
+        student.train()
+
+        total_teacher_loss = 0.0
+        total_student_loss = 0.0
+        batch_count = 0
+
+        for batch_idx, batch in enumerate(train_dataloader):
+            if batch is None:
+                continue
+            if batch_idx >= 10: break
+
+            images, true_masks, texts = batch
+
+            current_batch_teacher_loss_sum = 0
+            current_batch_student_loss_sum = 0
+            num_samples_in_batch = 0
+
+            optimizer_teacher_finetune.zero_grad()
+            optimizer_student.zero_grad()
+
+            for img, mask, txt in zip(images, true_masks, texts):
+                print(img)
+                print(mask)
+                print(txt)
+
+                mask = mask.to(device).float()
+                img = img.to(device)
+                txt = txt.to(device)
+
+                with torch.autograd.detect_anomaly():
+                    # Forward pass
+                    teacher_out = teacher(img, txt)
+                    student_out = student(img, txt)
+                    with torch.no_grad():
+                        teacher_out_for_student = teacher(img, txt).detach()
+
+                    # Compute losses
+                    teacher_loss = iou_loss(teacher_out, mask)
+                    student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask)
+
+                    # Backward passes
+                    teacher_loss.backward(retain_graph=True)
+                    student_loss.backward()
+
+                    current_batch_teacher_loss_sum += teacher_loss.item()
+                    current_batch_student_loss_sum += student_loss.item()
+                    num_samples_in_batch = num_samples_in_batch + 1
+            
+            batch_count = batch_count + 1
+                    
+            if batch_idx % 100 == 0 and is_main_process():
+                optimizer_teacher_finetune.step()
+                optimizer_student.step()
+
+                avg_batch_teacher_loss = current_batch_teacher_loss_sum / num_samples_in_batch
+                avg_batch_student_loss = current_batch_student_loss_sum / num_samples_in_batch
+                total_teacher_loss += avg_batch_teacher_loss
+                total_student_loss += avg_batch_student_loss
+
+                print(f"Student Epoch {epoch+1}/{HYPERPARAMS['TEACHER_STUDENT_EPOCHS']} | Batch {batch_idx} | Teacher Loss: {avg_batch_teacher_loss:.4f}, Student Loss: {avg_batch_student_loss:.4f}")
+                run.log({
+                    "student_phase_batch_teacher_loss": avg_batch_teacher_loss,
+                    "student_phase_batch_student_loss": avg_batch_student_loss,
+                    "student_phase_epoch": epoch + 1,
+                    "student_phase_batch_idx": batch_idx
+                })
+            # Update parameters
+            optimizer_teacher_finetune.step()
+            optimizer_student.step()
+
+        if is_main_process():
+            avg_epoch_teacher_loss = total_teacher_loss / batch_count if batch_count > 0 else 0
+            avg_epoch_student_loss = total_student_loss / batch_count if batch_count > 0 else 0
+            print(f"Student Epoch {epoch+1} Avg Losses - Teacher: {avg_epoch_teacher_loss:.4f}, Student: {avg_epoch_student_loss:.4f}")
+            run.log({
+                "student_phase_epoch_avg_teacher_loss": avg_epoch_teacher_loss,
+                "student_phase_epoch_avg_student_loss": avg_epoch_student_loss,
+                "student_phase_epoch": epoch + 1
+            })
+
+        # Full Validation Step
+        teacher.sam_decoder.eval()
+        student.eval()
+        total_teacher_val_loss = 0.0
+        total_student_val_loss = 0.0
+        iterations = 0
         
-        optimizer_teacher.step()
+        with torch.no_grad():
+            for batch in val_dataloader:
+                if batch is not None:
+                    for img, mask, txt in zip(images, true_masks, texts):
+                        teacher_out = teacher(img, txt)
+                        student_out = student(img, txt)
 
-        print(f"Teacher Training Loss: {sum(losses)/len(losses):.4f}")
-        break
+                        teacher_loss = iou_loss(teacher_out, mask)
+                        student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask)
 
-    from models.distill_model import DistilledMemoryStudent
+                        total_teacher_val_loss += teacher_loss.item()
+                        total_student_val_loss += student_loss.item()
 
-    print("\n[Joint Training] Initializing Student...")
-    student = DistilledMemoryStudent().to(device)
-    student.register_teacher(teacher)
+                    iterations += 1
+        avg_teacher_val_loss = 999.9
+        avg_student_val_loss = 999.9
+        if iterations > 0:
+            avg_teacher_val_loss = total_teacher_val_loss / iterations
+            avg_student_val_loss = total_student_val_loss / iterations
 
-    # Separate optimizers
-    optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=0.0001)  # Teacher LR
-    optimizer_student = torch.optim.Adam(student.parameters(), lr=0.001)  # Student LR
+        if is_main_process():
 
-    print("[Joint Training] Starting joint training...")
+            teacher.sam_decoder.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"student_phase_teacher_sam_decoder_epoch_{epoch+1}_{avg_teacher_val_loss:.4f}"
+            )
+            student.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"], 
+                f"student_phase_student_epoch_{epoch+1}_{avg_student_val_loss:.4f}"
+            )
+
+            run.log({"codistillation_teacher_epoch_avg_loss": avg_teacher_val_loss, "codistillation_teacher_epoch": epoch + 1})
+            run.log({"codistillation_student_epoch_avg_loss": avg_student_val_loss, "codistillation_student_epoch": epoch + 1})
+            print(f"Saved Student Phase checkpoints for epoch {epoch+1} (Teacher Val Loss: {avg_teacher_val_loss:.4f}, Student Val Loss: {avg_student_val_loss:.4f})")
+
+    print("Student training completed.\n")
+
+def get_dataset(dataset_cls, file_list, cache_prefix, split_name, val_size):
+    cache_path = f"{cache_prefix}_{split_name}.pth"
+        
+    if os.path.exists(cache_path):
+        print(f"\nLoading cached {split_name} dataset from {cache_path}...")
+        start = time.time()
+        cache = torch.load(cache_path)
+            
+        # Create without index build
+        dataset = dataset_cls(
+            root_dir="./data", 
+            file_list=file_list,
+            build_index=False,
+            verify_files=False,
+            split=split_name,
+            val_size=val_size
+        )
+        # Restore state
+        dataset.samples = cache['samples']
+        dataset.available_files = cache['available_files']
+        print(f"Loaded {split_name} dataset in {time.time()-start:.1f}s")
+    else:
+        print(f"\nBuilding {split_name} dataset index...")
+        dataset = dataset_cls(
+            root_dir="./data",
+            file_list=file_list,
+            build_index=True,
+            verify_files=True,
+            split=split_name,
+            val_size=val_size
+        )
+        if is_main_process():
+            print(f"Caching {split_name} dataset...")
+            torch.save({
+                'samples': dataset.samples,
+                'available_files': dataset.available_files
+            }, cache_path)
+    return dataset
+
+def main(hf_token, wandb_key):
+    setup_ddp()
+
+    if is_main_process():
+        try:
+            wandb.login(key=wandb_key)
+        except wandb.errors.UsageError as e:
+            print(f"Failed to login to W&B: {e}")
+            return 
+
+    if is_main_process():
+        os.makedirs(HYPERPARAMS["CHECKPOINT_DIR"], exist_ok=True)
+
+    if is_main_process():
+        run = wandb.init(
+            project=HYPERPARAMS["WANDB_PROJECT_NAME"],
+            entity=HYPERPARAMS["WANDB_ENTITY_NAME"],
+            config=HYPERPARAMS
+        )
+    else:
+        # Other processes get a mock run object that does nothing
+        run = wandb.init(mode="disabled")
+
+    # Determine start epochs for each phase by checking for existing checkpoints
+    clip_text_start_weights, clip_text_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
+    clip_img_start_weights, clip_img_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_image")
+    clip_wrapper_start_weights, clip_wrapper_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_wrapper")
+    prior_start_weights, prior_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
+    sam_decoder_start_weights, sam_decoder_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "sam_decoder")
+    teacher_start_weights, teacher_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_teacher")
+    student_start_weights, student_start_epoch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
     
-    for batch in dataloader:
-        if batch is None:
-            continue
+    if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"] or prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+        # Streaming LAION dataset
+        LAION_train_dataset = get_laion_streaming_dataset(
+            HUGGINGFACE = hf_token, 
+            text_processor = CLIPTokenize,
+            split = "train",
+            val_size=HYPERPARAMS["LAION_VAL_SIZE"]
+        )
+        LAION_train_loader = DataLoader(
+            LAION_train_dataset,
+            batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+            collate_fn=adaptive_collate,
+            pin_memory=True
+        )
+    
+        LAION_val_dataset = get_laion_streaming_dataset(
+            HUGGINGFACE = hf_token, 
+            text_processor = CLIPTokenize,
+            split = "val",
+            val_size=HYPERPARAMS["LAION_VAL_SIZE"]
+        )
+        LAION_val_loader = DataLoader(
+            LAION_val_dataset,
+            batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+            collate_fn=adaptive_collate,
+            pin_memory=True
+        )
 
-        images, true_masks, texts = batch
+        if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
+            print("Starting CLIP Training Phase")
+            train_clip(train_loader=LAION_train_loader,
+                       val_loader=LAION_val_loader, 
+                       text_start_weights=clip_text_start_weights, 
+                       img_start_weights=clip_img_start_weights,
+                       wrapper_start_weights=clip_wrapper_start_weights,
+                       start_epoch=clip_text_start_epoch + 1, 
+                       run=run)
+        else:
+            print("CLIP training already completed or up to date.")
 
-        target_size = 256
-        vid_target_size = 64
+        if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+            print("Starting Prior Training Phase")
+            train_prior(train_loader=LAION_train_loader,
+                        val_loader=LAION_val_loader, 
+                        start_weights=prior_start_weights, 
+                        start_epoch=prior_start_epoch + 1, 
+                        run=run)
+        else:
+            print("Prior training already completed or up to date.")
+    else:
+        print("CLIP and Prior already trained")
 
-        teacher_losses = []
-        student_losses = []
 
-        import torchvision.transforms.functional as F
+    if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+        # Mixed Dataset loading
+        def load_file_list(file_path):
+            with open(file_path) as f:
+                return [line.strip().split('\t') for line in f.readlines()[1:]]
 
-        optimizer_teacher.zero_grad()
-        optimizer_student.zero_grad()
+        print("Initializing SAM datasets")
+        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset_copy.txt")
+        sav_files = load_file_list("data/Datasets/SA-V_dataset_copy.txt")
 
-        for img, mask, txt in zip(images, true_masks, texts):
-            # Image resizing
-            # Get original dimensions
-            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
-        
-            # # Calculate new size while preserving aspect ratio
-            # scale = target_size / max(H, W)
-            # new_H, new_W = int(H * scale), int(W * scale)
-        
-            # # Resize image with bilinear interpolation
-            # img = F.resize(img, [new_H, new_W], interpolation=F.InterpolationMode.BILINEAR)
-        
-            # # Resize mask with nearest neighbor (preserve integer labels)
-            # mask = F.resize(mask, [new_H, new_W], interpolation=F.InterpolationMode.NEAREST)
-        
+        sa1b_train = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "train", HYPERPARAMS["SA_VAL_SIZE"])
+        sav_train = get_dataset(SAVDataset, sav_files, "sav_cache", "train", HYPERPARAMS["SAV_VAL_SIZE"])
+    
+        sa1b_val = get_dataset(SA1BDataset, sa1b_files, "sa1b_cache", "val", HYPERPARAMS["SA_VAL_SIZE"])
+        sav_val = get_dataset(SAVDataset, sav_files, "sav_cache", "val", HYPERPARAMS["SAV_VAL_SIZE"])
 
-            # # Video resizing
-            # C, H, W = img.shape[-3], img.shape[-2], img.shape[-1]
-        
-            # # Calculate new size while preserving aspect ratio
-            # scale = vid_target_size / max(H, W)
-            # new_H, new_W = int(H * scale), int(W * scale)
-            # resized_img = []
-            # resized_mask = []
-            # for i in range(img.shape[1]):
-            #     resized_img.append(F.resize(img[i], [new_H, new_W]))  # [T, C, H, W]
-            #     resized_mask.append(F.resize(mask[i], [new_H, new_W],
-            #                     interpolation=F.InterpolationMode.NEAREST))  # [T, 1, H, W]
+        # Create Datasets
+        train_dataset = torch.utils.data.ConcatDataset([sa1b_train, sav_train])
+        val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
 
-            mask = mask.to(device).float()
-            img = img.to(device)
-            txt = txt.to(device)
+        train_sampler = None
+        val_sampler = None
 
-            print(f"Resized image: {img.shape}")
-            print(f"Resized mask: {mask.shape}")
+        train_dataloader = DataLoader(train_dataset, 
+                                      batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+                                      shuffle=False, 
+                                      num_workers=10, 
+                                      collate_fn=SAM_adaptive_collate, 
+                                      pin_memory=True,
+                                      sampler=train_sampler)
+    
+        val_dataloader = DataLoader(val_dataset, 
+                                    batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+                                    shuffle=False, 
+                                    num_workers=10, 
+                                    collate_fn=SAM_adaptive_collate, 
+                                    pin_memory=True,
+                                    sampler=val_sampler)
 
-            with torch.autograd.detect_anomaly():
-                # Forward pass
-                teacher_out = teacher(img, txt)
-                print(f"Teacher Output mask: {teacher_out.shape}")
-                student_out = student(img, txt)
-                print(f"Student Output mask: {student_out.shape}")
+        if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
+            print("Starting SAM Decoder Training Phase")
+            train_SAM_decoder(train_dataloader, 
+                              val_dataloader, 
+                              start_weights=sam_decoder_start_weights,
+                              start_epoch=sam_decoder_start_epoch + 1, 
+                              run=run)
+        else:
+            print("SAM Decoder training already completed or up to date.")
 
-                # Compute losses
-                teacher_loss = iou_loss(teacher_out, mask)
-                student_loss = student.compute_distill_loss(student_out, teacher_out, mask)
+        if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+            print("Starting Student Training Phase")
+            train_student(train_dataloader, 
+                          val_dataloader, 
+                          teacher_start_weights=teacher_start_weights,
+                          student_start_weights=student_start_weights,
+                          start_epoch=student_start_epoch + 1, 
+                          run=run)
+        else:
+            print("Student training already completed or up to date.")
+    
+    print("All training phases completed")
+    run.finish()
 
-                # Backward passes
-                teacher_loss.backward(retain_graph=True)
-                student_loss.backward()
-
-                teacher_losses.append(teacher_loss.item())
-                student_losses.append(student_loss.item())
-
-        # Update parameters
-        optimizer_teacher.step()
-        optimizer_student.step()
-
-        print(f"Joint Step - Teacher Loss: {sum(teacher_losses)/len(teacher_losses):.4f}, Student Loss: {sum(student_losses)/len(student_losses):.4f}")
-        break
-
+# ======== Main ========
 if __name__ == "__main__":
-    torch.multiprocessing.freeze_support()
+    # Configure command line interface
+    parser = argparse.ArgumentParser(description="Train pipeline for Zero-Shot Segmentation")
+    parser.add_argument("--token", type=str, required=True, help="Hugging Face API token")
+    parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
+    args = parser.parse_args()
+    
     torch.manual_seed(42)
-    main()
+    
+    main(args.token, args.wandb_key)

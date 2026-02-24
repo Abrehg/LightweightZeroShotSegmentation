@@ -1,18 +1,11 @@
 Python 3.9.18
 torch
-argparse
-glob
 wandb
 transformers
-tarfile
-requests
-pillow
-torchvision
 numpy
-json
-pycocotools
-typing
-cv2
+opencv
 matplotlib
+pillow
+pycocotools
 datasets
-io
+torchvision

@@ -4,13 +4,13 @@
 #SBATCH --job-name=sam_clip_training
 #SBATCH --output=slurm-%A.%a.out
 #SBATCH --error=slurm-%A.%a.err
-#SBATCH --nodes=25
-#SBATCH --gres=gpu:1
+#SBATCH --nodes=15
+#SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --qos=dcs-48hr
 
 # --- User-configurable ---
-PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/train.py"
+PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/research"
 PYTHON_SCRIPT_NAME="train.py"
 VENV_NAME="visEnv"
 HF_TOKEN="_"
@@ -41,16 +41,15 @@ module load gcc
 module load spectrum-mpi
 module load cuda/11.2
 
-conda activate $VENV_NAME
+ENV_BIN="/gpfs/u/home/ZSIS/ZSISsrtk/barn/miniconda3/envs/$VENV_NAME/bin"
+export PATH="$ENV_BIN:$PATH"
 
 # Verify Python and pip are from the venv
 echo "Python executable: $(which python)"
-echo "Pip executable: $(which pip)"
 
 # Navigate to the project directory
 echo "Changing to project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
-
 
 # --- Running the Training Script ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
@@ -60,9 +59,10 @@ export MASTER_PORT=29500 # A free port
 echo "Starting distributed training script..."
 echo "MASTER_ADDR: $MASTER_ADDR"
 
-srun torchrun \
+srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
+    python -m torch.distributed.run \
     --nnodes=$SLURM_NNODES \
-    --nproc_per_node=1 \
+    --nproc_per_node=4 \
     --rdzv_id=$SLURM_JOB_ID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \

@@ -3,7 +3,7 @@ import tarfile
 import requests
 from PIL import Image
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, Dataset
 from torchvision import transforms
 from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
 import torchvision.transforms.functional as F
@@ -17,6 +17,29 @@ import time
 def SAM_adaptive_collate(batch):
     images, masks, texts = zip(*batch)
     return list(images), list(masks), list(texts)
+
+# class CaptionGenerator:
+#     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+#         self.device = device
+#         print("⚠️ WARNING: Using DUMMY CaptionGenerator to save memory for testing! ⚠️")
+    
+#     def _post_process_caption(self, caption):
+#         return caption
+
+#     def generate_all_captions(self, image, mask, index):
+#         # Instantly return dummy text to bypass the expensive LLM inference
+#         dummy_captions = [
+#             "a descriptive search query for the object",
+#             "a simple description of the red object doing something",
+#             "a brief one-sentence caption for this image.",
+#             "factual object label"
+#         ]
+        
+#         # Fallback just in case an invalid index is passed
+#         if index < 0 or index > 3:
+#             return "invalid_persona_index"
+            
+#         return dummy_captions[index]
 
 class CaptionGenerator:
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -117,8 +140,35 @@ class CaptionGenerator:
                 caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()
                 return self._post_process_caption(caption)
 
+def download_tar_file(url, dest_path, max_retries=3):
+    tmp_dest_path = dest_path + ".tmp"
+    for _ in range(max_retries):
+        try:
+            response = requests.get(url, stream=True, timeout=20)
+            response.raise_for_status()
+            expected_size = int(response.headers.get('content-length', 0))
+            downloaded_size = 0
+            
+            with open(tmp_dest_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+            
+            if expected_size > 0 and downloaded_size != expected_size:
+                raise Exception(f"Incomplete download")
+            
+            os.rename(tmp_dest_path, dest_path)
+            return True
+        except Exception:
+            if os.path.exists(tmp_dest_path):
+                try: os.remove(tmp_dest_path)
+                except OSError: pass
+            time.sleep(1)
+    return False
+
 class StreamingBaseTarDataset(IterableDataset):
-    def __init__(self, file_list, cache_dir, split='train', val_tar_count=1, max_retries=3):
+    def __init__(self, file_list, cache_dir, split='train', val_tar_count=1, val_sample_count=None, max_retries=3):
         super().__init__()
         self.max_retries = max_retries
         self.cache_dir = cache_dir
@@ -127,47 +177,8 @@ class StreamingBaseTarDataset(IterableDataset):
         
         if split == 'val':
             self.file_list = file_list[:val_tar_count]
-        elif split == 'train':
-            self.file_list = file_list[val_tar_count:]
         else:
-            self.file_list = file_list
-
-    def _download_file(self, url, dest_path):
-        tmp_dest_path = dest_path + ".tmp"
-        
-        for _ in range(self.max_retries):
-            try:
-                response = requests.get(url, stream=True, timeout=20)
-                response.raise_for_status()
-                
-                expected_size = int(response.headers.get('content-length', 0))
-                downloaded_size = 0
-                
-                # Write to temporary file first to prevent reading partially downloaded files
-                with open(tmp_dest_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                
-                # Verify download completeness
-                if expected_size > 0 and downloaded_size != expected_size:
-                    raise Exception(f"Incomplete download: {downloaded_size}/{expected_size} bytes")
-                
-                # Atomic rename once fully complete
-                os.rename(tmp_dest_path, dest_path)
-                return True
-                
-            except Exception as e:
-                # Cleanup failed temp file
-                if os.path.exists(tmp_dest_path):
-                    try:
-                        os.remove(tmp_dest_path)
-                    except OSError:
-                        pass
-                time.sleep(1) # brief pause before retry
-                
-        return False
+            self.file_list = file_list[val_tar_count:]
 
     def _get_worker_shard(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -180,15 +191,12 @@ class StreamingBaseTarDataset(IterableDataset):
         total_shards = num_workers * dist_world_size
         global_worker_id = (dist_rank * num_workers) + worker_id
 
-        shard = [
-            f for i, f in enumerate(self.file_list) 
-            if i % total_shards == global_worker_id
-        ]
+        shard = [f for i, f in enumerate(self.file_list) if i % total_shards == global_worker_id]
         return shard, global_worker_id
 
 class SA1BDataset(StreamingBaseTarDataset):
-    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_size=1):
-        super().__init__(file_list, cache_dir, split, val_tar_count=val_size)
+    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None):
+        super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count)
         self.device = device
         self.transform = transforms.Compose([transforms.ToTensor()])
         self.caption_generator = None 
@@ -199,7 +207,6 @@ class SA1BDataset(StreamingBaseTarDataset):
 
         try:
             with tarfile.open(tar_path, "r") as tar:
-                # We wrap getmembers in try-except because an incomplete EOF will crash here
                 members = tar.getmembers()
                 json_files = [m for m in members if m.name.endswith('.json')]
                 
@@ -212,31 +219,24 @@ class SA1BDataset(StreamingBaseTarDataset):
                         image_member = next((m for m in members if m.isfile() and os.path.basename(m.name) == image_name), None)
                         if not image_member: continue
                             
-                        image_file = tar.extractfile(image_member)
-                        image = Image.open(image_file).convert("RGB")
-                        image_tensor = self.transform(image).unsqueeze(0)
+                        image = Image.open(tar.extractfile(image_member)).convert("RGB")
+                        image_tensor = self.transform(image).unsqueeze(0) # [1, C, H, W]
                         
                         for ann_idx, ann in enumerate(data['annotations']):
                             try:
                                 rle = {'counts': ann['segmentation']['counts'], 'size': ann['segmentation']['size']}
                                 mask = coco_mask.decode(rle)
-                                mask_tensor = torch.from_numpy(mask).long().unsqueeze(0).unsqueeze(0)
+                                mask_tensor = torch.from_numpy(mask).long().unsqueeze(0) # [1, H, W]
                                 
                                 for caption_idx in range(4):
                                     caption = self.caption_generator.generate_all_captions(
                                         image_tensor.squeeze(0), mask_tensor.squeeze(0), caption_idx
                                     )
-                                    caption_tokens = CLIPTokenize(caption).squeeze(1)
+                                    caption_tokens = CLIPTokenize(caption) # Pre-unsqueezed sequence [1, 77]
                                     yield image_tensor, mask_tensor, caption_tokens
-                            except Exception:
-                                continue
-                    except Exception:
-                        continue
-                        
-        except (EOFError, tarfile.ReadError, Exception) as e:
-            # If the file is corrupted, simply print a warning and skip it.
-            print(f"\\n[!] Warning: Skipping corrupted or incomplete tar file {tar_path} ({e})")
-            return
+                            except Exception: continue
+                    except Exception: continue
+        except Exception: return
 
     def __iter__(self):
         shard, global_worker_id = self._get_worker_shard()
@@ -246,20 +246,17 @@ class SA1BDataset(StreamingBaseTarDataset):
             temp_tar_path = os.path.join(self.cache_dir, f"sa1b_w{global_worker_id}_{filename}")
             
             if not os.path.exists(temp_tar_path):
-                success = self._download_file(url, temp_tar_path)
-            else:
-                success = True
+                success = download_tar_file(url, temp_tar_path)
+            else: success = True
 
             if success:
                 yield from self._process_tar(temp_tar_path)
-                try:
-                    os.remove(temp_tar_path) 
-                except OSError:
-                    pass
+                try: os.remove(temp_tar_path) 
+                except OSError: pass
 
 class SAVDataset(StreamingBaseTarDataset):
-    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_size=1):
-        super().__init__(file_list, cache_dir, split, val_tar_count=val_size)
+    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None):
+        super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count)
         self.device = device
         self.transform = transforms.Compose([transforms.ToTensor()])
         self.caption_generator = None
@@ -278,17 +275,7 @@ class SAVDataset(StreamingBaseTarDataset):
                 for video_member in mp4_files:
                     try:
                         video_id = os.path.splitext(os.path.basename(video_member.name))[0]
-                        manual_annot_name = f"{video_id}_manual.json"
-                        auto_annot_name = f"{video_id}_auto.json"
-
-                        annot_member = None
-                        for json_member in json_files:
-                            if manual_annot_name in json_member.name:
-                                annot_member = json_member
-                                break
-                            elif auto_annot_name in json_member.name:
-                                annot_member = json_member
-                                
+                        annot_member = next((m for m in json_files if f"{video_id}_manual.json" in m.name or f"{video_id}_auto.json" in m.name), None)
                         if not annot_member: continue
                         
                         temp_video_path = os.path.join(self.cache_dir, f"tmp_vid_{global_worker_id}_{video_id}.mp4")
@@ -299,64 +286,207 @@ class SAVDataset(StreamingBaseTarDataset):
                         os.remove(temp_video_path) 
                         
                         if not frames: continue
-                        frames_tensor = torch.stack([self.transform(Image.fromarray(frame)) for frame in frames])
+                        frames_tensor = torch.stack([self.transform(Image.fromarray(f)) for f in frames]).unsqueeze(0) # [1, T, C, H, W]
 
-                        annot_file = tar.extractfile(annot_member)
-                        data = json.load(annot_file)
+                        data = json.load(tar.extractfile(annot_member))
                         
                         first_valid_frame, first_valid_mask = None, None
                         masks = []
-                        for frame_idx in range(len(frames_tensor)):
+                        for frame_idx in range(len(frames_tensor.squeeze(0))):
                             frame_masks = []
                             if data and data.get('masklet') and len(data['masklet']) > frame_idx:
                                 for ann in data['masklet'][frame_idx]:
                                     rle = {'counts': ann['counts'], 'size': ann['size']}
-                                    mask = torch.from_numpy(coco_mask.decode(rle)).long()
-                                    frame_masks.append(mask)
+                                    frame_masks.append(torch.from_numpy(coco_mask.decode(rle)).long())
                             if frame_masks:
-                                frame_mask = torch.stack(frame_masks).any(dim=0).unsqueeze(0).float()
+                                frame_mask = torch.stack(frame_masks).any(dim=0).float()
                                 masks.append(frame_mask)
                                 if first_valid_frame is None:
-                                    first_valid_frame = frames_tensor[frame_idx]
+                                    first_valid_frame = frames_tensor.squeeze(0)[frame_idx]
                                     first_valid_mask = frame_mask
                             else:
-                                masks.append(torch.zeros_like(frames_tensor[0].mean(dim=0, keepdim=True)))
-                        masks_tensor = torch.stack(masks)
+                                masks.append(torch.zeros_like(frames_tensor.squeeze(0)[0].mean(dim=0)))
+                        masks_tensor = torch.stack(masks).unsqueeze(0) # [1, T, H, W]
 
                         if first_valid_frame is not None:
                             for caption_idx in range(4):
                                 caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
-                                caption_tokens = CLIPTokenize(caption).squeeze(1)
+                                caption_tokens = CLIPTokenize(caption) # [1, seq_len]
                                 yield frames_tensor, masks_tensor, caption_tokens
                         else:
-                            caption_tokens = CLIPTokenize("object").squeeze(1)
-                            yield frames_tensor, masks_tensor, caption_tokens
+                            yield frames_tensor, masks_tensor, CLIPTokenize("object")
 
-                    except Exception:
-                        continue
-                        
-        except (EOFError, tarfile.ReadError, Exception) as e:
-            print(f"\\n[!] Warning: Skipping corrupted or incomplete tar file {tar_path} ({e})")
-            return
+                    except Exception: continue
+        except Exception: return
 
     def __iter__(self):
         shard, global_worker_id = self._get_worker_shard()
-        
         for url_info in shard:
             filename, url = url_info[0], url_info[1]
             temp_tar_path = os.path.join(self.cache_dir, f"sav_w{global_worker_id}_{filename}")
             
-            if not os.path.exists(temp_tar_path):
-                success = self._download_file(url, temp_tar_path)
-            else:
-                success = True
+            if not os.path.exists(temp_tar_path): success = download_tar_file(url, temp_tar_path)
+            else: success = True
 
             if success:
                 yield from self._process_tar(temp_tar_path, global_worker_id)
-                try:
-                    os.remove(temp_tar_path)
-                except OSError:
-                    pass
+                try: os.remove(temp_tar_path) 
+                except OSError: pass
+
+class StaticSA1BDataset(Dataset):
+    def __init__(self, file_list, cache_dir, device='cpu', split='val', val_tar_count=1, val_sample_count=None):
+        self.device = device
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.file_list = file_list[:val_tar_count]
+        self.transform = transforms.Compose([transforms.ToTensor()])
+        
+        self.available_files = []
+        for filename, url in self.file_list:
+            dest_path = os.path.join(self.cache_dir, filename)
+            if not os.path.exists(dest_path):
+                download_tar_file(url, dest_path)
+            if os.path.exists(dest_path):
+                self.available_files.append(dest_path)
+                
+        self.samples = self._build_index()
+        
+        if val_sample_count is not None and val_sample_count > 0:
+            self.samples = self.samples[:val_sample_count]
+            
+        self.caption_generator = CaptionGenerator(device=self.device)
+        
+    def _build_index(self):
+        samples = []
+        for tar_path in self.available_files:
+            try:
+                with tarfile.open(tar_path, "r") as tar:
+                    members = tar.getmembers()
+                    json_files = [m for m in members if m.name.endswith('.json')]
+                    for json_member in json_files:
+                        try:
+                            json_file = tar.extractfile(json_member)
+                            data = json.load(json_file)
+                            image_name = data['image']['file_name']
+                            image_member = next((m for m in members if m.isfile() and os.path.basename(m.name) == image_name), None)
+                            if not image_member: continue
+                            for ann_idx in range(len(data['annotations'])):
+                                samples.append((tar_path, json_member.name, ann_idx, image_member.name))
+                        except Exception: pass
+            except Exception: pass
+        return samples
+
+    def __len__(self):
+        return len(self.samples) * 4
+
+    def __getitem__(self, idx):
+        original_sample_idx = idx // 4
+        caption_idx = idx % 4
+        tar_path, json_name, ann_idx, image_path = self.samples[original_sample_idx]
+        
+        with tarfile.open(tar_path, "r") as tar:
+            data = json.load(tar.extractfile(json_name))
+            image = Image.open(tar.extractfile(image_path)).convert("RGB")
+            image_tensor = self.transform(image).unsqueeze(0) # [1, C, H, W]
+            
+            ann = data['annotations'][ann_idx]
+            rle = {'counts': ann['segmentation']['counts'], 'size': ann['segmentation']['size']}
+            mask = torch.from_numpy(coco_mask.decode(rle)).long().unsqueeze(0) # [1, H, W]
+            
+            caption = self.caption_generator.generate_all_captions(image_tensor.squeeze(0), mask.squeeze(0), caption_idx)
+            caption_tokens = CLIPTokenize(caption) # [1, seq_len]
+                
+        return image_tensor, mask, caption_tokens
+
+class StaticSAVDataset(Dataset):
+    def __init__(self, file_list, cache_dir, device='cpu', split='val', val_tar_count=1, val_sample_count=None):
+        self.device = device
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.file_list = file_list[:val_tar_count]
+        self.transform = transforms.Compose([transforms.ToTensor()])
+        self.sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir))
+        
+        self.available_files = []
+        for filename, url in self.file_list:
+            dest_path = os.path.join(self.cache_dir, filename)
+            if not os.path.exists(dest_path):
+                download_tar_file(url, dest_path)
+            if os.path.exists(dest_path):
+                self.available_files.append(dest_path)
+                
+        self.samples = self._build_index()
+        
+        if val_sample_count is not None and val_sample_count > 0:
+            self.samples = self.samples[:val_sample_count]
+            
+        self.caption_generator = CaptionGenerator(device=self.device)
+
+    def _build_index(self):
+        samples = []
+        for tar_path in self.available_files:
+            try:
+                with tarfile.open(tar_path, "r") as tar:
+                    members = tar.getmembers()
+                    mp4_files = [m for m in members if m.name.endswith('.mp4') and m.isfile()]
+                    json_files = [m for m in members if m.name.endswith('.json') and m.isfile()]
+                    for video_member in mp4_files:
+                        video_id = os.path.splitext(os.path.basename(video_member.name))[0]
+                        annot_member = next((m for m in json_files if f"{video_id}_manual.json" in m.name or f"{video_id}_auto.json" in m.name), None)
+                        if annot_member:
+                            samples.append((tar_path, video_id, annot_member.name))
+            except Exception: pass
+        return samples
+
+    def __len__(self):
+        return len(self.samples) * 4
+        
+    def __getitem__(self, idx):
+        original_sample_idx = idx // 4
+        caption_idx = idx % 4
+        
+        tar_path, video_id, annot_name = self.samples[original_sample_idx]
+        with tarfile.open(tar_path, "r") as tar:
+            video_path = f"{video_id}.mp4"
+            video_member = next((m for m in tar.getmembers() if m.isfile() and m.name.endswith(video_path)), None)
+            
+            temp_video_path = os.path.join(self.cache_dir, f"static_tmp_{video_id}_{idx}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(tar.extractfile(video_member).read())
+                
+            frames = self.sav_helper.read_frames(temp_video_path)
+            os.remove(temp_video_path)
+            
+            frames_tensor = torch.stack([self.transform(Image.fromarray(f)) for f in frames]).unsqueeze(0) # [1, T, C, H, W]
+            
+            data = json.load(tar.extractfile(annot_name))
+            
+            masks = []
+            first_valid_frame, first_valid_mask = None, None
+            for frame_idx in range(len(frames_tensor.squeeze(0))):
+                frame_masks = []
+                if data and data.get('masklet') and len(data['masklet']) > frame_idx:
+                    for ann in data['masklet'][frame_idx]:
+                        rle = {'counts': ann['counts'], 'size': ann['size']}
+                        frame_masks.append(torch.from_numpy(coco_mask.decode(rle)).long())
+                if frame_masks:
+                    frame_mask = torch.stack(frame_masks).any(dim=0).float()
+                    masks.append(frame_mask)
+                    if first_valid_frame is None:
+                        first_valid_frame = frames_tensor.squeeze(0)[frame_idx]
+                        first_valid_mask = frame_mask
+                else:
+                    masks.append(torch.zeros_like(frames_tensor.squeeze(0)[0].mean(dim=0)))
+            
+            masks_tensor = torch.stack(masks).unsqueeze(0) # [1, T, H, W]
+            
+            if first_valid_frame is not None:
+                caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
+                caption_tokens = CLIPTokenize(caption)
+            else:
+                caption_tokens = CLIPTokenize("object")
+                
+        return frames_tensor, masks_tensor, caption_tokens
 
 # def test_captioning_models(image_path: str, mask_path: str):
 #     print(f"🧪 Testing with:\n  Image: {image_path}\n  Mask:  {mask_path}\n")

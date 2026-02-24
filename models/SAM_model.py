@@ -6,10 +6,13 @@ import os
 def create_SAM():
     return VideoSAM()
 
-# Loss for overall model
+# Loss for overall model (Binary Cross Entropy + IoU Loss)
 # pred_masks -> model output
 # true_masks -> masks in dataset
 def iou_loss(pred_masks, true_masks):
+    true_masks = true_masks.float().view_as(pred_masks)
+    bce = F.binary_cross_entropy_with_logits(pred_masks, true_masks)
+
     pred_prob = torch.sigmoid(pred_masks)
     true = true_masks.float()
     
@@ -20,7 +23,7 @@ def iou_loss(pred_masks, true_masks):
     union = pred_flat.sum(dim=1) + true_flat.sum(dim=1) - intersection
     
     iou = (intersection + 1e-6) / (union + 1e-6)
-    return 1.0 - iou.mean()
+    return (1.0 - iou.mean()) + bce
 
 class UnifiedPositionalEncoding(nn.Module):
     def __init__(self, embed_dim=512, max_frames=32, initial_spatial_size=16):
@@ -135,6 +138,7 @@ class FrameTransformerDecoder(nn.Module):
         # Generate Mask via dynamic filters
         query_filters = self.controller(updated_queries)
         mask_logits = torch.bmm(query_filters, current_image_features.flatten(2))
+        mask_logits = mask_logits / (self.embed_dim ** 0.5)
         mask_logits = mask_logits.view(B, -1, H, W)
         
         masks = F.interpolate(

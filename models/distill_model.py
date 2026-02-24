@@ -6,17 +6,24 @@ import os
 def create_Student():
     return DistilledMemoryStudent()
 
+# Loss for overall model (Binary Cross Entropy + IoU Loss)
+# pred_masks -> model output
+# true_masks -> masks in dataset
 def iou_loss(pred_masks, true_masks):
-    pred_prob = torch.sigmoid(pred_masks)
+    true_masks = true_masks.float().view_as(pred_masks)
+    bce = F.binary_cross_entropy_with_logits(pred_masks, true_masks)
 
-    pred_flat = pred_prob.view(pred_prob.size(0), -1)
-    true_flat = true_masks.float().view(true_masks.size(0), -1)
+    pred_prob = torch.sigmoid(pred_masks)
+    true = true_masks.float()
+    
+    pred_flat = pred_prob.flatten(start_dim=1)
+    true_flat = true.flatten(start_dim=1)
     
     intersection = (pred_flat * true_flat).sum(dim=1)
     union = pred_flat.sum(dim=1) + true_flat.sum(dim=1) - intersection
     
     iou = (intersection + 1e-6) / (union + 1e-6)
-    return 1.0 - iou.mean()
+    return (1.0 - iou.mean()) + bce
 
 class DistilledMemoryStudent(nn.Module):
     def __init__(self,
@@ -91,7 +98,7 @@ class DistilledMemoryStudent(nn.Module):
         B, T, C, H, W = images.shape
         device = images.device
 
-        # --- Process Text (Once per batch) ---
+        # --- Process Text ---
         text_embeds = self.token_embed(text_tokens)
         text_embeds = text_embeds + self.pos_embed[:, :text_tokens.size(1), :]
         

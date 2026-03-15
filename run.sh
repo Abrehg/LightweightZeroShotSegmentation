@@ -41,6 +41,12 @@ module load gcc
 module load spectrum-mpi
 module load cuda/11.2
 
+export http_proxy=http://proxy:8888
+export https_proxy=http://proxy:8888
+export HTTP_PROXY=http://proxy:8888
+export HTTPS_PROXY=http://proxy:8888
+export WANDB_CORE=false
+
 ENV_BIN="/gpfs/u/home/ZSIS/ZSISsrtk/barn/miniconda3/envs/$VENV_NAME/bin"
 export PATH="$ENV_BIN:$PATH"
 
@@ -53,11 +59,71 @@ cd "$PROJECT_DIR"
 
 # --- Running the Training Script ---
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=29500 # A free port
+
+export MASTER_IP=$(srun --nodes=1 --ntasks=1 -w "$MASTER_ADDR" hostname -I | awk '{print $1}')
+export MASTER_PORT=29500 
+
+export NO_PROXY="localhost,127.0.0.1,.ccni.rpi.edu,$MASTER_ADDR,$MASTER_IP"
+export no_proxy=$NO_PROXY
+
+export NCCL_SOCKET_IFNAME=^docker,lo
+export GLOO_SOCKET_IFNAME=^docker,lo
+export NCCL_DEBUG=WARN
+
+echo "Pre-downloading HuggingFace cache to prevent DDP race conditions"
+python -c "
+import os, socket, requests
+os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
+socket.setdefaulttimeout(3600)
+
+import datasets
+datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
+datasets.config.MAX_RETRIES = 10
+
+_original_request = requests.Session.request
+def _patched_request(self, method, url, **kwargs):
+    kwargs['timeout'] = 3600
+    return _original_request(self, method, url, **kwargs)
+requests.Session.request = _patched_request
+
+_original_send = requests.Session.send
+def _patched_send(self, request, **kwargs):
+    kwargs['timeout'] = 3600
+    return _original_send(self, request, **kwargs)
+requests.Session.send = _patched_send
+
+from models.clip_model import create_text_encoder, create_image_encoder
+from models.prior_model import TeacherCLIP
+from transformers import InstructBlipProcessor
+from datasets import load_dataset
+import warnings
+warnings.filterwarnings('ignore')
+
+print('1/4: Downloading CLIP Base models...')
+create_text_encoder()
+create_image_encoder()
+
+print('2/4: Downloading Teacher CLIP (Large)...')
+TeacherCLIP()
+
+print('3/4: Downloading InstructBlip Processor...')
+try:
+    InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
+except Exception:
+    pass 
+
+print('4/4: Downloading LAION streaming builder...')
+try:
+    load_dataset('laion/laion400m', split='train', streaming=True, token='$HF_TOKEN')
+    print('LAION pre-download successful!')
+except Exception as e:
+    print(f'LAION pre-download failed: {e}')
+"
 
 # --- Running the Training Script with torchrun ---
 echo "Starting distributed training script..."
 echo "MASTER_ADDR: $MASTER_ADDR"
+echo "MASTER_IP: $MASTER_IP"
 
 srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
     python -m torch.distributed.run \
@@ -65,7 +131,7 @@ srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
     --nproc_per_node=4 \
     --rdzv_id=$SLURM_JOB_ID \
     --rdzv_backend=c10d \
-    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    --rdzv_endpoint=$MASTER_IP:$MASTER_PORT \
     "$PYTHON_SCRIPT_PATH" \
     --token "$HF_TOKEN"\
     --wandb_key "$WANDB_API_KEY"
@@ -77,7 +143,5 @@ if [ $EXIT_CODE -eq 0 ]; then
 else
     echo "Python script exited with error code $EXIT_CODE."
 fi
-
-conda deactivate
 
 echo "Job finished."

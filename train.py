@@ -1,6 +1,40 @@
 # train.py
-import torch
 import os
+os.environ["HF_HUB_HTTP_TIMEOUT"] = "3600"
+
+import socket
+socket.setdefaulttimeout(3600)
+
+import datasets
+datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
+datasets.config.MAX_RETRIES = 10
+
+import requests
+import time
+import random
+
+_original_send = requests.Session.send
+def _patched_send(self, request, **kwargs):
+    kwargs['timeout'] = 3600
+    for attempt in range(15): 
+        response = _original_send(self, request, **kwargs)
+        if response.status_code == 429:
+            sleep_duration = 310 + random.uniform(0, 120)
+            print(f"Worker hit Hugging Face 5-minute quota. Sleeping for {sleep_duration/60:.1f} minutes...")
+            time.sleep(sleep_duration)
+            continue
+        return response
+    return _original_send(self, request, **kwargs)
+
+requests.Session.send = _patched_send
+
+_original_request = requests.Session.request
+def _patched_request(self, method, url, **kwargs):
+    kwargs['timeout'] = 3600
+    return _original_request(self, method, url, **kwargs)
+requests.Session.request = _patched_request
+
+import torch
 import re
 import glob
 import wandb
@@ -149,11 +183,16 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
     for epoch in range(start_epoch, HYPERPARAMS["CLIP_EPOCHS"]):
         clip_model.train()
         total_loss = 0.0
-        
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+
+        prof.start()
         for batch_idx, batch in enumerate(train_loader):
-            if epoch == start_epoch and (batch_idx <= start_batch and start_batch > 0):
-                print(f"Skipping batch {batch_idx}")
-                continue
                 
             if batch is None: continue
             
@@ -170,6 +209,7 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
             
             loss.backward()
             optimizer.step()
+            prof.step()
             total_loss += loss.item()
             
             if batch_idx % 100 == 0 and is_main_process():
@@ -225,7 +265,7 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
                 f"clip_wrapper_epoch_{epoch+1}_complete"
             )
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-            
+        prof.stop() 
     print("CLIP training completed.")
 
 # ======== Prior Training ========
@@ -261,7 +301,15 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
     for epoch in range(start_epoch, HYPERPARAMS["PRIOR_EPOCHS"]):
         prior.train()
         total_loss = 0.0
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
         
+        prof.start()
         for batch_idx, batch in enumerate(train_loader):
             if epoch == start_epoch and batch_idx <= start_batch and start_batch > 0:
                 print(f"Skipping batch {batch_idx}")
@@ -283,6 +331,7 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
             
             loss.backward()
             optimizer.step()
+            prof.step()
             total_loss += loss.item()
             
             if batch_idx % 100 == 0 and is_main_process():
@@ -331,6 +380,7 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
                 f"prior_epoch_{epoch+1}_complete"
             )
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
+        prof.stop()
             
     print("Prior training completed.\n")
 
@@ -390,7 +440,15 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
         teacher.sam_decoder.train()
         total_loss = 0.0
         batch_count = 0
-        
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+
+        prof.start()
         for batch_idx, batch in enumerate(train_dataloader):
             if epoch == start_epoch and batch_idx <= start_batch and start_batch > 0:
                 print(f"Skipping batch {batch_idx}")
@@ -415,6 +473,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                 num_samples_in_batch += 1
         
             optimizer_sam_decoder.step()
+            prof.step()
 
             avg_batch_item_loss = current_batch_loss_sum / max(1, num_samples_in_batch)
             total_loss += avg_batch_item_loss
@@ -466,6 +525,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                 f"sam_decoder_epoch_{epoch+1}_complete"
             )
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
+        prof.stop()
 
     print("SAM Decoder training completed.\n")
 
@@ -540,6 +600,15 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
         total_student_loss = 0.0
         batch_count = 0
 
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+
+        prof.start()
         for batch_idx, batch in enumerate(train_dataloader):
             if epoch == start_epoch and batch_idx <= start_batch and start_batch > 0:
                 print(f"Skipping batch {batch_idx}")
@@ -578,6 +647,7 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                     
             optimizer_teacher_finetune.step()
             optimizer_student.step()
+            prof.step()
             
             batch_count += 1
             avg_batch_teacher_loss = current_batch_teacher_loss_sum / max(1, num_samples_in_batch)
@@ -642,7 +712,7 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"student_phase_student_epoch_{epoch+1}_complete")
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-
+        prof.stop()
     print("Student training completed.\n")
 
 def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_count=None):
@@ -693,18 +763,35 @@ def main(hf_token, wandb_key):
     teacher_start_weights, _, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_teacher")
     student_start_weights, student_start_epoch, student_start_batch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
 
-    if clip_text_start_epoch <= HYPERPARAMS["CLIP_EPOCHS"] or prior_start_epoch <= HYPERPARAMS["PRIOR_EPOCHS"]:
+    NUM_LAION_WORKERS = 8 
+    
+    # Determine the correct skip parameters based on the active training phase
+    active_skip_items = 0
+    if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
+        if clip_start_batch > 0:
+            active_skip_items = clip_start_batch * (HYPERPARAMS["LAION_BATCH_SIZE"] // NUM_LAION_WORKERS)
+    elif prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+        if prior_start_batch > 0:
+            active_skip_items = prior_start_batch * (HYPERPARAMS["LAION_BATCH_SIZE"] // NUM_LAION_WORKERS)
+
+    if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"] or prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+        if dist.get_rank() != 0: dist.barrier()
+
         LAION_train_dataset = get_laion_streaming_dataset(
             HUGGINGFACE = hf_token, 
             text_processor = CLIPTokenize,
             split = "train",
-            val_size=HYPERPARAMS["LAION_VAL_SIZE"]+1
+            val_size=HYPERPARAMS["LAION_VAL_SIZE"]+1,
+            skip_items=active_skip_items
         )
+        
         LAION_train_loader = DataLoader(
             LAION_train_dataset,
             batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
             collate_fn=adaptive_collate,
-            pin_memory=True
+            pin_memory=True,
+            num_workers=NUM_LAION_WORKERS,
+            prefetch_factor=2
         )
     
         LAION_val_dataset = get_laion_streaming_dataset(
@@ -713,14 +800,17 @@ def main(hf_token, wandb_key):
             split = "val",
             val_size=HYPERPARAMS["LAION_VAL_SIZE"]+1
         )
+        
         LAION_val_loader = DataLoader(
             LAION_val_dataset,
             batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
             collate_fn=adaptive_collate,
-            pin_memory=True
+            pin_memory=True,
+            num_workers=NUM_LAION_WORKERS,
+            prefetch_factor=2
         )
 
-        if clip_text_start_epoch <= HYPERPARAMS["CLIP_EPOCHS"]:
+        if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
             print("Starting CLIP Training Phase")
             train_clip(train_loader=LAION_train_loader,
                        val_loader=LAION_val_loader, 
@@ -733,7 +823,7 @@ def main(hf_token, wandb_key):
         else:
             print("CLIP training already completed.")
 
-        if prior_start_epoch <= HYPERPARAMS["PRIOR_EPOCHS"]:
+        if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
             print("Starting Prior Training Phase")
             train_prior(train_loader=LAION_train_loader,
                         val_loader=LAION_val_loader, 
@@ -748,7 +838,7 @@ def main(hf_token, wandb_key):
         
     num_workers = 0 if device == 'mps' else 10
 
-    if sam_decoder_start_epoch <= HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch <= HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+    if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
         def load_file_list(file_path):
             try:
                 with open(file_path) as f:
@@ -788,7 +878,7 @@ def main(hf_token, wandb_key):
                                     pin_memory=True, 
                                     sampler=val_sampler)
 
-        if sam_decoder_start_epoch <= HYPERPARAMS["SAM_DECODER_EPOCHS"]:
+        if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
             print("Starting SAM Decoder Training Phase")
             train_SAM_decoder(train_dataloader, 
                               val_dataloader, 
@@ -799,7 +889,7 @@ def main(hf_token, wandb_key):
         else:
             print("SAM Decoder training already completed.")
 
-        if student_start_epoch <= HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+        if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
             print("Starting Student Training Phase")
             train_student(train_dataloader, 
                           val_dataloader, 

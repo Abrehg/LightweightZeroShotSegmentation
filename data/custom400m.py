@@ -1,11 +1,13 @@
 import torch
 from torch.utils.data import IterableDataset, Dataset, DataLoader
+import torch.distributed as dist
 from datasets import load_dataset
 from PIL import Image
 import requests
 import io
 from torchvision import transforms
 from typing import Optional, Callable
+import itertools
 
 # Standard CLIP stats
 OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -23,7 +25,8 @@ class StreamingLAIONDataset(IterableDataset):
         sample_timeout: int = 10,
         image_size: int = 224,
         split_mode: str = "train",
-        val_size: int = 10000
+        val_size: int = 10000,
+        skip_items_per_worker: int = 0
     ):
         self.text_processor = text_processor
         self.max_retries = max_retries
@@ -47,6 +50,8 @@ class StreamingLAIONDataset(IterableDataset):
             streaming=True,
             token=HUGGINGFACE_TOKEN
         )
+
+        self.skip_items_per_worker = skip_items_per_worker
 
         if self.split_mode == "train":
             self.hf_dataset = self.hf_dataset.skip(self.val_size)
@@ -86,14 +91,56 @@ class StreamingLAIONDataset(IterableDataset):
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
-        shard = self.hf_dataset
-        if worker_info is not None:
-            shard = shard.shard(
-                num_shards=worker_info.num_workers,
-                index=worker_info.id
-            )
         
-        for sample in shard:
+        # 1. Get Global DDP details
+        if dist.is_initialized():
+            global_rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            global_rank = 0
+            world_size = 1
+            
+        # 2. Get local DataLoader worker details
+        if worker_info is not None:
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+        else:
+            num_workers = 1
+            worker_id = 0
+
+        # 3. Calculate absolute worker rank across the entire supercomputer
+        total_shards = world_size * num_workers
+        global_worker_rank = (global_rank * num_workers) + worker_id
+        
+        def safe_hf_generator():
+            original_get_worker_info = torch.utils.data.get_worker_info
+            
+            torch.utils.data.get_worker_info = lambda: None
+            try:
+                hf_iterator = iter(self.hf_dataset)
+            finally:
+                torch.utils.data.get_worker_info = original_get_worker_info
+                
+            while True:
+                torch.utils.data.get_worker_info = lambda: None
+                try:
+                    sample = next(hf_iterator)
+                except StopIteration:
+                    torch.utils.data.get_worker_info = original_get_worker_info
+                    break
+                except Exception as e:
+                    torch.utils.data.get_worker_info = original_get_worker_info
+                    raise e
+                    
+                torch.utils.data.get_worker_info = original_get_worker_info
+                yield sample
+                
+        shard_iterator = itertools.islice(safe_hf_generator(), global_worker_rank, None, total_shards)
+        
+        if self.skip_items_per_worker > 0:
+            shard_iterator = itertools.islice(shard_iterator, self.skip_items_per_worker, None)
+        
+        for sample in shard_iterator:
             processed = self._process_sample(sample)
             if processed is not None:
                 yield processed
@@ -213,12 +260,13 @@ def adaptive_collate(batch):
     return images, texts
 
 # Call twice for train/val splits. once with split="train" and once with split="val"
-def get_laion_streaming_dataset(HUGGINGFACE, val_size, text_processor=None, split="train"):
+def get_laion_streaming_dataset(HUGGINGFACE, val_size, text_processor=None, split="train", skip_items=0):
     return StreamingLAIONDataset(
         HUGGINGFACE_TOKEN=HUGGINGFACE, 
         text_processor=text_processor,
         split_mode=split,
-        val_size=val_size
+        val_size=val_size,
+        skip_items_per_worker=skip_items
     )
 
 # Call twice for train/val splits. once with split="train" and once with split="val"

@@ -364,7 +364,7 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
                         iters += 1
                 
                 avg_val = val_loss / iters if iters > 0 else 999.9
-                prior.module.store_weights(
+                prior.store_weights(
                     HYPERPARAMS["CHECKPOINT_DIR"], 
                     f"prior_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}"
                 )
@@ -375,7 +375,7 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
             avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
             print(f"Prior Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
 
-            prior.module.store_weights(
+            prior.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"prior_epoch_{epoch+1}_complete"
             )
@@ -600,15 +600,6 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
         total_student_loss = 0.0
         batch_count = 0
 
-        prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True
-        )
-
-        prof.start()
         for batch_idx, batch in enumerate(train_dataloader):
             if epoch == start_epoch and batch_idx <= start_batch and start_batch > 0:
                 print(f"Skipping batch {batch_idx}")
@@ -647,7 +638,6 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                     
             optimizer_teacher_finetune.step()
             optimizer_student.step()
-            prof.step()
             
             batch_count += 1
             avg_batch_teacher_loss = current_batch_teacher_loss_sum / max(1, num_samples_in_batch)
@@ -682,7 +672,7 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                             s_out = student(v_img, v_txt)
                             
                             val_t_loss += iou_loss(t_out, v_mask).item()
-                            val_s_loss += student.module.compute_distill_loss(s_out, t_out, v_mask).item()
+                            val_s_loss += student.compute_distill_loss(s_out, t_out, v_mask).item()
 
                             num_val_samples += 1
                         
@@ -712,7 +702,6 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"student_phase_student_epoch_{epoch+1}_complete")
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-        prof.stop()
     print("Student training completed.\n")
 
 def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_count=None):

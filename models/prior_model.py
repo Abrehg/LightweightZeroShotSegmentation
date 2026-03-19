@@ -5,8 +5,8 @@ import os
 from transformers import CLIPVisionModel
 
 # Prior model factory
-def create_prior():
-    return Prior()
+def create_prior(num_layers=12):
+    return Prior(num_layers=num_layers)
 
 # Input encoding shape: (1, seq_len, 768) (max seq_len is 77)
 # Output shape: (1, 196, 768)

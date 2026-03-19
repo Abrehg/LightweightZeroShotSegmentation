@@ -3,8 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-def create_SAM():
-    return VideoSAM()
+def create_SAM(max_memory_length=10, num_layers = 2):
+    return VideoSAM(
+        max_memory_length=max_memory_length,
+        num_layers=num_layers
+        )
 
 # Loss for overall model (Binary Cross Entropy + IoU Loss)
 # pred_masks -> model output
@@ -156,7 +159,8 @@ class VideoSAM(nn.Module):
                  prior_dim=768,
                  mem_size=1,
                  max_memory_length=10,
-                 fixed_encoder_size=(14, 14)):
+                 fixed_encoder_size=(14, 14),
+                 num_layers = 2):
         super().__init__()
         self.embed_dim = embed_dim
         self.mem_size = mem_size
@@ -174,7 +178,7 @@ class VideoSAM(nn.Module):
         self.pos_enc = UnifiedPositionalEncoding(embed_dim=embed_dim)
         
         self.object_queries = nn.Parameter(torch.randn(1, mem_size, embed_dim))
-        self.decoder = FrameTransformerDecoder(embed_dim=embed_dim)
+        self.decoder = FrameTransformerDecoder(embed_dim=embed_dim, num_layers=num_layers)
 
     def forward(self, images: torch.Tensor, prior_grid: torch.Tensor):
         if images.ndim == 4:

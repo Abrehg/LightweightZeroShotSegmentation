@@ -3,8 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-def create_Student():
-    return DistilledMemoryStudent()
+def create_Student(text_transformer_layers=2, max_memory_length=10, output_layers=2):
+    return DistilledMemoryStudent(
+        text_transformer_layers=text_transformer_layers,
+        max_memory_length=max_memory_length,
+        num_decoder_layers=output_layers
+    )
 
 # Loss for overall model (Binary Cross Entropy + IoU Loss)
 # pred_masks -> model output
@@ -36,7 +40,8 @@ class DistilledMemoryStudent(nn.Module):
                  image_feature_dim=128,
                  output_mask_channels=1, 
                  fixed_intermediate_spatial_size=(16, 16),
-                 max_memory_length=10):
+                 max_memory_length=10,
+                 num_decoder_layers=2):
         super().__init__()
 
         self.text_embed_dim = text_embed_dim
@@ -61,7 +66,7 @@ class DistilledMemoryStudent(nn.Module):
             num_layers=text_transformer_layers
         )
 
-        # --- Image Encoder (Lightweight) ---
+        # --- Image Encoder ---
         self.image_encoder = nn.Sequential(
             nn.Conv2d(image_input_channels, 32, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 32), 
@@ -75,11 +80,31 @@ class DistilledMemoryStudent(nn.Module):
         )
         self.adaptive_pool = nn.AdaptiveAvgPool2d(fixed_intermediate_spatial_size)
 
-        # --- Mask Decoder ---
-        combined_feature_dim = image_feature_dim + text_embed_dim
+        # --- Mask Cross Attention ---
+        fusion_dim = image_feature_dim
+        num_spatial_tokens = self.fixed_intermediate_H * self.fixed_intermediate_W
+        self.spatial_pos_embed = nn.Parameter(
+            torch.randn(1, num_spatial_tokens, fusion_dim) * 0.02
+        )
         
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=fusion_dim,
+            nhead=text_transformer_heads,
+            dim_feedforward=fusion_dim * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.fusion_decoder = nn.TransformerDecoder(
+            decoder_layer=decoder_layer,
+            num_layers=num_decoder_layers
+        )
+        self.fusion_norm = nn.LayerNorm(fusion_dim)
+ 
+        # --- Mask Decoder ---
         self.mask_decoder = nn.Sequential(
-            nn.ConvTranspose2d(combined_feature_dim, 128, kernel_size=2, stride=2), # 16->32
+            nn.ConvTranspose2d(fusion_dim, 128, kernel_size=2, stride=2), # 16->32
             nn.GroupNorm(8, 128),
             nn.GELU(),
             nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2), # 32->64
@@ -104,14 +129,13 @@ class DistilledMemoryStudent(nn.Module):
         
         # Transformer encoding
         text_features_seq = self.text_transformer(text_embeds)
-        text_features_global = text_features_seq.mean(dim=1) 
 
         # --- Initialize Memory Queue ---
-        combined_dim = self.image_feature_dim + self.text_embed_dim
+        fusion_dim = self.image_feature_dim
         
         if self.max_memory_length > 0:
             memory_queue = torch.zeros(
-                B, self.max_memory_length, combined_dim, 
+                B, self.max_memory_length, fusion_dim, 
                 self.fixed_intermediate_H, self.fixed_intermediate_W
             ).to(device)
         
@@ -124,17 +148,26 @@ class DistilledMemoryStudent(nn.Module):
             img_feats_raw = self.image_encoder(current_frame) 
             img_feats_pooled = self.adaptive_pool(img_feats_raw)
 
-            text_feats_expanded = text_features_global.unsqueeze(-1).unsqueeze(-1).expand(
-                -1, -1, self.fixed_intermediate_H, self.fixed_intermediate_W
+            img_tokens = img_feats_pooled.flatten(2).transpose(1, 2)  # (B, H'*W', img_dim)
+            img_tokens = img_tokens + self.spatial_pos_embed
+ 
+            # Cross-attention: image tokens (tgt) attend to text tokens (memory)
+            fused_tokens = self.fusion_decoder(
+                tgt=img_tokens,
+                memory=text_features_seq
+            )  # (B, H'*W', fusion_dim)
+            fused_tokens = self.fusion_norm(fused_tokens)
+ 
+            # Reshape back to spatial feature map
+            fused_spatial = fused_tokens.transpose(1, 2).view(
+                B, fusion_dim, self.fixed_intermediate_H, self.fixed_intermediate_W
             )
-            
-            current_combined = torch.cat([img_feats_pooled, text_feats_expanded], dim=1)
 
             if self.max_memory_length > 0:
-                memory_queue = torch.cat((memory_queue[:, 1:], current_combined.unsqueeze(1)), dim=1)
+                memory_queue = torch.cat((memory_queue[:, 1:], fused_spatial.unsqueeze(1)), dim=1)
                 features_for_decoder = memory_queue.mean(dim=1)
             else:
-                features_for_decoder = current_combined
+                features_for_decoder = fused_spatial
 
             mask_logits = self.mask_decoder(features_for_decoder)
             mask_final = F.interpolate(

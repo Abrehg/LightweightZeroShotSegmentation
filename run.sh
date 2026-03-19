@@ -114,7 +114,7 @@ except Exception:
 
 print('4/4: Downloading LAION streaming builder...')
 try:
-    load_dataset('laion/laion400m', split='train', streaming=True, token='$HF_TOKEN')
+    load_dataset('laion/relaion400m', split='train', streaming=True, token='$HF_TOKEN')
     print('LAION pre-download successful!')
 except Exception as e:
     print(f'LAION pre-download failed: {e}')

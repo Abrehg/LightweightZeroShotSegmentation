@@ -45,7 +45,7 @@ class StreamingLAIONDataset(IterableDataset):
         ])
         
         self.hf_dataset = load_dataset(
-            "laion/laion400m",
+            "laion/relaion400m",
             split="train",
             streaming=True,
             token=HUGGINGFACE_TOKEN
@@ -189,7 +189,7 @@ class CachedLAIONDataset(Dataset):
         
         try:
             dataset = load_dataset(
-                "laion/laion400m",
+                "laion/relaion400m",
                 split="train",
                 streaming=True,
                 token=HUGGINGFACE_TOKEN

@@ -13,6 +13,7 @@ from models.clip_model import CLIPTokenize
 from .sav_utils import SAVDatasetHelper
 import re
 import time
+import random
 
 def SAM_adaptive_collate(batch):
     images, masks, texts = zip(*batch)
@@ -228,12 +229,12 @@ class SA1BDataset(StreamingBaseTarDataset):
                                 mask = coco_mask.decode(rle)
                                 mask_tensor = torch.from_numpy(mask).long().unsqueeze(0) # [1, H, W]
                                 
-                                for caption_idx in range(4):
-                                    caption = self.caption_generator.generate_all_captions(
-                                        image_tensor.squeeze(0), mask_tensor.squeeze(0), caption_idx
-                                    )
-                                    caption_tokens = CLIPTokenize(caption) # Pre-unsqueezed sequence [1, 77]
-                                    yield image_tensor, mask_tensor, caption_tokens
+                                caption_idx = random.randint(0, 3)
+                                caption = self.caption_generator.generate_all_captions(
+                                    image_tensor.squeeze(0), mask_tensor.squeeze(0), caption_idx
+                                )
+                                caption_tokens = CLIPTokenize(caption) # [1, 77]
+                                yield image_tensor, mask_tensor, caption_tokens
                             except Exception: continue
                     except Exception: continue
         except Exception: return
@@ -309,10 +310,10 @@ class SAVDataset(StreamingBaseTarDataset):
                         masks_tensor = torch.stack(masks).unsqueeze(0) # [1, T, H, W]
 
                         if first_valid_frame is not None:
-                            for caption_idx in range(4):
-                                caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
-                                caption_tokens = CLIPTokenize(caption) # [1, seq_len]
-                                yield frames_tensor, masks_tensor, caption_tokens
+                            caption_idx = random.randint(0, 3)
+                            caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
+                            caption_tokens = CLIPTokenize(caption) # [1, seq_len]
+                            yield frames_tensor, masks_tensor, caption_tokens
                         else:
                             yield frames_tensor, masks_tensor, CLIPTokenize("object")
 
@@ -377,11 +378,11 @@ class StaticSA1BDataset(Dataset):
         return samples
 
     def __len__(self):
-        return len(self.samples) * 4
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        original_sample_idx = idx // 4
-        caption_idx = idx % 4
+        original_sample_idx = idx
+        caption_idx = random.randint(0, 3)
         tar_path, json_name, ann_idx, image_path = self.samples[original_sample_idx]
         
         with tarfile.open(tar_path, "r") as tar:
@@ -439,11 +440,11 @@ class StaticSAVDataset(Dataset):
         return samples
 
     def __len__(self):
-        return len(self.samples) * 4
+        return len(self.samples)
         
     def __getitem__(self, idx):
-        original_sample_idx = idx // 4
-        caption_idx = idx % 4
+        original_sample_idx = idx
+        caption_idx = random.randint(0, 3)
         
         tar_path, video_id, annot_name = self.samples[original_sample_idx]
         with tarfile.open(tar_path, "r") as tar:

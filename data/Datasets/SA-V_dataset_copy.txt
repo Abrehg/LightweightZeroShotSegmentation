@@ -1,2 +1,0 @@
-file_name	cdn_link
-sav_000.tar	https://scontent.xx.fbcdn.net/m1/v/t6/An-tPiXhtjFu_KnO3KjjcMReWlc1m_oYKcpw7Bj7r0Oa32_oMYC-Frt17lRsjwBWNqRYJNsFKh_Xud4jNd6evmU.tar?_nc_gid&ccb=10-5&oh=00_AfvNI8FePxasb_DURjRvfvRpW7g4qDc1CK63kQeHZmKa_w&oe=69BCD552&_nc_sid=7b5a27

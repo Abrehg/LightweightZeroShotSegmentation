@@ -2,25 +2,60 @@
 #SBATCH --mail-user=surata@rpi.edu
 #SBATCH --mail-type=end,fail
 #SBATCH --job-name=sam_clip_tuning
-#SBATCH --output=slurm-%A.%a.out
-#SBATCH --error=slurm-%A.%a.err
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --time=24:00:00
 #SBATCH --qos=dcs-48hr
+
+# ============================================================
+# Sequential Tuning Workflow
+# ============================================================
+# Each phase depends on trained weights from previous phases.
+# Run them in order, updating PHASE and structural args each time:
+#
+#   1) PHASE="clip"    — no weights needed, tunes from scratch
+#      → train CLIP with best hyperparams, save to WEIGHTS_DIR
+#
+#   2) PHASE="prior"   — needs trained text encoder from step 1
+#      → set TXT_ENC_LAYERS to best num_layers from step 1
+#      → train Prior with best hyperparams, save to WEIGHTS_DIR
+#
+#   3) PHASE="decoder"  — needs trained text encoder + prior
+#      → set TXT_ENC_LAYERS and PRIOR_LAYERS from steps 1-2
+#      → train SAM decoder for 3 epochs, save to WEIGHTS_DIR
+#
+#   4) PHASE="student"  — needs full trained teacher pipeline
+#      → set all structural params from steps 1-3
+#      → teacher warms up for TEACHER_WARMUP_EPOCHS, then student tunes
+# ============================================================
 
 # --- User-configurable ---
 PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/research"
 PYTHON_SCRIPT_NAME="tune.py"
 VENV_NAME="visEnv"
 HF_TOKEN="_"
-PHASE="clip"
 N_TRIALS=30
 
+# Current phase to tune (change per run)
+PHASE="clip"
+
+# Path to trained weights from previous phases
+WEIGHTS_DIR="$PROJECT_DIR/models/trained"
+
+# Structural params from previous tuning results (must match saved weights).
+# Update these after each phase completes with the best trial values.
+TXT_ENC_LAYERS=12       # best num_layers from CLIP tuning
+PRIOR_LAYERS=12          # best num_layers from Prior tuning
+SAM_LAYERS=2             # best num_layers from Decoder tuning
+SAM_MEMORY=10            # best Max Memory Length from Decoder tuning
+TEACHER_WARMUP_EPOCHS=3  # warm-up epochs for teacher before student tuning
+                         # set to 0 if SAM weights already have 3+ epochs
+
 # --- Sanity Checks ---
-if [ -z "$HF_TOKEN" ]; then
-    echo "Error: Hugging Face token not provided."
-    echo "Usage: sbatch $0 YOUR_HF_TOKEN"
+if [ -z "$HF_TOKEN" ] || [ "$HF_TOKEN" = "_" ]; then
+    echo "Error: Set HF_TOKEN to your actual HuggingFace token."
     exit 1
 fi
 
@@ -35,11 +70,17 @@ if [ ! -f "$PYTHON_SCRIPT_PATH" ]; then
     exit 1
 fi
 
+# Check weights dir exists for phases that need it
+if [ "$PHASE" != "clip" ] && [ ! -d "$WEIGHTS_DIR" ]; then
+    echo "Error: WEIGHTS_DIR '$WEIGHTS_DIR' does not exist."
+    echo "Phase '$PHASE' requires trained weights from previous phases."
+    exit 1
+fi
+
 # --- Environment Setup ---
 echo "Loading modules..."
 module purge
 module load gcc
-module load cuda/11.2
 
 export http_proxy=http://proxy:8888
 export https_proxy=http://proxy:8888
@@ -49,16 +90,13 @@ export HTTPS_PROXY=http://proxy:8888
 ENV_BIN="/gpfs/u/home/ZSIS/ZSISsrtk/barn/miniconda3/envs/$VENV_NAME/bin"
 export PATH="$ENV_BIN:$PATH"
 
-# Verify Python and pip are from the venv
 echo "Python executable: $(which python)"
 echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
 
-# Navigate to the project directory
-echo "Changing to project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
-# --- Running the Training Script ---
-echo "Pre-downloading HuggingFace cache to prevent DDP race conditions"
+# --- Pre-download HuggingFace assets ---
+echo "Pre-downloading HuggingFace cache..."
 python -c "
 import os, socket, requests
 os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
@@ -98,7 +136,7 @@ print('3/4: Downloading InstructBlip Processor...')
 try:
     InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
 except Exception:
-    pass 
+    pass
 
 print('4/4: Downloading LAION streaming builder...')
 try:
@@ -108,20 +146,41 @@ except Exception as e:
     print(f'LAION pre-download failed: {e}')
 "
 
-# --- Running the Training Script with torchrun ---
+# --- Build the command with phase-appropriate args ---
 echo "Starting Optuna hyperparameter sweep: phase=$PHASE, trials=$N_TRIALS"
- 
-python "$PYTHON_SCRIPT_PATH" \
-    --token "$HF_TOKEN" \
-    --phase "$PHASE" \
-    --trials "$N_TRIALS"
 
+CMD="python $PYTHON_SCRIPT_PATH \
+    --token $HF_TOKEN \
+    --phase $PHASE \
+    --trials $N_TRIALS"
+
+# Add weight-loading args for phases that depend on previous phases
+if [ "$PHASE" != "clip" ]; then
+    CMD="$CMD \
+    --weights_dir $WEIGHTS_DIR \
+    --txt_enc_layers $TXT_ENC_LAYERS"
+fi
+
+if [ "$PHASE" = "decoder" ] || [ "$PHASE" = "student" ]; then
+    CMD="$CMD \
+    --prior_layers $PRIOR_LAYERS"
+fi
+
+if [ "$PHASE" = "student" ]; then
+    CMD="$CMD \
+    --sam_layers $SAM_LAYERS \
+    --sam_memory $SAM_MEMORY \
+    --teacher_warmup_epochs $TEACHER_WARMUP_EPOCHS"
+fi
+
+echo "Running: $CMD"
+eval $CMD
 
 EXIT_CODE=$?
 if [ $EXIT_CODE -eq 0 ]; then
-    echo "Python script completed successfully."
+    echo "Tuning completed successfully."
 else
-    echo "Python script exited with error code $EXIT_CODE."
+    echo "Tuning exited with error code $EXIT_CODE."
 fi
 
 echo "Job finished."

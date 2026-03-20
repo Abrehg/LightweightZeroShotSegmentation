@@ -5,7 +5,7 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --qos=dcs-48hr
 
@@ -35,7 +35,7 @@
 PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/research"
 PYTHON_SCRIPT_NAME="tune.py"
 VENV_NAME="visEnv"
-HF_TOKEN="_"
+HF_TOKEN=""
 N_TRIALS=30
 
 # Current phase to tune (change per run)
@@ -46,7 +46,7 @@ WEIGHTS_DIR="$PROJECT_DIR/models/trained"
 
 # Structural params from previous tuning results (must match saved weights).
 # Update these after each phase completes with the best trial values.
-TXT_ENC_LAYERS=12       # best num_layers from CLIP tuning
+TXT_ENC_LAYERS=11       # best num_layers from CLIP tuning
 PRIOR_LAYERS=12          # best num_layers from Prior tuning
 SAM_LAYERS=2             # best num_layers from Decoder tuning
 SAM_MEMORY=10            # best Max Memory Length from Decoder tuning
@@ -70,11 +70,14 @@ if [ ! -f "$PYTHON_SCRIPT_PATH" ]; then
     exit 1
 fi
 
-# Check weights dir exists for phases that need it
-if [ "$PHASE" != "clip" ] && [ ! -d "$WEIGHTS_DIR" ]; then
-    echo "Error: WEIGHTS_DIR '$WEIGHTS_DIR' does not exist."
-    echo "Phase '$PHASE' requires trained weights from previous phases."
-    exit 1
+# Auto-create weights dir and warn if empty (tuning will use random init as fallback)
+if [ "$PHASE" != "clip" ]; then
+    mkdir -p "$WEIGHTS_DIR"
+    if [ -z "$(ls -A $WEIGHTS_DIR 2>/dev/null)" ]; then
+        echo "WARNING: WEIGHTS_DIR '$WEIGHTS_DIR' is empty."
+        echo "  Phase '$PHASE' will use random initialization for upstream components."
+        echo "  Results are approximate — retune after training for best accuracy."
+    fi
 fi
 
 # --- Environment Setup ---

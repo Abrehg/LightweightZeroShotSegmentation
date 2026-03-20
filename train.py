@@ -61,7 +61,7 @@ HYPERPARAMS = {
     "TEACHER_LR": 0.00001, # For teacher fine-tuning during student training
     "STUDENT_LR": 0.0001,
     "LAION_VAL_SIZE": 10000,
-    "LAION_BATCH_SIZE": 64,
+    "LAION_BATCH_SIZE": 128,
     "SA_VAL_TAR_COUNT": 1,  
     "SA_VAL_SAMPLE_COUNT": 5000,
     "SAV_VAL_TAR_COUNT": 1,
@@ -752,7 +752,7 @@ def main(hf_token, wandb_key):
     teacher_start_weights, _, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_teacher")
     student_start_weights, student_start_epoch, student_start_batch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
 
-    NUM_LAION_WORKERS = 8 
+    NUM_LAION_WORKERS = 6
     
     # Determine the correct skip parameters based on the active training phase
     active_skip_items = 0

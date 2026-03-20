@@ -17,7 +17,7 @@ def VecToText(vector):
     return tokenizer.convert_ids_to_tokens(vector)
 
 # Text encoder factory
-def create_text_encoder(num_layers=12):
+def create_text_encoder(num_layers=11):
     return TextEncoder(
         vocab_size=49408, 
         max_seq_len=MAXSEQLENGTH,

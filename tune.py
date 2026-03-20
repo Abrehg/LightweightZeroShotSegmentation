@@ -1,11 +1,31 @@
 # tune.py
+#
+# Sequential hyperparameter tuning for a 4-phase pipeline:
+#   Phase 1 (clip)    — tunes from scratch
+#   Phase 2 (prior)   — loads trained CLIP text encoder
+#   Phase 3 (decoder) — loads trained CLIP text encoder + Prior
+#   Phase 4 (student) — loads full trained teacher (CLIP + Prior + SAM w/ 3 epochs),
+#                        warms up teacher, then tunes student hyperparameters
+#
+# Usage examples:
+#   python tune.py --token HF_TOKEN --phase clip --trials 30
+#   python tune.py --token HF_TOKEN --phase prior --trials 30 \
+#       --weights_dir models/trained --txt_enc_layers 12
+#   python tune.py --token HF_TOKEN --phase decoder --trials 30 \
+#       --weights_dir models/trained --txt_enc_layers 12 --prior_layers 10
+#   python tune.py --token HF_TOKEN --phase student --trials 30 \
+#       --weights_dir models/trained --txt_enc_layers 12 --prior_layers 10 \
+#       --sam_layers 8 --sam_memory 10 --teacher_warmup_epochs 3
+
 import torch
 import gc
+import os
+import copy
 import optuna
 import argparse
 import warnings
 warnings.filterwarnings('ignore')
-
+import json
 from torch.utils.data import DataLoader, ConcatDataset
 from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
 from models.prior_model import create_prior, PriorLoss, TeacherCLIP
@@ -17,32 +37,54 @@ from data.segmentation import SAM_adaptive_collate, StaticSA1BDataset, StaticSAV
 # Hardware Setup (Single Node)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Micro-Sweep Configurations (Fast runs!)
+# Micro-Sweep Configurations
 TUNE_EPOCHS = 1
-TUNE_TRAIN_SAMPLES = 2000 
-TUNE_VAL_SAMPLES = 500
+TUNE_TOTAL_SAMPLES = 2500
+TUNE_VAL_RATIO = 0.2
+
+# Standard weight filenames (saved by store_weights in each model)
+CLIP_TXT_FILENAME = "txtEncWeights"
+CLIP_IMG_FILENAME = "imgEncWeights"
+CLIP_WRAPPER_FILENAME = "CLIPWrapperWeights"
+PRIOR_FILENAME = "PriorWeights"
+SAM_FILENAME = "SAMWeights"
+
+# ======================== Dataset Caching ========================
+# Loaded once on first call, reused across all trials.
 
 _laion_cache = {}
 _sam_cache = {}
 
 def _get_laion_datasets(hf_token):
-    """Load LAION train/val datasets once, cache for all trials."""
     if 'train' not in _laion_cache:
-        print("[Cache] Loading LAION train dataset (one-time)...")
-        _laion_cache['train'] = get_laion_test_dataset(
-            hf_token, val_boundary=10000, num_samples=TUNE_TRAIN_SAMPLES, 
+        print(f"[Cache] Downloading {TUNE_TOTAL_SAMPLES} LAION samples (one-time)...")
+        full_dataset = get_laion_test_dataset(
+            hf_token, val_boundary=0, num_samples=TUNE_TOTAL_SAMPLES,
             text_processor=CLIPTokenize, split="train"
         )
-    if 'val' not in _laion_cache:
-        print("[Cache] Loading LAION val dataset (one-time)...")
-        _laion_cache['val'] = get_laion_test_dataset(
-            hf_token, val_boundary=10000, num_samples=TUNE_VAL_SAMPLES, 
-            text_processor=CLIPTokenize, split="val"
+        
+        total = len(full_dataset)
+        val_size = max(1, int(total * TUNE_VAL_RATIO))
+        train_size = total - val_size
+        
+        train_subset, val_subset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
         )
+        
+        _laion_cache['train'] = train_subset
+        _laion_cache['val'] = val_subset
+        print(f"[Cache] Split into {train_size} train / {val_size} val samples")
+    
     return _laion_cache['train'], _laion_cache['val']
 
+def get_laion_loaders(hf_token, batch_size):
+    train_dataset, val_dataset = _get_laion_datasets(hf_token)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=adaptive_collate, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=adaptive_collate, shuffle=False, num_workers=4)
+    return train_loader, val_loader
+
 def _get_sam_datasets():
-    """Load SAM train/val datasets once, cache for all trials."""
     if 'train' not in _sam_cache:
         def load_file_list(file_path):
             try:
@@ -56,21 +98,15 @@ def _get_sam_datasets():
 
         print("[Cache] Loading SAM train dataset (one-time)...")
         _sam_cache['train'] = ConcatDataset([
-            StaticSA1BDataset(sa1b_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=TUNE_TRAIN_SAMPLES//2),
-            StaticSAVDataset(sav_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=TUNE_TRAIN_SAMPLES//2)
+            StaticSA1BDataset(sa1b_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=1000),
+            StaticSAVDataset(sav_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=1000)
         ])
         print("[Cache] Loading SAM val dataset (one-time)...")
         _sam_cache['val'] = ConcatDataset([
-            StaticSA1BDataset(sa1b_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=TUNE_VAL_SAMPLES//2),
-            StaticSAVDataset(sav_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=TUNE_VAL_SAMPLES//2)
+            StaticSA1BDataset(sa1b_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=250),
+            StaticSAVDataset(sav_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=250)
         ])
     return _sam_cache['train'], _sam_cache['val']
-
-def get_laion_loaders(hf_token, batch_size):
-    train_dataset, val_dataset = _get_laion_datasets(hf_token)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=adaptive_collate, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=adaptive_collate, shuffle=False, num_workers=4)
-    return train_loader, val_loader
 
 def get_sam_loaders(batch_size):
     train_dataset, val_dataset = _get_sam_datasets()
@@ -78,22 +114,100 @@ def get_sam_loaders(batch_size):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=SAM_adaptive_collate, shuffle=False, num_workers=4)
     return train_loader, val_loader
 
+# ======================== Helpers ========================
+
 def gpu_cleanup():
+    """Free GPU memory between trials to prevent fragmentation."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-# ======== PHASE 1: CLIP Objective ========
+# Base directory for saving trial weights
+TUNE_CHECKPOINT_DIR = "weights/tune"
+
+def save_trial_weights(phase, trial, val_loss, models_dict):
+    trial_dir = os.path.join(
+        TUNE_CHECKPOINT_DIR, phase,
+        f"trial_{trial.number:02d}_loss_{val_loss:.4f}"
+    )
+    os.makedirs(trial_dir, exist_ok=True)
+    
+    # Save each model's weights
+    for filename, model in models_dict.items():
+        if filename == "clip_wrapper":
+            # CLIPWrapper has its own multi-file save
+            model.store_weights(
+                trial_dir, 
+                CLIP_TXT_FILENAME, CLIP_IMG_FILENAME, CLIP_WRAPPER_FILENAME
+            )
+        elif hasattr(model, 'store_weights'):
+            model.store_weights(trial_dir, filename)
+        else:
+            # Fallback: raw state_dict save
+            torch.save(model.state_dict(), os.path.join(trial_dir, filename))
+    
+    # Save hyperparameters alongside weights
+    params = dict(trial.params)
+    params["val_loss"] = val_loss
+    params["trial_number"] = trial.number
+    with open(os.path.join(trial_dir, "params.json"), 'w') as f:
+        json.dump(params, f, indent=2)
+    
+    print(f"  [Save] Trial {trial.number} weights saved to {trial_dir} (val_loss={val_loss:.4f})")
+
+def load_trained_text_encoder(args):
+    txt_path = os.path.join(args.weights_dir, CLIP_TXT_FILENAME)
+    text_encoder = create_text_encoder(num_layers=args.txt_enc_layers).to(device)
+    if os.path.exists(txt_path):
+        print(f"[Weights] Loading trained text encoder ({args.txt_enc_layers} layers) from {txt_path}")
+        text_encoder.load_weights(txt_path)
+    else:
+        print(f"[Weights] WARNING: Trained text encoder not found at {txt_path}")
+        print(f"  Using random initialization. Tuning results will approximate — retune after CLIP training for best accuracy.")
+    text_encoder.eval()
+    for p in text_encoder.parameters():
+        p.requires_grad = False
+    return text_encoder
+
+def load_trained_prior(args):
+    prior_path = os.path.join(args.weights_dir, PRIOR_FILENAME)
+    prior = create_prior(num_layers=args.prior_layers).to(device)
+    if os.path.exists(prior_path):
+        print(f"[Weights] Loading trained prior ({args.prior_layers} layers) from {prior_path}")
+        prior.load_weights(prior_path)
+    else:
+        print(f"[Weights] WARNING: Trained prior not found at {prior_path}")
+        print(f"  Using random initialization. Tuning results will approximate — retune after Prior training for best accuracy.")
+    prior.eval()
+    for p in prior.parameters():
+        p.requires_grad = False
+    return prior
+
+def load_trained_sam(args):
+    sam_path = os.path.join(args.weights_dir, SAM_FILENAME)
+    sam_decoder = create_SAM(max_memory_length=args.sam_memory, num_layers=args.sam_layers).to(device)
+    if os.path.exists(sam_path):
+        print(f"[Weights] Loading trained SAM decoder ({args.sam_layers} layers, memory={args.sam_memory}) from {sam_path}")
+        sam_decoder.load_weights(sam_path)
+    else:
+        print(f"[Weights] WARNING: Trained SAM decoder not found at {sam_path}")
+        print(f"  Using random initialization. Tuning results will approximate — retune after SAM training for best accuracy.")
+    return sam_decoder
+
+# ======================== PHASE 1: CLIP ========================
 def objective_clip(trial, hf_token):
     lr = trial.suggest_float("lr", 1e-6, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
     num_layers = trial.suggest_int("num_layers", 1, 24)
+
+    estimated_mem_factor = batch_size * num_layers
+    if estimated_mem_factor > 2048:
+        raise optuna.exceptions.TrialPruned()
     
     gpu_cleanup()
     train_loader, val_loader = get_laion_loaders(hf_token, batch_size)
     
-    # Passing structural tuning params to model
     text_encoder = create_text_encoder(num_layers=num_layers).to(device)
     image_encoder = create_image_encoder().to(device)
     model = CLIPWrapper(text_encoder, image_encoder).to(device)
@@ -135,22 +249,29 @@ def objective_clip(trial, hf_token):
                 
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
+
+    save_trial_weights("clip", trial, val_loss, {"clip_wrapper": model})
         
     return val_loss
 
-# ======== PHASE 2: Prior Objective ========
-def objective_prior(trial, hf_token):
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
+# ======================== PHASE 2: Prior ========================
+# Depends on: trained CLIP text encoder (frozen).
+def objective_prior(trial, hf_token, args):
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     num_layers = trial.suggest_int("num_layers", 1, 24)
     
+    estimated_mem_factor = batch_size * num_layers
+    if estimated_mem_factor > 2048:
+        raise optuna.exceptions.TrialPruned()
+
     gpu_cleanup()
     train_loader, val_loader = get_laion_loaders(hf_token, batch_size=batch_size)
     
-    text_encoder = create_text_encoder(num_layers=10).to(device).eval()
+    # Load trained text encoder from CLIP phase (frozen)
+    text_encoder = load_trained_text_encoder(args)
     teacher = TeacherCLIP().to(device).eval()
     
-    # Passing structural tuning params to Prior
     prior = create_prior(num_layers=num_layers).to(device)
     optimizer = torch.optim.Adam(prior.parameters(), lr=lr)
 
@@ -193,21 +314,31 @@ def objective_prior(trial, hf_token):
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
         
+    save_trial_weights("prior", trial, val_loss, {PRIOR_FILENAME: prior})
+
     return val_loss
 
-# ======== PHASE 3: SAM Decoder Objective ========
-def objective_decoder(trial):
+# ======================== PHASE 3: SAM Decoder ========================
+# Depends on: trained CLIP text encoder + Prior (both frozen).
+def objective_decoder(trial, args):
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
     max_memory_length = trial.suggest_int("Max Memory Length", 1, 20)
     num_layers = trial.suggest_int("num layers", 1, 20)
     
+    estimated_mem_factor = batch_size * num_layers
+    if estimated_mem_factor > 2048:  # e.g. 128*16 or 256*8
+        raise optuna.exceptions.TrialPruned()
+
     gpu_cleanup()
     train_loader, val_loader = get_sam_loaders(batch_size)
     
-    text_encoder = create_text_encoder(num_layers=10).to(device).eval()
-    prior = create_prior(num_layers=10).to(device).eval()
+    # Load trained components from previous phases (frozen)
+    text_encoder = load_trained_text_encoder(args)
+    prior = load_trained_prior(args)
+    
+    # SAM decoder is what we're tuning — fresh init
     sam_decoder = create_SAM(max_memory_length=max_memory_length, num_layers=num_layers).to(device)
 
     class TeacherModel(torch.nn.Module):
@@ -261,492 +392,8 @@ def objective_decoder(trial):
                     
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
-        
-    return val_loss
 
-def objective_student(trial):
-    teacher_lr = trial.suggest_float("teacher_lr", 1e-5, 1e-2, log=True)
-    student_lr = trial.suggest_float("student_lr", 1e-5, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
-    input_layers = trial.suggest_int("input layers", 1, 20)
-    num_decoder_layers = trial.suggest_int("num_decoder_layers", 1, 8)
-    max_memory_length = trial.suggest_int("Max Memory Length", 1, 20)
-
-    gpu_cleanup()
-    train_loader, val_loader = get_sam_loaders(batch_size)
-
-    text_encoder = create_text_encoder(num_layers=10).to(device).eval()
-    prior = create_prior(num_layers=10).to(device).eval()
-    sam_decoder = create_SAM(max_memory_length=10, num_layers=10).to(device)
-
-    class TeacherModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.text_encoder = text_encoder
-            self.prior = prior
-            self.sam_decoder = sam_decoder
-
-        def forward(self, x, text_tokens):
-            with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
-                prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
-
-    teacher = TeacherModel().to(device)
-
-    student = create_Student(text_transformer_layers=input_layers, 
-                             max_memory_length=max_memory_length,
-                             num_decoder_layers=num_decoder_layers)
-
-    optimizer_teacher_finetune = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=teacher_lr)
-    optimizer_student = torch.optim.Adam(student.parameters(), lr=student_lr)
-
-    for epoch in range(TUNE_EPOCHS):
-        teacher.sam_decoder.train()
-        student.train()
-
-        total_teacher_loss = 0.0
-        total_student_loss = 0.0
-        batch_count = 0
-
-        for batch_idx, batch in enumerate(train_loader):
-            if batch is None: continue
-            images, true_masks, texts = batch
-
-            current_batch_teacher_loss_sum = 0
-            current_batch_student_loss_sum = 0
-            num_samples_in_batch = 0
-
-            optimizer_teacher_finetune.zero_grad()
-            optimizer_student.zero_grad()
-
-            for img, mask, txt in zip(images, true_masks, texts):
-                mask = mask.to(device).float()
-                img = img.to(device)
-                txt = txt.to(device)
-
-                teacher_out = teacher(img, txt)
-                student_out = student(img, txt)
-                
-                with torch.no_grad():
-                    teacher_out_for_student = teacher(img, txt).detach()
-
-                teacher_loss = iou_loss(teacher_out, mask)
-                student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask)
-
-                teacher_loss.backward(retain_graph=True)
-                student_loss.backward()
-
-                current_batch_teacher_loss_sum += teacher_loss.item()
-                current_batch_student_loss_sum += student_loss.item()
-                num_samples_in_batch += 1
-                    
-            optimizer_teacher_finetune.step()
-            optimizer_student.step()
-            
-            batch_count += 1
-            avg_batch_teacher_loss = current_batch_teacher_loss_sum / max(1, num_samples_in_batch)
-            avg_batch_student_loss = current_batch_student_loss_sum / max(1, num_samples_in_batch)
-            total_teacher_loss += avg_batch_teacher_loss
-            total_student_loss += avg_batch_student_loss
-            
-
-        teacher.sam_decoder.eval()
-        student.eval()
-        val_t_loss, val_s_loss = 0.0, 0.0
-        with torch.no_grad():
-            for v_batch in val_loader:
-                if v_batch is None: continue
-                v_images, v_true_masks, v_texts = v_batch
-                for v_img, v_mask, v_txt in zip(v_images, v_true_masks, v_texts):
-                    v_mask = v_mask.to(device).float()
-                    v_img = v_img.to(device)
-                    v_txt = v_txt.to(device)
-
-                    t_out = teacher(v_img, v_txt)
-                    s_out = student(v_img, v_txt)
-                            
-                    val_t_loss += iou_loss(t_out, v_mask).item()
-                    val_s_loss += student.compute_distill_loss(s_out, t_out, v_mask).item()
-        val_loss = val_t_loss + val_s_loss
-        trial.report(val_loss, epoch)
-        if trial.should_prune(): raise optuna.exceptions.TrialPruned()
-    
-    return val_loss
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--token", type=str, required=True)
-    parser.add_argument("--phase", type=str, choices=["clip", "prior", "decoder", "student"], required=True)
-    parser.add_argument("--trials", type=int, default=30)
-    args = parser.parse_args()
-    
-    study = optuna.create_study(direction="minimize", pruner=optuna.pruners.MedianPruner())
-    
-    print(f"=== Starting Optuna Micro-Sweep for Phase: {args.phase.upper()} ===")
-    if args.phase == "clip":
-        study.optimize(lambda t: objective_clip(t, args.token), n_trials=args.trials)
-    elif args.phase == "prior":
-        study.optimize(lambda t: objective_prior(t, args.token), n_trials=args.trials)
-    elif args.phase == "decoder":
-        study.optimize(objective_decoder, n_trials=args.trials)
-    elif args.phase == "student":
-        study.optimize(objective_student, n_trials=args.trials)
-        
-    print(f"\\nBest {args.phase} trial:")
-    print(f"  Value (Validation Loss): {study.best_trial.value}")
-    print("  Best Hyperparameters:")
-    for key, value in study.best_trial.params.items():
-        print(f"    {key}: {value}")
-
-
-# tune.py
-#
-# Sequential hyperparameter tuning for a 4-phase pipeline:
-#   Phase 1 (clip)    — tunes from scratch
-#   Phase 2 (prior)   — loads trained CLIP text encoder
-#   Phase 3 (decoder) — loads trained CLIP text encoder + Prior
-#   Phase 4 (student) — loads full trained teacher (CLIP + Prior + SAM w/ 3 epochs),
-#                        warms up teacher, then tunes student hyperparameters
-#
-# Usage examples:
-#   python tune.py --token HF_TOKEN --phase clip --trials 30
-#   python tune.py --token HF_TOKEN --phase prior --trials 30 \
-#       --weights_dir models/trained --txt_enc_layers 12
-#   python tune.py --token HF_TOKEN --phase decoder --trials 30 \
-#       --weights_dir models/trained --txt_enc_layers 12 --prior_layers 10
-#   python tune.py --token HF_TOKEN --phase student --trials 30 \
-#       --weights_dir models/trained --txt_enc_layers 12 --prior_layers 10 \
-#       --sam_layers 8 --sam_memory 10 --teacher_warmup_epochs 3
-
-import torch
-import gc
-import os
-import copy
-import optuna
-import argparse
-import warnings
-warnings.filterwarnings('ignore')
-
-from torch.utils.data import DataLoader, ConcatDataset
-from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
-from models.prior_model import create_prior, PriorLoss, TeacherCLIP
-from models.SAM_model import iou_loss, create_SAM
-from models.distill_model import create_Student
-from data.custom400m import get_laion_test_dataset, adaptive_collate
-from data.segmentation import SAM_adaptive_collate, StaticSA1BDataset, StaticSAVDataset
-
-# Hardware Setup (Single Node)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-# Micro-Sweep Configurations
-TUNE_EPOCHS = 1
-TUNE_TRAIN_SAMPLES = 2000 
-TUNE_VAL_SAMPLES = 500
-
-# Standard weight filenames (saved by store_weights in each model)
-CLIP_TXT_FILENAME = "txtEncWeights"
-CLIP_IMG_FILENAME = "imgEncWeights"
-CLIP_WRAPPER_FILENAME = "CLIPWrapperWeights"
-PRIOR_FILENAME = "PriorWeights"
-SAM_FILENAME = "SAMWeights"
-
-# ======================== Dataset Caching ========================
-# Loaded once on first call, reused across all trials.
-
-_laion_cache = {}
-_sam_cache = {}
-
-def _get_laion_datasets(hf_token):
-    if 'train' not in _laion_cache:
-        print("[Cache] Loading LAION train dataset (one-time)...")
-        _laion_cache['train'] = get_laion_test_dataset(
-            hf_token, val_boundary=10000, num_samples=TUNE_TRAIN_SAMPLES,
-            text_processor=CLIPTokenize, split="train"
-        )
-    if 'val' not in _laion_cache:
-        print("[Cache] Loading LAION val dataset (one-time)...")
-        _laion_cache['val'] = get_laion_test_dataset(
-            hf_token, val_boundary=10000, num_samples=TUNE_VAL_SAMPLES,
-            text_processor=CLIPTokenize, split="val"
-        )
-    return _laion_cache['train'], _laion_cache['val']
-
-def _get_sam_datasets():
-    if 'train' not in _sam_cache:
-        def load_file_list(file_path):
-            try:
-                with open(file_path) as f:
-                    return [line.strip().split('\t') for line in f.readlines()[1:]]
-            except FileNotFoundError:
-                return []
-
-        sa1b_files = load_file_list("data/Datasets/SA-1B_dataset.txt")
-        sav_files = load_file_list("data/Datasets/SA-V_dataset.txt")
-
-        print("[Cache] Loading SAM train dataset (one-time)...")
-        _sam_cache['train'] = ConcatDataset([
-            StaticSA1BDataset(sa1b_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=TUNE_TRAIN_SAMPLES//2),
-            StaticSAVDataset(sav_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=TUNE_TRAIN_SAMPLES//2)
-        ])
-        print("[Cache] Loading SAM val dataset (one-time)...")
-        _sam_cache['val'] = ConcatDataset([
-            StaticSA1BDataset(sa1b_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=TUNE_VAL_SAMPLES//2),
-            StaticSAVDataset(sav_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=TUNE_VAL_SAMPLES//2)
-        ])
-    return _sam_cache['train'], _sam_cache['val']
-
-def get_laion_loaders(hf_token, batch_size):
-    train_dataset, val_dataset = _get_laion_datasets(hf_token)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=adaptive_collate, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=adaptive_collate, shuffle=False, num_workers=4)
-    return train_loader, val_loader
-
-def get_sam_loaders(batch_size):
-    train_dataset, val_dataset = _get_sam_datasets()
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=SAM_adaptive_collate, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=SAM_adaptive_collate, shuffle=False, num_workers=4)
-    return train_loader, val_loader
-
-# ======================== Helpers ========================
-
-def gpu_cleanup():
-    """Free GPU memory between trials to prevent fragmentation."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-def load_trained_text_encoder(args):
-    """Load the text encoder with trained weights from a previous CLIP phase."""
-    txt_path = os.path.join(args.weights_dir, CLIP_TXT_FILENAME)
-    if not os.path.exists(txt_path):
-        raise FileNotFoundError(
-            f"Trained text encoder weights not found at {txt_path}. "
-            f"Run the CLIP training phase first and save weights to --weights_dir."
-        )
-    print(f"[Weights] Loading trained text encoder ({args.txt_enc_layers} layers) from {txt_path}")
-    text_encoder = create_text_encoder(num_layers=args.txt_enc_layers).to(device)
-    text_encoder.load_weights(txt_path)
-    text_encoder.eval()
-    for p in text_encoder.parameters():
-        p.requires_grad = False
-    return text_encoder
-
-def load_trained_prior(args):
-    """Load the prior with trained weights from a previous Prior phase."""
-    prior_path = os.path.join(args.weights_dir, PRIOR_FILENAME)
-    if not os.path.exists(prior_path):
-        raise FileNotFoundError(
-            f"Trained prior weights not found at {prior_path}. "
-            f"Run the Prior training phase first and save weights to --weights_dir."
-        )
-    print(f"[Weights] Loading trained prior ({args.prior_layers} layers) from {prior_path}")
-    prior = create_prior(num_layers=args.prior_layers).to(device)
-    prior.load_weights(prior_path)
-    prior.eval()
-    for p in prior.parameters():
-        p.requires_grad = False
-    return prior
-
-def load_trained_sam(args):
-    """Load the SAM decoder with trained weights from a previous Decoder phase."""
-    sam_path = os.path.join(args.weights_dir, SAM_FILENAME)
-    if not os.path.exists(sam_path):
-        raise FileNotFoundError(
-            f"Trained SAM decoder weights not found at {sam_path}. "
-            f"Run the Decoder training phase first and save weights to --weights_dir."
-        )
-    print(f"[Weights] Loading trained SAM decoder ({args.sam_layers} layers, memory={args.sam_memory}) from {sam_path}")
-    sam_decoder = create_SAM(max_memory_length=args.sam_memory, num_layers=args.sam_layers).to(device)
-    sam_decoder.load_weights(sam_path)
-    return sam_decoder
-
-# ======================== PHASE 1: CLIP ========================
-
-def objective_clip(trial, hf_token):
-    lr = trial.suggest_float("lr", 1e-6, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
-    num_layers = trial.suggest_int("num_layers", 1, 24)
-    
-    gpu_cleanup()
-    train_loader, val_loader = get_laion_loaders(hf_token, batch_size)
-    
-    text_encoder = create_text_encoder(num_layers=num_layers).to(device)
-    image_encoder = create_image_encoder().to(device)
-    model = CLIPWrapper(text_encoder, image_encoder).to(device)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    for epoch in range(TUNE_EPOCHS):
-        model.train()
-        for batch in train_loader:
-            if batch is None: continue
-            images, texts = batch
-            images = images.to(device)
-            texts = texts.to(device)
-            optimizer.zero_grad()
-            
-            text_features, image_features, logit_scale = model(texts, images)
-            
-            logits_per_image = logit_scale * image_features @ text_features.t()
-            logits_per_text = logit_scale * text_features @ image_features.t()
-            loss = clip_contrastive_loss(logits_per_image, logits_per_text)
-
-            loss.backward()
-            optimizer.step()
-            
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                if batch is None: continue
-                images, texts = batch
-                images = images.to(device)
-                texts = texts.to(device)
-            
-                text_features, image_features, logit_scale = model(texts, images)
-            
-                logits_per_image = logit_scale * image_features @ text_features.t()
-                logits_per_text = logit_scale * text_features @ image_features.t()
-                val_loss += clip_contrastive_loss(logits_per_image, logits_per_text).item()
-                
-        trial.report(val_loss, epoch)
-        if trial.should_prune(): raise optuna.exceptions.TrialPruned()
-        
-    return val_loss
-
-# ======================== PHASE 2: Prior ========================
-# Depends on: trained CLIP text encoder (frozen).
-
-def objective_prior(trial, hf_token, args):
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    num_layers = trial.suggest_int("num_layers", 1, 24)
-    
-    gpu_cleanup()
-    train_loader, val_loader = get_laion_loaders(hf_token, batch_size=batch_size)
-    
-    # Load trained text encoder from CLIP phase (frozen)
-    text_encoder = load_trained_text_encoder(args)
-    teacher = TeacherCLIP().to(device).eval()
-    
-    prior = create_prior(num_layers=num_layers).to(device)
-    optimizer = torch.optim.Adam(prior.parameters(), lr=lr)
-
-    for epoch in range(TUNE_EPOCHS):
-        prior.train()
-        for batch in train_loader:
-            if batch is None: continue
-            images, texts = batch
-
-            images = images.to(device)
-            texts = texts.to(device)
-            optimizer.zero_grad()
-            
-            with torch.no_grad():
-                text_emb = text_encoder(texts)
-                target_grid = teacher(images)
-            
-            prior_grid = prior(text_emb)
-            loss = PriorLoss(prior_grid, target_grid)
-            
-            loss.backward()
-            optimizer.step()
-            
-        prior.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                if batch is None: continue
-                images, texts = batch
-
-                images = images.to(device)
-                texts = texts.to(device)
-            
-                text_emb = text_encoder(texts)
-                target_grid = teacher(images)
-            
-                prior_grid = prior(text_emb)
-                val_loss += PriorLoss(prior_grid, target_grid).item()
-                
-        trial.report(val_loss, epoch)
-        if trial.should_prune(): raise optuna.exceptions.TrialPruned()
-        
-    return val_loss
-
-# ======================== PHASE 3: SAM Decoder ========================
-# Depends on: trained CLIP text encoder + Prior (both frozen).
-
-def objective_decoder(trial, args):
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
-    max_memory_length = trial.suggest_int("Max Memory Length", 1, 20)
-    num_layers = trial.suggest_int("num layers", 1, 20)
-    
-    gpu_cleanup()
-    train_loader, val_loader = get_sam_loaders(batch_size)
-    
-    # Load trained components from previous phases (frozen)
-    text_encoder = load_trained_text_encoder(args)
-    prior = load_trained_prior(args)
-    
-    # SAM decoder is what we're tuning — fresh init
-    sam_decoder = create_SAM(max_memory_length=max_memory_length, num_layers=num_layers).to(device)
-
-    class TeacherModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.text_encoder = text_encoder
-            self.prior = prior
-            self.sam_decoder = sam_decoder
-
-        def forward(self, x, text_tokens):
-            with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
-                prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
-
-    teacher = TeacherModel().to(device)
-
-    optimizer = torch.optim.AdamW(sam_decoder.parameters(), lr=lr, weight_decay=weight_decay)
-
-    for epoch in range(TUNE_EPOCHS):
-        sam_decoder.train()
-        for batch in train_loader:
-            if batch is None: continue
-            images, masks, texts = batch
-            optimizer.zero_grad()
-            
-            for img, mask, txt in zip(images, masks, texts):
-                mask = mask.to(device).float()
-                img = img.to(device)
-                txt = txt.to(device)
-
-                pred_mask = teacher.forward(img, txt)
-                loss = iou_loss(pred_mask, mask)
-                loss.backward()
-            optimizer.step()
-            
-        sam_decoder.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                if batch is None: continue
-                images, masks, texts = batch
-                for img, mask, txt in zip(images, masks, texts):
-                    mask = mask.to(device).float()
-                    img = img.to(device)
-                    txt = txt.to(device)
-
-                    pred_mask = teacher.forward(img, txt)
-                    val_loss += iou_loss(pred_mask, mask).item()
-                    
-        trial.report(val_loss, epoch)
-        if trial.should_prune(): raise optuna.exceptions.TrialPruned()
+    save_trial_weights("decoder", trial, val_loss, {SAM_FILENAME: sam_decoder})
         
     return val_loss
 
@@ -836,7 +483,7 @@ def get_warmed_teacher_components(args):
 def objective_student(trial, args):
     teacher_lr = trial.suggest_float("teacher_lr", 1e-5, 1e-2, log=True)
     student_lr = trial.suggest_float("student_lr", 1e-5, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
     input_layers = trial.suggest_int("input layers", 1, 20)
     num_decoder_layers = trial.suggest_int("num_decoder_layers", 1, 8)
     max_memory_length = trial.suggest_int("Max Memory Length", 1, 20)
@@ -883,7 +530,7 @@ def objective_student(trial, args):
         teacher.sam_decoder.train()
         student.train()
 
-        for batch_idx, batch in enumerate(train_loader):
+        for _, batch in enumerate(train_loader):
             if batch is None: continue
             images, true_masks, texts = batch
 
@@ -934,6 +581,11 @@ def objective_student(trial, args):
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
     
+    save_trial_weights("student", trial, val_loss, {
+        "StudentWeights": student,
+        SAM_FILENAME: sam_decoder,  # co-distilled teacher SAM
+    })
+
     return val_loss
 
 # ======================== Main ========================
@@ -967,9 +619,28 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Validate that weights exist for phases that need them
-    if args.phase in ("prior", "decoder", "student") and not os.path.isdir(args.weights_dir):
-        parser.error(f"--weights_dir '{args.weights_dir}' does not exist. "
-                     f"Phase '{args.phase}' requires trained weights from previous phases.")
+    if args.phase in ("prior", "decoder", "student"):
+        os.makedirs(args.weights_dir, exist_ok=True)
+        
+        # Check which weights exist and warn about missing ones upfront
+        required_weights = {}
+        if args.phase in ("prior", "decoder", "student"):
+            required_weights["Text encoder"] = os.path.join(args.weights_dir, CLIP_TXT_FILENAME)
+        if args.phase in ("decoder", "student"):
+            required_weights["Prior"] = os.path.join(args.weights_dir, PRIOR_FILENAME)
+        if args.phase == "student":
+            required_weights["SAM decoder"] = os.path.join(args.weights_dir, SAM_FILENAME)
+        
+        missing = [name for name, path in required_weights.items() if not os.path.exists(path)]
+        if missing:
+            print(f"\n{'='*60}")
+            print(f"  WARNING: Missing trained weights for phase '{args.phase}':")
+            for name in missing:
+                print(f"    - {name}: {required_weights[name]}")
+            print(f"\n  Tuning will proceed with RANDOM initialization for these")
+            print(f"  components. Results are approximate — consider retuning")
+            print(f"  after full training for best accuracy.")
+            print(f"{'='*60}\n")
     
     study = optuna.create_study(direction="minimize", pruner=optuna.pruners.MedianPruner())
     catch_errors = (torch.cuda.OutOfMemoryError, RuntimeError)
@@ -992,3 +663,18 @@ if __name__ == "__main__":
     print("  Best Hyperparameters:")
     for key, value in study.best_trial.params.items():
         print(f"    {key}: {value}")
+    
+    best_dir = os.path.join(
+        TUNE_CHECKPOINT_DIR, args.phase,
+        f"trial_{study.best_trial.number:02d}_loss_{study.best_trial.value:.4f}"
+    )
+    if os.path.isdir(best_dir):
+        print(f"  Best trial weights: {best_dir}")
+    
+    # Summary of all saved trials
+    phase_dir = os.path.join(TUNE_CHECKPOINT_DIR, args.phase)
+    if os.path.isdir(phase_dir):
+        saved_trials = sorted(os.listdir(phase_dir))
+        print(f"\n  All saved trial weights ({len(saved_trials)} trials):")
+        for d in saved_trials:
+            print(f"    {d}")

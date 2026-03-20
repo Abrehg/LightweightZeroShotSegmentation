@@ -9,3 +9,4 @@ pillow
 pycocotools
 datasets
 torchvision
+scikit-image

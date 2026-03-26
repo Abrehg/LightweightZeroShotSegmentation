@@ -4,11 +4,10 @@
 #SBATCH --job-name=sam_finetune_referring
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
-#SBATCH --nodes=1
+#SBATCH --nodes=10
 #SBATCH --gres=gpu:4
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --qos=dcs-48hr
-#SBATCH --partition=dcs
 
 # ============================================================
 # Fine-tune on Referring Expression Datasets

@@ -5,9 +5,9 @@ from PIL import Image
 import torch
 from torch.utils.data import IterableDataset, Dataset
 from torchvision import transforms
-from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
 import torchvision.transforms.functional as F
 import json
+import threading
 from pycocotools import mask as coco_mask
 from models.clip_model import CLIPTokenize
 from .Helpers.sav_utils import SAVDatasetHelper
@@ -15,32 +15,60 @@ import re
 import time
 import random
 
+_caption_cache = None
+_caption_cache_loaded = False
+ 
+def load_caption_cache(cache_path="data/cache/caption_cache.json"):
+    """Load the pre-computed caption cache. Returns dict or None if not found."""
+    global _caption_cache, _caption_cache_loaded
+    if _caption_cache_loaded:
+        return _caption_cache
+    _caption_cache_loaded = True
+    if os.path.exists(cache_path):
+        with open(cache_path, 'r') as f:
+            _caption_cache = json.load(f)
+        print(f"[CaptionCache] Loaded {len(_caption_cache)} cached captions from {cache_path}")
+    else:
+        print(f"[CaptionCache] No cache found at {cache_path}. Will use live captioning (slow, GPU-heavy).")
+        _caption_cache = None
+    return _caption_cache
+ 
+def get_cached_caption(cache_key, caption_idx):
+    """Look up a cached caption. Returns caption string or None on miss."""
+    if _caption_cache is None:
+        return None
+    captions = _caption_cache.get(cache_key)
+    if captions is None:
+        return None
+    idx = caption_idx % len(captions)
+    return captions[idx]
+
 def SAM_adaptive_collate(batch):
     images, masks, texts = zip(*batch)
     return list(images), list(masks), list(texts)
 
-# class CaptionGenerator:
-#     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
-#         self.device = device
-#         print("⚠️ WARNING: Using DUMMY CaptionGenerator to save memory for testing! ⚠️")
+class DummyCaptionGenerator:
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.device = device
+        print("⚠️ WARNING: Using DUMMY CaptionGenerator to save memory for testing! ⚠️")
     
-#     def _post_process_caption(self, caption):
-#         return caption
+    def _post_process_caption(self, caption):
+        return caption
 
-#     def generate_all_captions(self, image, mask, index):
-#         # Instantly return dummy text to bypass the expensive LLM inference
-#         dummy_captions = [
-#             "a descriptive search query for the object",
-#             "a simple description of the red object doing something",
-#             "a brief one-sentence caption for this image.",
-#             "factual object label"
-#         ]
+    def generate_all_captions(self, image, mask, index):
+        # Instantly return dummy text to bypass the expensive LLM inference
+        dummy_captions = [
+            "a descriptive search query for the object",
+            "a simple description of the red object doing something",
+            "a brief one-sentence caption for this image.",
+            "factual object label"
+        ]
         
-#         # Fallback just in case an invalid index is passed
-#         if index < 0 or index > 3:
-#             return "invalid_persona_index"
+        # Fallback just in case an invalid index is passed
+        if index < 0 or index > 3:
+            return "invalid_persona_index"
             
-#         return dummy_captions[index]
+        return dummy_captions[index]
 
 class CaptionGenerator:
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -57,7 +85,12 @@ class CaptionGenerator:
         attn_implementation = "flash_attention_2" if self.device == 'cuda' else "eager"
         self.compute_dtype = torch.bfloat16 if self.device == 'cuda' else torch.float32
 
-        self.processor = InstructBlipProcessor.from_pretrained("Salesforce/instructblip-flan-t5-xl")
+        from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
+
+        self.processor = InstructBlipProcessor.from_pretrained(
+            "Salesforce/instructblip-flan-t5-xl",
+            use_fast=False
+            )
         self.model = InstructBlipForConditionalGeneration.from_pretrained(
             "Salesforce/instructblip-flan-t5-xl",
             dtype=self.compute_dtype,
@@ -104,7 +137,6 @@ class CaptionGenerator:
         background = Image.new("RGB", cropped_image_rgba.size, (0, 0, 0))
         background.paste(cropped_image_rgba, mask=cropped_image_rgba.split()[3])
         final_masked_image_rgb = background
-
 
         with torch.no_grad():
             if index == 0:
@@ -169,18 +201,22 @@ def download_tar_file(url, dest_path, max_retries=3):
     return False
 
 class StreamingBaseTarDataset(IterableDataset):
-    def __init__(self, file_list, cache_dir, split='train', val_tar_count=1, val_sample_count=None, max_retries=3):
+    def __init__(self, file_list, cache_dir, split='train', val_tar_count=1, val_sample_count=None, max_retries=3, skip_tars=0):
         super().__init__()
         self.max_retries = max_retries
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         self.split = split
+        self.skip_tars = skip_tars
         
         if split == 'val':
             self.file_list = file_list[:val_tar_count]
         else:
             self.file_list = file_list[val_tar_count:]
-
+        
+        self._prefetch_thread = None
+        self._prefetch_result = None
+ 
     def _get_worker_shard(self):
         worker_info = torch.utils.data.get_worker_info()
         num_workers = worker_info.num_workers if worker_info else 1
@@ -188,24 +224,49 @@ class StreamingBaseTarDataset(IterableDataset):
         
         dist_world_size = int(os.environ.get("WORLD_SIZE", 1)) if "LOCAL_RANK" in os.environ else 1
         dist_rank = int(os.environ.get("RANK", 0)) if "LOCAL_RANK" in os.environ else 0
-
+ 
         total_shards = num_workers * dist_world_size
         global_worker_id = (dist_rank * num_workers) + worker_id
-
+ 
         shard = [f for i, f in enumerate(self.file_list) if i % total_shards == global_worker_id]
         return shard, global_worker_id
-
+    
+    def _start_prefetch(self, url, dest_path):
+        def _worker():
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                self._prefetch_result = (True, dest_path)
+                return
+            success = download_tar_file(url, dest_path)
+            self._prefetch_result = (success, dest_path)
+        
+        self._prefetch_thread = threading.Thread(target=_worker, daemon=True)
+        self._prefetch_thread.start()
+    
+    def _wait_prefetch(self):
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join()
+            self._prefetch_thread = None
+            return self._prefetch_result
+        return None
+    
+    def _cleanup_tar(self, tar_path):
+        if tar_path and os.path.exists(tar_path):
+            try:
+                os.remove(tar_path)
+            except OSError:
+                pass
+ 
 class SA1BDataset(StreamingBaseTarDataset):
-    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None):
-        super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count)
+    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None, skip_tars=0):
+        super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count, skip_tars=skip_tars)
         self.device = device
         self.transform = transforms.Compose([transforms.ToTensor()])
-        self.caption_generator = None 
-
+        self.caption_generator = None
+        load_caption_cache()
+ 
     def _process_tar(self, tar_path):
-        if self.caption_generator is None:
-            self.caption_generator = CaptionGenerator(device=self.device)
-
+        tar_basename = os.path.basename(tar_path)
+ 
         try:
             with tarfile.open(tar_path, "r") as tar:
                 members = tar.getmembers()
@@ -230,43 +291,77 @@ class SA1BDataset(StreamingBaseTarDataset):
                                 mask_tensor = torch.from_numpy(mask).long().unsqueeze(0) # [1, H, W]
                                 
                                 caption_idx = random.randint(0, 3)
-                                caption = self.caption_generator.generate_all_captions(
-                                    image_tensor.squeeze(0), mask_tensor.squeeze(0), caption_idx
-                                )
+                                cache_key = f"{tar_basename}::{json_member.name}::{ann_idx}"
+                                caption = get_cached_caption(cache_key, caption_idx)
+ 
+                                if caption is None:
+                                    if self.caption_generator is None:
+                                        self.caption_generator = CaptionGenerator(device=self.device)
+                                    caption = self.caption_generator.generate_all_captions(
+                                        image_tensor.squeeze(0), mask_tensor.squeeze(0), caption_idx
+                                    )
+ 
                                 caption_tokens = CLIPTokenize(caption) # [1, 77]
                                 yield image_tensor, mask_tensor, caption_tokens
                             except Exception: continue
                     except Exception: continue
         except Exception: return
-
+ 
     def __iter__(self):
         shard, global_worker_id = self._get_worker_shard()
         
-        for url_info in shard:
+        if self.skip_tars > 0:
+            shard = shard[self.skip_tars:]
+        
+        prev_tar_path = None
+        
+        for i, url_info in enumerate(shard):
             filename, url = url_info[0], url_info[1]
-            temp_tar_path = os.path.join(self.cache_dir, f"sa1b_w{global_worker_id}_{filename}")
+            tar_path = os.path.join(self.cache_dir, f"sa1b_w{global_worker_id}_{filename}")
             
-            if not os.path.exists(temp_tar_path):
-                success = download_tar_file(url, temp_tar_path)
-            else: success = True
-
+            # Check if this tar was already prefetched
+            prefetch_result = self._wait_prefetch()
+            if prefetch_result and prefetch_result[1] == tar_path:
+                success = prefetch_result[0]
+            elif os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
+                success = True
+            else:
+                success = download_tar_file(url, tar_path)
+            
+            # Start prefetching the NEXT tar in background
+            if i + 1 < len(shard):
+                next_filename, next_url = shard[i + 1][0], shard[i + 1][1]
+                next_path = os.path.join(self.cache_dir, f"sa1b_w{global_worker_id}_{next_filename}")
+                self._start_prefetch(next_url, next_path)
+            
+            # Clean up the PREVIOUS tar (current one is in use)
+            self._cleanup_tar(prev_tar_path)
+            
             if success:
-                yield from self._process_tar(temp_tar_path)
-                try: os.remove(temp_tar_path) 
-                except OSError: pass
-
+                sample_count = 0
+                for sample in self._process_tar(tar_path):
+                    sample_count += 1
+                    yield sample
+                print(f"[SA1B] Worker {global_worker_id} | {filename}: {sample_count} samples extracted")
+                prev_tar_path = tar_path
+            else:
+                prev_tar_path = None
+        
+        # Clean up last tar
+        self._cleanup_tar(prev_tar_path)
+ 
 class SAVDataset(StreamingBaseTarDataset):
-    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None):
-        super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count)
+    def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None, skip_tars=0):
+        super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count, skip_tars=skip_tars)
         self.device = device
         self.transform = transforms.Compose([transforms.ToTensor()])
         self.caption_generator = None
-        self.sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir)) 
-
+        self.sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir))
+        load_caption_cache()
+ 
     def _process_tar(self, tar_path, global_worker_id):
-        if self.caption_generator is None:
-            self.caption_generator = CaptionGenerator(device=self.device)
-
+        tar_basename = os.path.basename(tar_path)
+ 
         try:
             with tarfile.open(tar_path, "r") as tar:
                 members = tar.getmembers()
@@ -288,7 +383,7 @@ class SAVDataset(StreamingBaseTarDataset):
                         
                         if not frames: continue
                         frames_tensor = torch.stack([self.transform(Image.fromarray(f)) for f in frames]).unsqueeze(0) # [1, T, C, H, W]
-
+ 
                         data = json.load(tar.extractfile(annot_member))
                         
                         first_valid_frame, first_valid_mask = None, None
@@ -308,31 +403,68 @@ class SAVDataset(StreamingBaseTarDataset):
                             else:
                                 masks.append(torch.zeros_like(frames_tensor.squeeze(0)[0].mean(dim=0)))
                         masks_tensor = torch.stack(masks).unsqueeze(0) # [1, T, H, W]
-
-                        if first_valid_frame is not None:
-                            caption_idx = random.randint(0, 3)
+ 
+                        caption_idx = random.randint(0, 3)
+                        cache_key = f"{tar_basename}::{video_id}"
+                        caption = get_cached_caption(cache_key, caption_idx)
+                        
+                        if caption is not None:
+                            caption_tokens = CLIPTokenize(caption)
+                        elif first_valid_frame is not None:
+                            if self.caption_generator is None:
+                                self.caption_generator = CaptionGenerator(device=self.device)
                             caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
-                            caption_tokens = CLIPTokenize(caption) # [1, seq_len]
-                            yield frames_tensor, masks_tensor, caption_tokens
+                            caption_tokens = CLIPTokenize(caption)
                         else:
-                            yield frames_tensor, masks_tensor, CLIPTokenize("object")
-
+                            caption_tokens = CLIPTokenize("object")
+ 
+                        yield frames_tensor, masks_tensor, caption_tokens
                     except Exception: continue
         except Exception: return
-
+ 
     def __iter__(self):
         shard, global_worker_id = self._get_worker_shard()
-        for url_info in shard:
+        
+        # Skip already-processed tars for resume
+        if self.skip_tars > 0:
+            shard = shard[self.skip_tars:]
+        
+        prev_tar_path = None
+        
+        for i, url_info in enumerate(shard):
             filename, url = url_info[0], url_info[1]
-            temp_tar_path = os.path.join(self.cache_dir, f"sav_w{global_worker_id}_{filename}")
+            tar_path = os.path.join(self.cache_dir, f"sav_w{global_worker_id}_{filename}")
             
-            if not os.path.exists(temp_tar_path): success = download_tar_file(url, temp_tar_path)
-            else: success = True
-
+            # Check if this tar was already prefetched
+            prefetch_result = self._wait_prefetch()
+            if prefetch_result and prefetch_result[1] == tar_path:
+                success = prefetch_result[0]
+            elif os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
+                success = True
+            else:
+                success = download_tar_file(url, tar_path)
+            
+            # Start prefetching the NEXT tar in background
+            if i + 1 < len(shard):
+                next_filename, next_url = shard[i + 1][0], shard[i + 1][1]
+                next_path = os.path.join(self.cache_dir, f"sav_w{global_worker_id}_{next_filename}")
+                self._start_prefetch(next_url, next_path)
+            
+            # Clean up the PREVIOUS tar
+            self._cleanup_tar(prev_tar_path)
+ 
             if success:
-                yield from self._process_tar(temp_tar_path, global_worker_id)
-                try: os.remove(temp_tar_path) 
-                except OSError: pass
+                sample_count = 0
+                for sample in self._process_tar(tar_path, global_worker_id):
+                    sample_count += 1
+                    yield sample
+                print(f"[SAV] Worker {global_worker_id} | {filename}: {sample_count} samples extracted")
+                prev_tar_path = tar_path
+            else:
+                prev_tar_path = None
+        
+        # Clean up last tar
+        self._cleanup_tar(prev_tar_path)
 
 class StaticSA1BDataset(Dataset):
     def __init__(self, file_list, cache_dir, device='cpu', split='val', val_tar_count=1, val_sample_count=None):
@@ -342,20 +474,55 @@ class StaticSA1BDataset(Dataset):
         self.file_list = file_list[:val_tar_count]
         self.transform = transforms.Compose([transforms.ToTensor()])
         
+        # How many tar files we want
+        target_count = val_tar_count
+        
+        # Try every entry in the list, not just the first val_tar_count
         self.available_files = []
-        for filename, url in self.file_list:
+        for filename, url in file_list:
+            if len(self.available_files) >= target_count:
+                break
             dest_path = os.path.join(self.cache_dir, filename)
-            if not os.path.exists(dest_path):
-                download_tar_file(url, dest_path)
-            if os.path.exists(dest_path):
+            # Use cached file if it exists and is non-empty
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 self.available_files.append(dest_path)
+                print(f"[SA1B] Using cached: {filename} ({os.path.getsize(dest_path):,} bytes)")
+                continue
+            # Remove 0-byte leftover from failed downloads
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) == 0:
+                os.remove(dest_path)
+            # Try downloading
+            success = download_tar_file(url, dest_path)
+            if success and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                self.available_files.append(dest_path)
+                print(f"[SA1B] Downloaded: {filename}")
+            else:
+                print(f"[SA1B] Skipping {filename} (download failed)")
+        
+        # Fallback: scan cache dir for any pre-staged sa_*.tar files
+        if not self.available_files:
+            print(f"[SA1B] No files from URL list. Scanning {cache_dir} for pre-staged tars...")
+            for f in sorted(os.listdir(cache_dir)):
+                if f.startswith("sa_") and f.endswith(".tar") and os.path.getsize(os.path.join(cache_dir, f)) > 0:
+                    self.available_files.append(os.path.join(cache_dir, f))
+                    print(f"[SA1B] Found pre-staged: {f}")
+                    if len(self.available_files) >= target_count:
+                        break
+        
+        if not self.available_files:
+            print(f"[SA1B] WARNING: No tar files available for {split}.")
+            print(f"  To fix: download SA-1B tars externally and scp to {cache_dir}/")
+            print(f"  Files should be named sa_XXXXXX.tar")
                 
         self.samples = self._build_index()
         
         if val_sample_count is not None and val_sample_count > 0:
             self.samples = self.samples[:val_sample_count]
             
-        self.caption_generator = CaptionGenerator(device=self.device)
+        print(f"[SA1B] {split}: {len(self.available_files)} tars, {len(self.samples)} samples")
+        # load_caption_cache()
+        # self.caption_generator = None
+        self.caption_generator = DummyCaptionGenerator()
         
     def _build_index(self):
         samples = []
@@ -395,6 +562,16 @@ class StaticSA1BDataset(Dataset):
             mask = torch.from_numpy(coco_mask.decode(rle)).long().unsqueeze(0) # [1, H, W]
             
             caption = self.caption_generator.generate_all_captions(image_tensor.squeeze(0), mask.squeeze(0), caption_idx)
+
+            # tar_basename = os.path.basename(tar_path)
+            # cache_key = f"{tar_basename}::{json_name}::{ann_idx}"
+            # caption = get_cached_caption(cache_key, caption_idx)
+            
+            # if caption is None:
+            #     if self.caption_generator is None:
+            #         self.caption_generator = CaptionGenerator(device=self.device)
+            #     caption = self.caption_generator.generate_all_captions(image_tensor.squeeze(0), mask.squeeze(0), caption_idx)
+            
             caption_tokens = CLIPTokenize(caption) # [1, seq_len]
                 
         return image_tensor, mask, caption_tokens
@@ -408,20 +585,52 @@ class StaticSAVDataset(Dataset):
         self.transform = transforms.Compose([transforms.ToTensor()])
         self.sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir))
         
+        target_count = val_tar_count
+        
+        # Try every entry in the list, skip failures
         self.available_files = []
-        for filename, url in self.file_list:
+        for filename, url in file_list:
+            if len(self.available_files) >= target_count:
+                break
             dest_path = os.path.join(self.cache_dir, filename)
-            if not os.path.exists(dest_path):
-                download_tar_file(url, dest_path)
-            if os.path.exists(dest_path):
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                 self.available_files.append(dest_path)
+                print(f"[SAV] Using cached: {filename} ({os.path.getsize(dest_path):,} bytes)")
+                continue
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) == 0:
+                os.remove(dest_path)
+            success = download_tar_file(url, dest_path)
+            if success and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                self.available_files.append(dest_path)
+                print(f"[SAV] Downloaded: {filename}")
+            else:
+                print(f"[SAV] Skipping {filename} (download failed)")
+        
+        # Fallback: scan cache dir for pre-staged sav_*.tar files
+        if not self.available_files:
+            print(f"[SAV] No files from URL list. Scanning {cache_dir} for pre-staged tars...")
+            for f in sorted(os.listdir(cache_dir)):
+                if f.startswith("sav_") and f.endswith(".tar") and os.path.getsize(os.path.join(cache_dir, f)) > 0:
+                    self.available_files.append(os.path.join(cache_dir, f))
+                    print(f"[SAV] Found pre-staged: {f}")
+                    if len(self.available_files) >= target_count:
+                        break
+        
+        if not self.available_files:
+            print(f"[SAV] WARNING: No tar files available for {split}.")
+            print(f"  To fix: download SA-V tars externally and scp to {cache_dir}/")
+            print(f"  Files should be named sav_XXX.tar")
                 
         self.samples = self._build_index()
         
         if val_sample_count is not None and val_sample_count > 0:
             self.samples = self.samples[:val_sample_count]
             
-        self.caption_generator = CaptionGenerator(device=self.device)
+        print(f"[SAV] {split}: {len(self.available_files)} tars, {len(self.samples)} samples")
+        
+        # load_caption_cache()
+        # self.caption_generator = None
+        self.caption_generator = DummyCaptionGenerator()
 
     def _build_index(self):
         samples = []
@@ -481,11 +690,22 @@ class StaticSAVDataset(Dataset):
             
             masks_tensor = torch.stack(masks).unsqueeze(0) # [1, T, H, W]
             
-            if first_valid_frame is not None:
-                caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
-                caption_tokens = CLIPTokenize(caption)
-            else:
-                caption_tokens = CLIPTokenize("object")
+            caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
+            caption_tokens = CLIPTokenize(caption)
+
+            # tar_basename = os.path.basename(tar_path)
+            # cache_key = f"{tar_basename}::{video_id}"
+            # caption = get_cached_caption(cache_key, caption_idx)
+            
+            # if caption is not None:
+            #     caption_tokens = CLIPTokenize(caption)
+            # elif first_valid_frame is not None:
+            #     if self.caption_generator is None:
+            #         self.caption_generator = CaptionGenerator(device=self.device)
+            #     caption = self.caption_generator.generate_all_captions(first_valid_frame, first_valid_mask, caption_idx)
+            #     caption_tokens = CLIPTokenize(caption)
+            # else:
+            #     caption_tokens = CLIPTokenize("object")
                 
         return frames_tensor, masks_tensor, caption_tokens
 

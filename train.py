@@ -12,6 +12,7 @@ datasets.config.MAX_RETRIES = 10
 import requests
 import time
 import random
+import datetime
 
 _original_send = requests.Session.send
 def _patched_send(self, request, **kwargs):
@@ -39,15 +40,17 @@ import re
 import glob
 import wandb
 import argparse
-from torch.utils.data import DataLoader, ChainDataset, DistributedSampler
+from torch.utils.data import DataLoader, ChainDataset, DistributedSampler, IterableDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
 from models.prior_model import create_prior, PriorLoss, TeacherCLIP
 from models.SAM_model import iou_loss, create_SAM
 from models.distill_model import create_Student
-from data.custom400m import get_laion_streaming_dataset, adaptive_collate
+from data.custom400m import get_laion_streaming_dataset, get_laion_test_dataset, adaptive_collate, ChunkedLAIONManager
 from data.segmentation import SAM_adaptive_collate, SA1BDataset, SAVDataset, StaticSA1BDataset, StaticSAVDataset
+import math
+from torch.optim.lr_scheduler import LambdaLR
 
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
@@ -55,18 +58,23 @@ HYPERPARAMS = {
     "PRIOR_EPOCHS": 10,
     "SAM_DECODER_EPOCHS": 3,
     "TEACHER_STUDENT_EPOCHS": 10,
-    "CLIP_LR": 0.0001,
-    "PRIOR_LR": 0.0001,
+    "CLIP_LR": 0.002,
+    "PRIOR_LR": 0.0005,
     "DECODER_LR": 0.0001, # For SAM Decoder training
     "TEACHER_LR": 0.00001, # For teacher fine-tuning during student training
     "STUDENT_LR": 0.0001,
+    "WARMUP_STEPS": 1000,
+    "MIN_LR_RATIO": 0.01,
     "LAION_VAL_SIZE": 10000,
     "LAION_BATCH_SIZE": 128,
+    "LAION_CACHE_SAMPLES": 200000,
+    "LAION_CHUNK_SIZE": 10000,
     "SA_VAL_TAR_COUNT": 1,  
     "SA_VAL_SAMPLE_COUNT": 5000,
     "SAV_VAL_TAR_COUNT": 1,
     "SAV_VAL_SAMPLE_COUNT": 5000,
     "SAM_BATCH_SIZE": 512,
+    "EST_SAMPLES_PER_TAR": 10000,
     "SAVE_FREQ": 50,
     "CHECKPOINT_DIR": "weights",
     "WANDB_PROJECT_NAME": "Zero Shot Segmentation",
@@ -83,7 +91,10 @@ def get_device():
 device = get_device()
 
 def setup_ddp():
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(
+        backend="nccl",
+        timeout=datetime.timedelta(minutes=90)
+    )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 def is_main_process():
@@ -157,10 +168,22 @@ def get_best_weights_checkpoint(directory, prefix):
                 
     return best_file, max(0, best_epoch), max(0, best_batch)
 
-# ======== CLIP Training ========
-def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, wrapper_start_weights, run: wandb, start_epoch = 0, start_batch = 0):
-    print("\n=== Training CLIP ===")
+def create_lr_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01):
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # Linear warmup: 0 → 1 over warmup_steps
+            return current_step / max(1, warmup_steps)
+        else:
+            # Cosine decay: 1 → min_lr_ratio over remaining steps
+            progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
     
+    return LambdaLR(optimizer, lr_lambda)
+
+# ======== CLIP Training ========
+def train_clip(chunk_manager:ChunkedLAIONManager, text_start_weights, img_start_weights, wrapper_start_weights, run: wandb, start_epoch = 0, start_batch = 0):
+    print("\n=== Training CLIP ===")
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
     text_encoder = create_text_encoder().to(local_device)
@@ -180,96 +203,140 @@ def train_clip(train_loader, val_loader, text_start_weights, img_start_weights, 
 
     clip_model = DDP(clip_model, device_ids=[int(os.environ["LOCAL_RANK"])])
 
+    num_chunks = chunk_manager.num_chunks if not isinstance(chunk_manager.num_chunks, float) else 20
+    batches_per_chunk = int(chunk_manager.chunk_size * (1 - chunk_manager.val_ratio)) // HYPERPARAMS["LAION_BATCH_SIZE"]
+    estimated_total_steps = HYPERPARAMS["CLIP_EPOCHS"] * num_chunks * batches_per_chunk
+    scheduler = create_lr_warmup_cosine_scheduler(
+        optimizer, HYPERPARAMS["WARMUP_STEPS"], estimated_total_steps, HYPERPARAMS["MIN_LR_RATIO"]
+    )
+ 
+    # Compute which chunk to resume from based on saved global_batch_idx
+    start_chunk = 0
+    start_batch_in_chunk = 0
+    if start_epoch > 0 or start_batch > 0:
+        start_chunk = start_batch // batches_per_chunk if batches_per_chunk > 0 else 0
+        start_batch_in_chunk = start_batch % batches_per_chunk if batches_per_chunk > 0 else 0
+        skip_steps = start_epoch * num_chunks * batches_per_chunk + start_batch
+        for _ in range(skip_steps):
+            scheduler.step()
+        if is_main_process():
+            print(f"[Resume] Resuming from epoch {start_epoch}, chunk {start_chunk}, batch {start_batch_in_chunk}")
+    
+    # Skip the stream forward to the right chunk position
+    chunk_manager.skip_chunks(start_chunk)
+ 
+    # Download static val set once (persists across all chunks and epochs)
+    val_loader = chunk_manager.prepare_val_loader(
+        HYPERPARAMS["LAION_BATCH_SIZE"], 
+        num_val_samples=HYPERPARAMS["LAION_VAL_SIZE"]
+    )
+
+    if dist.is_initialized():
+        dist.barrier()
+        if is_main_process():
+            print("[Sync] All ranks ready. Starting CLIP training loop.")
+
     for epoch in range(start_epoch, HYPERPARAMS["CLIP_EPOCHS"]):
         clip_model.train()
         total_loss = 0.0
-        prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True
-        )
+        global_batch_idx = start_chunk * batches_per_chunk if epoch == start_epoch else 0
+        epoch_start_chunk = start_chunk if epoch == start_epoch else 0
+        
+        for chunk_idx in range(epoch_start_chunk, num_chunks):
+            chunk_manager.prepare_chunk(chunk_idx)
+            train_loader = chunk_manager.get_loaders(chunk_idx, HYPERPARAMS["LAION_BATCH_SIZE"])
+            
+            if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
+            
+            if is_main_process():
+                print(f"CLIP Epoch {epoch+1} | Chunk {chunk_idx+1}/{num_chunks}")
+        
+            for batch_idx, batch in enumerate(train_loader):
+                if epoch == start_epoch and chunk_idx == epoch_start_chunk and batch_idx < start_batch_in_chunk and start_batch > 0:
+                    global_batch_idx += 1
+                    continue
+                if batch is None: continue
+            
+                images, texts = batch
+                images = images.to(local_device)
+                texts = texts.to(local_device)
+                optimizer.zero_grad()
+            
+                text_features, image_features, logit_scale = clip_model(texts, images)
+            
+                logits_per_image = logit_scale * image_features @ text_features.t()
+                logits_per_text = logit_scale * text_features @ image_features.t()
+                loss = clip_contrastive_loss(logits_per_image, logits_per_text)
+            
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+            
+                if global_batch_idx % 100 == 0 and is_main_process():
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(f"CLIP Epoch {epoch+1}/{HYPERPARAMS['CLIP_EPOCHS']} | Chunk {chunk_idx+1}/{num_chunks} | Batch {global_batch_idx} | Loss: {loss.item():.4f}")
+                    run.log({
+                        "clip_batch_loss": loss.item(), 
+                        "clip_epoch": epoch + 1,
+                        "clip_batch_idx": global_batch_idx,
+                        "clip_lr": current_lr
+                    })
 
-        prof.start()
-        for batch_idx, batch in enumerate(train_loader):
-                
-            if batch is None: continue
-            
-            images, texts = batch
-            images = images.to(local_device)
-            texts = texts.to(local_device)
-            optimizer.zero_grad()
-            
-            text_features, image_features, logit_scale = clip_model(texts, images)
-            
-            logits_per_image = logit_scale * image_features @ text_features.t()
-            logits_per_text = logit_scale * text_features @ image_features.t()
-            loss = clip_contrastive_loss(logits_per_image, logits_per_text)
-            
-            loss.backward()
-            optimizer.step()
-            prof.step()
-            total_loss += loss.item()
-            
-            if batch_idx % 100 == 0 and is_main_process():
-                print(f"CLIP Epoch {epoch+1}/{HYPERPARAMS['CLIP_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
-                run.log({
-                    "clip_batch_loss": loss.item(), 
-                    "clip_epoch": epoch + 1,
-                    "clip_batch_idx": batch_idx
-                })
+                if global_batch_idx > 0 and global_batch_idx % HYPERPARAMS["SAVE_FREQ"] == 0 and is_main_process():
+                    clip_model.eval()
+                    val_loss = 0.0
+                    iters = 0
+                    with torch.no_grad():
+                        for v_batch in val_loader:
+                            if v_batch is None: continue
+                            v_images, v_texts = v_batch
 
-            if batch_idx > 0 and batch_idx % HYPERPARAMS["SAVE_FREQ"] == 0 and is_main_process():
-                clip_model.eval()
-                val_loss = 0.0
-                iters = 0
-                with torch.no_grad():
-                    for v_batch in val_loader:
-                        if v_batch is None: continue
-                        v_images, v_texts = v_batch
-
-                        v_images = v_images.to(device)
-                        v_texts = v_texts.to(device)
+                            v_images = v_images.to(device)
+                            v_texts = v_texts.to(device)
             
-                        # Forward pass
-                        text_features, image_features, v_scale = clip_model(v_texts, v_images)
+                            # Forward pass
+                            text_features, image_features, v_scale = clip_model(v_texts, v_images)
             
-                        # Contrastive loss
-                        v_logits_per_image = v_scale * image_features @ text_features.t()
-                        v_logits_per_text = v_scale * text_features @ image_features.t()
-                        loss = clip_contrastive_loss(v_logits_per_image, v_logits_per_text)
+                            # Contrastive loss
+                            v_logits_per_image = v_scale * image_features @ text_features.t()
+                            v_logits_per_text = v_scale * text_features @ image_features.t()
+                            loss = clip_contrastive_loss(v_logits_per_image, v_logits_per_text)
             
-                        # Backprop
-                        val_loss += loss.item()
-                        iters += 1
+                            # Backprop
+                            val_loss += loss.item()
+                            iters += 1
                         
-                avg_val = val_loss / iters if iters > 0 else 999.9
-                clip_model.store_weights(
-                    HYPERPARAMS['CHECKPOINT_DIR'], 
-                    f"clip_text_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}", 
-                    f"clip_image_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}", 
-                    f"clip_wrapper_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}"
-                )
-                print(f"Saved CLIP partial epoch {epoch+1} batch {batch_idx} (Val Loss: {avg_val:.4f})")
-                clip_model.train()
+                    avg_val = val_loss / iters if iters > 0 else 999.9
+                    run.log({"clip_val_loss": avg_val, "clip_epoch": epoch + 1, "clip_batch_idx": global_batch_idx})
+                    clip_model.module.store_weights(
+                        HYPERPARAMS['CHECKPOINT_DIR'], 
+                        f"clip_text_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}", 
+                        f"clip_image_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}", 
+                        f"clip_wrapper_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}"
+                    )
+                    print(f"Saved CLIP partial epoch {epoch+1} batch {batch_idx} (Val Loss: {avg_val:.4f})")
+                    clip_model.train()
+                global_batch_idx += 1
+            
+            # Done with this chunk — delete it, next chunk already prefetching
+            chunk_manager.cleanup(chunk_idx)
 
         if is_main_process():
-            avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
-            print(f"CLIP Epoch {epoch+1} Average Train Loss: {avg_epoch_loss:.4f}")
+            avg_epoch_loss = total_loss / max(1, global_batch_idx)
+            print(f"CLIP Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}")
+            clip_model.module.store_weights(
+                HYPERPARAMS["CHECKPOINT_DIR"],
+                f"clip_text_epoch_{epoch+1}_complete",
+                f"clip_image_epoch_{epoch+1}_complete",
+                f"clip_wrapper_epoch_{epoch+1}_complete")
 
-            clip_model.store_weights(
-                HYPERPARAMS['CHECKPOINT_DIR'], 
-                f"clip_text_epoch_{epoch+1}_complete", 
-                f"clip_image_epoch_{epoch+1}_complete", 
-                f"clip_wrapper_epoch_{epoch+1}_complete"
-            )
-            print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-        prof.stop() 
+    chunk_manager.shutdown()
     print("CLIP training completed.")
 
 # ======== Prior Training ========
-def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch = 0, start_batch = 0):
+def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, start_epoch = 0, start_batch = 0):
     print("\n=== Training Prior ===")
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
@@ -298,90 +365,126 @@ def train_prior(train_loader, val_loader, start_weights, run: wandb, start_epoch
     
     prior = DDP(prior_model, device_ids=[int(os.environ["LOCAL_RANK"])])
 
+    num_chunks = chunk_manager.num_chunks if not isinstance(chunk_manager.num_chunks, float) else 20
+    batches_per_chunk = int(chunk_manager.chunk_size * (1 - chunk_manager.val_ratio)) // HYPERPARAMS["LAION_BATCH_SIZE"]
+    estimated_total_steps = HYPERPARAMS["PRIOR_EPOCHS"] * num_chunks * batches_per_chunk
+    scheduler = create_lr_warmup_cosine_scheduler(
+        optimizer, HYPERPARAMS["WARMUP_STEPS"], estimated_total_steps, HYPERPARAMS["MIN_LR_RATIO"]
+    )
+ 
+    start_chunk = 0
+    start_batch_in_chunk = 0
+    if start_epoch > 0 or start_batch > 0:
+        start_chunk = start_batch // batches_per_chunk if batches_per_chunk > 0 else 0
+        start_batch_in_chunk = start_batch % batches_per_chunk if batches_per_chunk > 0 else 0
+        skip_steps = start_epoch * num_chunks * batches_per_chunk + start_batch
+        for _ in range(skip_steps):
+            scheduler.step()
+        if is_main_process():
+            print(f"[Resume] Resuming from epoch {start_epoch}, chunk {start_chunk}, batch {start_batch_in_chunk}")
+    
+    chunk_manager.skip_chunks(start_chunk)
+ 
+    # Download static val set once (persists across all chunks and epochs)
+    val_loader = chunk_manager.prepare_val_loader(
+        HYPERPARAMS["LAION_BATCH_SIZE"],
+        num_val_samples=HYPERPARAMS["LAION_VAL_SIZE"]
+    )
+ 
+    if dist.is_initialized():
+        dist.barrier()
+        if is_main_process():
+            print("[Sync] All ranks ready. Starting Prior training loop.")
+
     for epoch in range(start_epoch, HYPERPARAMS["PRIOR_EPOCHS"]):
         prior.train()
         total_loss = 0.0
-        prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True
-        )
+        global_batch_idx = start_chunk * batches_per_chunk if epoch == start_epoch else 0
+        epoch_start_chunk = start_chunk if epoch == start_epoch else 0
         
-        prof.start()
-        for batch_idx, batch in enumerate(train_loader):
-            if epoch == start_epoch and batch_idx <= start_batch and start_batch > 0:
-                print(f"Skipping batch {batch_idx}")
-                continue
-            if batch is None: continue
+        for chunk_idx in range(epoch_start_chunk, num_chunks):
+            chunk_manager.prepare_chunk(chunk_idx)
+            train_loader = chunk_manager.get_loaders(chunk_idx, HYPERPARAMS["LAION_BATCH_SIZE"])
             
-            images, texts = batch
-
-            images = images.to(local_device)
-            texts = texts.to(local_device)
-            optimizer.zero_grad()
+            if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
             
-            with torch.no_grad():
-                text_emb = text_encoder(texts)
-                target_grid = prior_teacher(images)
+            if is_main_process():
+                print(f"Prior Epoch {epoch+1} | Chunk {chunk_idx+1}/{num_chunks}")
             
-            prior_grid = prior(text_emb)
-            loss = PriorLoss(prior_grid, target_grid)
+            for batch_idx, batch in enumerate(train_loader):
+                if epoch == start_epoch and chunk_idx == epoch_start_chunk and batch_idx < start_batch_in_chunk and start_batch > 0:
+                    global_batch_idx += 1
+                    continue
+                if batch is None: continue
             
-            loss.backward()
-            optimizer.step()
-            prof.step()
-            total_loss += loss.item()
+                images, texts = batch
+                images = images.to(local_device)
+                texts = texts.to(local_device)
+                optimizer.zero_grad()
             
-            if batch_idx % 100 == 0 and is_main_process():
-                print(f"Prior Epoch {epoch+1}/{HYPERPARAMS['PRIOR_EPOCHS']} | Batch {batch_idx} | Loss: {loss.item():.4f}")
-                run.log({
-                    "prior_batch_loss": loss.item(), 
-                    "prior_epoch": epoch + 1,
-                    "prior_batch_idx": batch_idx
-                })
-
-            if batch_idx > 0 and batch_idx % HYPERPARAMS["SAVE_FREQ"] == 0 and is_main_process():
-                prior.eval()
-                val_loss = 0.0
-                iters = 0
                 with torch.no_grad():
-                    for v_batch in val_loader:
-                        if v_batch is None: continue
+                    text_emb = text_encoder(texts)
+                    target_grid = prior_teacher(images)
+            
+                prior_grid = prior(text_emb)
+                loss = PriorLoss(prior_grid, target_grid)
+            
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+            
+                if global_batch_idx % 100 == 0 and is_main_process():
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(f"CLIP Epoch {epoch+1}/{HYPERPARAMS['CLIP_EPOCHS']} | Chunk {chunk_idx+1}/{num_chunks} | Batch {global_batch_idx} | Loss: {loss.item():.4f}")
+                    run.log({
+                        "prior_batch_loss": loss.item(), 
+                        "prior_epoch": epoch + 1,
+                        "prior_batch_idx": global_batch_idx,
+                        "prior_lr": current_lr
+                    })
 
-                        v_images, v_texts = v_batch
+                if global_batch_idx > 0 and global_batch_idx % HYPERPARAMS["SAVE_FREQ"] == 0 and is_main_process():
+                    prior.eval()
+                    val_loss = 0.0
+                    iters = 0
+                    with torch.no_grad():
+                        for v_batch in val_loader:
+                            if v_batch is None: continue
 
-                        v_texts = v_texts.to(local_device)
-                        v_images = v_images.to(local_device)
+                            v_images, v_texts = v_batch
 
-                        v_text_emb = text_encoder(v_texts)
-                        v_target_grid = prior_teacher(v_images)
-                        v_prior_grid = prior(v_text_emb)
+                            v_texts = v_texts.to(local_device)
+                            v_images = v_images.to(local_device)
 
-                        val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
+                            v_text_emb = text_encoder(v_texts)
+                            v_target_grid = prior_teacher(v_images)
+                            v_prior_grid = prior(v_text_emb)
 
-                        iters += 1
+                            val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
+
+                            iters += 1
                 
-                avg_val = val_loss / iters if iters > 0 else 999.9
-                prior.store_weights(
-                    HYPERPARAMS["CHECKPOINT_DIR"], 
-                    f"prior_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}"
-                )
-                print(f"Saved Prior partial epoch {epoch+1} batch {batch_idx} (Val Loss: {avg_val:.4f})")
-                prior.train()
+                    avg_val = val_loss / iters if iters > 0 else 999.9
+                    run.log({"prior_val_loss": avg_val, "prior_epoch": epoch + 1, "prior_batch_idx": global_batch_idx})
+                    prior.module.store_weights(
+                        HYPERPARAMS["CHECKPOINT_DIR"], 
+                        f"prior_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}"
+                    )
+                    print(f"Saved Prior partial epoch {epoch+1} batch {batch_idx} (Val Loss: {avg_val:.4f})")
+                    prior.train()
+                global_batch_idx += 1
+            chunk_manager.cleanup(chunk_idx)
 
         if is_main_process():
-            avg_epoch_loss = total_loss / (batch_idx + 1) if batch_idx > -1 else 0
-            print(f"Prior Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
-
-            prior.store_weights(
+            avg_epoch_loss = total_loss / max(1, global_batch_idx)
+            print(f"Prior Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}")
+            prior.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
-                f"prior_epoch_{epoch+1}_complete"
-            )
-            print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-        prof.stop()
+                f"prior_epoch_{epoch+1}_complete")
             
+    chunk_manager.shutdown()   
     print("Prior training completed.\n")
 
 # ======== SAM Teacher Training ========
@@ -436,19 +539,25 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
     print("[Teacher Training] Training SAM decoder...")
     optimizer_sam_decoder = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["DECODER_LR"])
 
+    estimated_total_steps = HYPERPARAMS["SAM_DECODER_EPOCHS"] * 2000
+    scheduler = create_lr_warmup_cosine_scheduler(
+        optimizer_sam_decoder, HYPERPARAMS["WARMUP_STEPS"], estimated_total_steps, HYPERPARAMS["MIN_LR_RATIO"]
+    )
+    if start_epoch > 0 or start_batch > 0:
+        skip_steps = start_epoch * 2000 + start_batch
+        for _ in range(skip_steps):
+            scheduler.step()
+
+    if dist.is_initialized():
+        dist.barrier()
+        if is_main_process():
+            print("[Sync] All ranks ready. Starting SAM decoder training loop.")
+
     for epoch in range(start_epoch, HYPERPARAMS["SAM_DECODER_EPOCHS"]):
         teacher.sam_decoder.train()
         total_loss = 0.0
         batch_count = 0
-        prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=2, warmup=2, active=5, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True
-        )
-
-        prof.start()
+        
         for batch_idx, batch in enumerate(train_dataloader):
             if epoch == start_epoch and batch_idx <= start_batch and start_batch > 0:
                 print(f"Skipping batch {batch_idx}")
@@ -473,18 +582,20 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                 num_samples_in_batch += 1
         
             optimizer_sam_decoder.step()
-            prof.step()
+            scheduler.step()
 
             avg_batch_item_loss = current_batch_loss_sum / max(1, num_samples_in_batch)
             total_loss += avg_batch_item_loss
             batch_count += 1
 
             if batch_idx % 100 == 0 and is_main_process():
+                current_lr = scheduler.get_last_lr()[0]
                 print(f"SAM Decoder Epoch {epoch+1}/{HYPERPARAMS['SAM_DECODER_EPOCHS']} | Batch {batch_idx} Avg Item Loss: {avg_batch_item_loss:.4f}")
                 run.log({
                     "sam_decoder_batch_avg_item_loss": avg_batch_item_loss,
                     "sam_decoder_epoch": epoch + 1,
-                    "sam_decoder_batch_idx": batch_idx
+                    "sam_decoder_batch_idx": batch_idx,
+                    "sam_decoder_lr": current_lr
                 })
 
             if batch_idx > 0 and batch_idx % HYPERPARAMS["SAVE_FREQ"] == 0 and is_main_process():
@@ -507,25 +618,22 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                             num_val_samples += 1
                         
                 avg_val = val_loss / num_val_samples if num_val_samples > 0 else 999.9
-                teacher.sam_decoder.store_weights(
+                teacher.sam_decoder.module.store_weights(
                     HYPERPARAMS["CHECKPOINT_DIR"], 
                     f"sam_decoder_epoch_{epoch+1}_batch_{batch_idx}_{avg_val:.4f}"
                 )
                 print(f"Saved SAM Decoder partial epoch {epoch+1} batch {batch_idx} (Val Loss: {avg_val:.4f})")
                 teacher.sam_decoder.train()
-
-            batch_count += 1
             
         if is_main_process():
             avg_epoch_loss = total_loss / batch_count if batch_count > 0 else 0
             print(f"SAM Decoder Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
 
-            teacher.sam_decoder.store_weights(
+            teacher.sam_decoder.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"sam_decoder_epoch_{epoch+1}_complete"
             )
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-        prof.stop()
 
     print("SAM Decoder training completed.\n")
 
@@ -591,6 +699,24 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
     optimizer_teacher_finetune = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["TEACHER_LR"])
     optimizer_student = torch.optim.Adam(student.parameters(), lr=HYPERPARAMS["STUDENT_LR"])
 
+    estimated_total_steps = HYPERPARAMS["TEACHER_STUDENT_EPOCHS"] * 2000
+    scheduler_teacher = create_lr_warmup_cosine_scheduler(
+        optimizer_teacher_finetune, HYPERPARAMS["WARMUP_STEPS"], estimated_total_steps, HYPERPARAMS["MIN_LR_RATIO"]
+    )
+    scheduler_student = create_lr_warmup_cosine_scheduler(
+        optimizer_student, HYPERPARAMS["WARMUP_STEPS"], estimated_total_steps, HYPERPARAMS["MIN_LR_RATIO"]
+    )
+    if start_epoch > 0 or start_batch > 0:
+        skip_steps = start_epoch * 2000 + start_batch
+        for _ in range(skip_steps):
+            scheduler_teacher.step()
+            scheduler_student.step()
+
+    if dist.is_initialized():
+        dist.barrier()
+        if is_main_process():
+            print("[Sync] All ranks ready. Starting joint training loop.")
+
     print("[Joint Training] Starting joint training")
     for epoch in range(start_epoch, HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]):
         teacher.sam_decoder.train()
@@ -638,6 +764,8 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                     
             optimizer_teacher_finetune.step()
             optimizer_student.step()
+            scheduler_teacher.step()
+            scheduler_student.step()
             
             batch_count += 1
             avg_batch_teacher_loss = current_batch_teacher_loss_sum / max(1, num_samples_in_batch)
@@ -646,12 +774,16 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
             total_student_loss += avg_batch_student_loss
             
             if batch_idx % 100 == 0 and is_main_process():
+                t_lr = scheduler_teacher.get_last_lr()[0]
+                s_lr = scheduler_student.get_last_lr()[0]
                 print(f"Student Epoch {epoch+1}/{HYPERPARAMS['TEACHER_STUDENT_EPOCHS']} | Batch {batch_idx} | Teacher Loss: {avg_batch_teacher_loss:.4f}, Student Loss: {avg_batch_student_loss:.4f}")
                 run.log({
                     "student_phase_batch_teacher_loss": avg_batch_teacher_loss,
                     "student_phase_batch_student_loss": avg_batch_student_loss,
                     "student_phase_epoch": epoch + 1,
-                    "student_phase_batch_idx": batch_idx
+                    "student_phase_batch_idx": batch_idx,
+                    "student_phase_teacher_lr": t_lr,
+                    "student_phase_student_lr": s_lr
                 })
 
             if batch_idx > 0 and batch_idx % HYPERPARAMS["SAVE_FREQ"] == 0 and is_main_process():
@@ -672,17 +804,17 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                             s_out = student(v_img, v_txt)
                             
                             val_t_loss += iou_loss(t_out, v_mask).item()
-                            val_s_loss += student.compute_distill_loss(s_out, t_out, v_mask).item()
+                            val_s_loss += student.module.compute_distill_loss(s_out, t_out, v_mask).item()
 
                             num_val_samples += 1
                         
                 avg_t_val = val_t_loss / num_val_samples if num_val_samples > 0 else 999.9
                 avg_s_val = val_s_loss / num_val_samples if num_val_samples > 0 else 999.9
                 
-                teacher.sam_decoder.store_weights(
+                teacher.sam_decoder.module.store_weights(
                     HYPERPARAMS["CHECKPOINT_DIR"], 
                     f"student_phase_teacher_epoch_{epoch+1}_batch_{batch_idx}_{avg_t_val:.4f}")
-                student.store_weights(
+                student.module.store_weights(
                     HYPERPARAMS["CHECKPOINT_DIR"], 
                     f"student_phase_student_epoch_{epoch+1}_batch_{batch_idx}_{avg_s_val:.4f}")
                 print(f"Saved Joint Phase partial epoch {epoch+1} batch {batch_idx}")
@@ -695,21 +827,21 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
             avg_epoch_student_loss = total_student_loss / batch_count if batch_count > 0 else 0
             print(f"Student Epoch {epoch+1} Avg Losses - Teacher: {avg_epoch_teacher_loss:.4f}, Student: {avg_epoch_student_loss:.4f}")
 
-            teacher.sam_decoder.store_weights(
+            teacher.sam_decoder.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"student_phase_teacher_epoch_{epoch+1}_complete")
-            student.store_weights(
+            student.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"student_phase_student_epoch_{epoch+1}_complete")
             print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
     print("Student training completed.\n")
 
-def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_count=None):
+def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_count=None, skip_tars=0):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cache_dir = os.path.join(base_dir, "data", "cache")
     os.makedirs(cache_dir, exist_ok=True)
     
-    dataset = dataset_cls(
+    kwargs = dict(
         file_list=file_list,
         cache_dir=cache_dir,
         device=device,
@@ -717,6 +849,10 @@ def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_co
         val_tar_count=val_tar_count,
         val_sample_count=val_sample_count
     )
+    if skip_tars > 0 and issubclass(dataset_cls, IterableDataset):
+        kwargs['skip_tars'] = skip_tars
+    
+    dataset = dataset_cls(**kwargs)
     return dataset
 
 def main(hf_token, wandb_key):
@@ -752,57 +888,24 @@ def main(hf_token, wandb_key):
     teacher_start_weights, _, _ = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_teacher")
     student_start_weights, student_start_epoch, student_start_batch = get_latest_epoch_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "student_phase_student")
 
-    NUM_LAION_WORKERS = 6
-    
-    # Determine the correct skip parameters based on the active training phase
-    active_skip_items = 0
-    if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
-        if clip_start_batch > 0:
-            active_skip_items = clip_start_batch * (HYPERPARAMS["LAION_BATCH_SIZE"] // NUM_LAION_WORKERS)
-    elif prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
-        if prior_start_batch > 0:
-            active_skip_items = prior_start_batch * (HYPERPARAMS["LAION_BATCH_SIZE"] // NUM_LAION_WORKERS)
-
     if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"] or prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
-        if dist.get_rank() != 0: dist.barrier()
-
-        LAION_train_dataset = get_laion_streaming_dataset(
-            HUGGINGFACE = hf_token, 
-            text_processor = CLIPTokenize,
-            split = "train",
-            val_size=HYPERPARAMS["LAION_VAL_SIZE"]+1,
-            skip_items=active_skip_items
-        )
+        chunk_cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache", "chunks")
         
-        LAION_train_loader = DataLoader(
-            LAION_train_dataset,
-            batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
+        laion_chunk_manager = ChunkedLAIONManager(
+            hf_token=hf_token,
+            chunk_size=HYPERPARAMS.get("LAION_CHUNK_SIZE", 10000),
+            total_samples=HYPERPARAMS.get("LAION_CACHE_SAMPLES", 200000),
+            val_ratio=0.05,
+            cache_dir=chunk_cache_dir,
+            text_processor=CLIPTokenize,
+            num_workers=4,
+            prefetch_factor=4,
             collate_fn=adaptive_collate,
-            pin_memory=True,
-            num_workers=NUM_LAION_WORKERS,
-            prefetch_factor=2
         )
-    
-        LAION_val_dataset = get_laion_streaming_dataset(
-            HUGGINGFACE = hf_token, 
-            text_processor = CLIPTokenize,
-            split = "val",
-            val_size=HYPERPARAMS["LAION_VAL_SIZE"]+1
-        )
-        
-        LAION_val_loader = DataLoader(
-            LAION_val_dataset,
-            batch_size=HYPERPARAMS["LAION_BATCH_SIZE"],
-            collate_fn=adaptive_collate,
-            pin_memory=True,
-            num_workers=NUM_LAION_WORKERS,
-            prefetch_factor=2
-        )
-
+ 
         if clip_text_start_epoch < HYPERPARAMS["CLIP_EPOCHS"]:
             print("Starting CLIP Training Phase")
-            train_clip(train_loader=LAION_train_loader,
-                       val_loader=LAION_val_loader, 
+            train_clip(chunk_manager=laion_chunk_manager,
                        text_start_weights=clip_text_start_weights, 
                        img_start_weights=clip_img_start_weights,
                        wrapper_start_weights=clip_wrapper_start_weights,
@@ -811,11 +914,12 @@ def main(hf_token, wandb_key):
                        run=run)
         else:
             print("CLIP training already completed.")
-
+ 
         if prior_start_epoch < HYPERPARAMS["PRIOR_EPOCHS"]:
+            laion_chunk_manager.reset_stream()
+            
             print("Starting Prior Training Phase")
-            train_prior(train_loader=LAION_train_loader,
-                        val_loader=LAION_val_loader, 
+            train_prior(chunk_manager=laion_chunk_manager,
                         start_weights=prior_start_weights, 
                         start_epoch=prior_start_epoch, 
                         start_batch=prior_start_batch,
@@ -824,8 +928,8 @@ def main(hf_token, wandb_key):
             print("Prior training already completed.")
     else:
         print("CLIP and Prior already trained")
-        
-    num_workers = 0 if device == 'mps' else 10
+
+    num_workers = 0 if device == 'mps' else 4
 
     if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"] or student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
         def load_file_list(file_path):
@@ -834,22 +938,36 @@ def main(hf_token, wandb_key):
                     return [line.strip().split('\t') for line in f.readlines()[1:]]
             except FileNotFoundError:
                 return []
-
+ 
         print("Initializing Iterable SAM datasets...")
         sa1b_files = load_file_list("data/Datasets/SA-1B_dataset.txt")
         sav_files = load_file_list("data/Datasets/SA-V_dataset.txt")
-
-        # Training (Streaming Infinite Iterables)
-        sa1b_train = get_dataset(SA1BDataset, sa1b_files, "train", HYPERPARAMS["SA_VAL_TAR_COUNT"])
-        sav_train = get_dataset(SAVDataset, sav_files, "train", HYPERPARAMS["SAV_VAL_TAR_COUNT"])
+ 
+        samples_per_tar = HYPERPARAMS.get("EST_SAMPLES_PER_TAR", 3000)
+        batches_per_tar = max(1, samples_per_tar // HYPERPARAMS["SAM_BATCH_SIZE"])
+        
+        # Use the active phase's start_batch to determine skip
+        if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
+            active_skip_tars = sam_start_batch // batches_per_tar if sam_start_batch > 0 else 0
+        elif student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
+            active_skip_tars = student_start_batch // batches_per_tar if student_start_batch > 0 else 0
+        else:
+            active_skip_tars = 0
+        
+        if active_skip_tars > 0 and is_main_process():
+            print(f"[SAM Resume] Skipping ~{active_skip_tars} tars ({active_skip_tars * samples_per_tar} est. samples)")
+ 
+        # Training (Streaming with prefetch + skip)
+        sa1b_train = get_dataset(SA1BDataset, sa1b_files, "train", HYPERPARAMS["SA_VAL_TAR_COUNT"], skip_tars=active_skip_tars)
+        sav_train = get_dataset(SAVDataset, sav_files, "train", HYPERPARAMS["SAV_VAL_TAR_COUNT"], skip_tars=active_skip_tars)
         
         # Validation (Fast Static Loaders)
         sa1b_val = get_dataset(StaticSA1BDataset, sa1b_files, "val", HYPERPARAMS["SA_VAL_TAR_COUNT"], HYPERPARAMS.get("SA_VAL_SAMPLE_COUNT"))
         sav_val = get_dataset(StaticSAVDataset, sav_files, "val", HYPERPARAMS["SAV_VAL_TAR_COUNT"], HYPERPARAMS.get("SAV_VAL_SAMPLE_COUNT"))
-
+ 
         train_dataset = ChainDataset([sa1b_train, sav_train])
         val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
-
+ 
         train_dataloader = DataLoader(train_dataset, 
                                       batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
                                       shuffle=False, 
@@ -866,7 +984,7 @@ def main(hf_token, wandb_key):
                                     collate_fn=SAM_adaptive_collate, 
                                     pin_memory=True, 
                                     sampler=val_sampler)
-
+ 
         if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
             print("Starting SAM Decoder Training Phase")
             train_SAM_decoder(train_dataloader, 
@@ -877,7 +995,7 @@ def main(hf_token, wandb_key):
                               run=run)
         else:
             print("SAM Decoder training already completed.")
-
+ 
         if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
             print("Starting Student Training Phase")
             train_student(train_dataloader, 

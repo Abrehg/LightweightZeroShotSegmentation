@@ -38,14 +38,14 @@ fi
 echo "Loading modules..."
 module purge
 module load gcc
-module load spectrum-mpi
-module load cuda/11.2
 
 export http_proxy=http://proxy:8888
 export https_proxy=http://proxy:8888
 export HTTP_PROXY=http://proxy:8888
 export HTTPS_PROXY=http://proxy:8888
 export WANDB_CORE=false
+
+export OMP_NUM_THREADS=4
 
 ENV_BIN="/gpfs/u/home/ZSIS/ZSISsrtk/barn/miniconda3/envs/$VENV_NAME/bin"
 export PATH="$ENV_BIN:$PATH"
@@ -70,54 +70,25 @@ export NCCL_SOCKET_IFNAME=^docker,lo
 export GLOO_SOCKET_IFNAME=^docker,lo
 export NCCL_DEBUG=WARN
 
+export NCCL_TIMEOUT=5400000
+export NCCL_IB_TIMEOUT=23
+export NCCL_IB_RETRY_CNT=7
+
 echo "Pre-downloading HuggingFace cache to prevent DDP race conditions"
 python -c "
-import os, socket, requests
-os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
-socket.setdefaulttimeout(3600)
-
-import datasets
-datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
-datasets.config.MAX_RETRIES = 10
-
-_original_request = requests.Session.request
-def _patched_request(self, method, url, **kwargs):
-    kwargs['timeout'] = 3600
-    return _original_request(self, method, url, **kwargs)
-requests.Session.request = _patched_request
-
-_original_send = requests.Session.send
-def _patched_send(self, request, **kwargs):
-    kwargs['timeout'] = 3600
-    return _original_send(self, request, **kwargs)
-requests.Session.send = _patched_send
-
 from models.clip_model import create_text_encoder, create_image_encoder
 from models.prior_model import TeacherCLIP
-from transformers import InstructBlipProcessor
-from datasets import load_dataset
 import warnings
 warnings.filterwarnings('ignore')
-
-print('1/4: Downloading CLIP Base models...')
+ 
+print('1/2: Downloading CLIP Base models...')
 create_text_encoder()
 create_image_encoder()
-
-print('2/4: Downloading Teacher CLIP (Large)...')
+ 
+print('2/2: Downloading Teacher CLIP (Large)...')
 TeacherCLIP()
-
-print('3/4: Downloading InstructBlip Processor...')
-try:
-    InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
-except Exception:
-    pass 
-
-print('4/4: Downloading LAION streaming builder...')
-try:
-    load_dataset('laion/relaion400m', split='train', streaming=True, token='$HF_TOKEN')
-    print('LAION pre-download successful!')
-except Exception as e:
-    print(f'LAION pre-download failed: {e}')
+ 
+print('Model cache ready.')
 "
 
 # --- Running the Training Script with torchrun ---

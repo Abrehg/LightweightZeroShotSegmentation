@@ -9,10 +9,10 @@
 #
 # Usage:
 #   # Single GPU
-#   python tuneModel.py --checkpoint_dir weights --wandb_key KEY
+#   python finetune.py --checkpoint_dir weights --wandb_key KEY
 #
 #   # Multi-GPU via torchrun
-#   torchrun --nproc_per_node=4 tuneModel.py --checkpoint_dir weights --wandb_key KEY
+#   torchrun --nproc_per_node=4 finetune.py --checkpoint_dir weights --wandb_key KEY
 
 import os
 import re

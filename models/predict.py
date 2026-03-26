@@ -36,4 +36,4 @@ class StudentModel(torch.nn.Module):
     def load_weights(self, student_weights):
         self.student.load_weights(student_weights)
 
-teacher = TeacherModel()
+#teacher = TeacherModel()

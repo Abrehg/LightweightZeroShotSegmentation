@@ -91,23 +91,44 @@ def _get_sam_datasets():
                 with open(file_path) as f:
                     return [line.strip().split('\t') for line in f.readlines()[1:]]
             except FileNotFoundError:
+                print(f"[SAM] WARNING: File list not found: {file_path}")
                 return []
-
+ 
         sa1b_files = load_file_list("data/Datasets/SA-1B_dataset.txt")
         sav_files = load_file_list("data/Datasets/SA-V_dataset.txt")
-
+        
+        print(f"[SAM] Found {len(sa1b_files)} SA-1B entries, {len(sav_files)} SA-V entries")
+ 
+        # Use barn for tar cache to avoid home quota limits
+        cache_dir = os.environ.get(
+            "SAM_CACHE_DIR",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"[SAM] Cache directory: {cache_dir}")
+ 
         print("[Cache] Loading SAM train dataset (one-time)...")
         _sam_cache['train'] = ConcatDataset([
-            StaticSA1BDataset(sa1b_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=1000),
-            StaticSAVDataset(sav_files, "data/cache", device, "train", val_tar_count=1, val_sample_count=1000)
+            StaticSA1BDataset(sa1b_files, cache_dir, device, "train", val_tar_count=1, val_sample_count=1000),
+            StaticSAVDataset(sav_files, cache_dir, device, "train", val_tar_count=1, val_sample_count=1000)
         ])
+        print(f"[SAM] Train dataset: {len(_sam_cache['train'])} samples")
+        
         print("[Cache] Loading SAM val dataset (one-time)...")
         _sam_cache['val'] = ConcatDataset([
-            StaticSA1BDataset(sa1b_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=250),
-            StaticSAVDataset(sav_files, "data/cache", device, "val", val_tar_count=1, val_sample_count=250)
+            StaticSA1BDataset(sa1b_files, cache_dir, device, "val", val_tar_count=1, val_sample_count=250),
+            StaticSAVDataset(sav_files, cache_dir, device, "val", val_tar_count=1, val_sample_count=250)
         ])
+        print(f"[SAM] Val dataset: {len(_sam_cache['val'])} samples")
+        
+        if len(_sam_cache['train']) == 0:
+            print("[SAM] ERROR: Train dataset is empty! Check that:")
+            print("  1. data/Datasets/SA-1B_dataset.txt and SA-V_dataset.txt have valid URLs")
+            print(f"  2. Cache dir {cache_dir} has enough disk space")
+            print("  3. URLs haven't expired (SA-1B/SA-V links rotate periodically)")
+    
     return _sam_cache['train'], _sam_cache['val']
-
+ 
 def get_sam_loaders(batch_size):
     train_dataset, val_dataset = _get_sam_datasets()
     train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=SAM_adaptive_collate, shuffle=True, num_workers=4)
@@ -257,7 +278,7 @@ def objective_clip(trial, hf_token):
 # ======================== PHASE 2: Prior ========================
 # Depends on: trained CLIP text encoder (frozen).
 def objective_prior(trial, hf_token, args):
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
+    batch_size = 128
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     num_layers = trial.suggest_int("num_layers", 1, 24)
     

@@ -35,23 +35,22 @@
 PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/research"
 PYTHON_SCRIPT_NAME="tune.py"
 VENV_NAME="visEnv"
-HF_TOKEN=""
-N_TRIALS=30
+HF_TOKEN="_"
+N_TRIALS=40
 
 # Current phase to tune (change per run)
-PHASE="clip"
+PHASE="decoder"
 
 # Path to trained weights from previous phases
 WEIGHTS_DIR="$PROJECT_DIR/models/trained"
 
 # Structural params from previous tuning results (must match saved weights).
 # Update these after each phase completes with the best trial values.
-TXT_ENC_LAYERS=11       # best num_layers from CLIP tuning
-PRIOR_LAYERS=12          # best num_layers from Prior tuning
-SAM_LAYERS=2             # best num_layers from Decoder tuning
-SAM_MEMORY=10            # best Max Memory Length from Decoder tuning
-TEACHER_WARMUP_EPOCHS=3  # warm-up epochs for teacher before student tuning
-                         # set to 0 if SAM weights already have 3+ epochs
+TXT_ENC_LAYERS=6
+PRIOR_LAYERS=8
+SAM_LAYERS=2
+SAM_MEMORY=10
+TEACHER_WARMUP_EPOCHS=3
 
 # --- Sanity Checks ---
 if [ -z "$HF_TOKEN" ] || [ "$HF_TOKEN" = "_" ]; then
@@ -93,61 +92,66 @@ export HTTPS_PROXY=http://proxy:8888
 ENV_BIN="/gpfs/u/home/ZSIS/ZSISsrtk/barn/miniconda3/envs/$VENV_NAME/bin"
 export PATH="$ENV_BIN:$PATH"
 
+export HF_HOME=/gpfs/u/barn/ZSIS/ZSISsrtk/.cache/huggingface
+export TRANSFORMERS_CACHE=$HF_HOME/hub
+export SAM_CACHE_DIR=/gpfs/u/barn/ZSIS/ZSISsrtk/.cache/sam_data
+mkdir -p "$HF_HOME/hub" "$SAM_CACHE_DIR"
+
 echo "Python executable: $(which python)"
 echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
 
 cd "$PROJECT_DIR"
 
-# --- Pre-download HuggingFace assets ---
-echo "Pre-downloading HuggingFace cache..."
-python -c "
-import os, socket, requests
-os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
-socket.setdefaulttimeout(3600)
+# # --- Pre-download HuggingFace assets ---
+# echo "Pre-downloading HuggingFace cache..."
+# python -c "
+# import os, socket, requests
+# os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
+# socket.setdefaulttimeout(3600)
 
-import datasets
-datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
-datasets.config.MAX_RETRIES = 10
+# import datasets
+# datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
+# datasets.config.MAX_RETRIES = 10
 
-_original_request = requests.Session.request
-def _patched_request(self, method, url, **kwargs):
-    kwargs['timeout'] = 3600
-    return _original_request(self, method, url, **kwargs)
-requests.Session.request = _patched_request
+# _original_request = requests.Session.request
+# def _patched_request(self, method, url, **kwargs):
+#     kwargs['timeout'] = 3600
+#     return _original_request(self, method, url, **kwargs)
+# requests.Session.request = _patched_request
 
-_original_send = requests.Session.send
-def _patched_send(self, request, **kwargs):
-    kwargs['timeout'] = 3600
-    return _original_send(self, request, **kwargs)
-requests.Session.send = _patched_send
+# _original_send = requests.Session.send
+# def _patched_send(self, request, **kwargs):
+#     kwargs['timeout'] = 3600
+#     return _original_send(self, request, **kwargs)
+# requests.Session.send = _patched_send
 
-from models.clip_model import create_text_encoder, create_image_encoder
-from models.prior_model import TeacherCLIP
-from transformers import InstructBlipProcessor
-from datasets import load_dataset
-import warnings
-warnings.filterwarnings('ignore')
+# from models.clip_model import create_text_encoder, create_image_encoder
+# from models.prior_model import TeacherCLIP
+# from transformers import InstructBlipProcessor
+# from datasets import load_dataset
+# import warnings
+# warnings.filterwarnings('ignore')
 
-print('1/4: Downloading CLIP Base models...')
-create_text_encoder()
-create_image_encoder()
+# print('1/4: Downloading CLIP Base models...')
+# create_text_encoder()
+# create_image_encoder()
 
-print('2/4: Downloading Teacher CLIP (Large)...')
-TeacherCLIP()
+# print('2/4: Downloading Teacher CLIP (Large)...')
+# TeacherCLIP()
 
-print('3/4: Downloading InstructBlip Processor...')
-try:
-    InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
-except Exception:
-    pass
+# print('3/4: Downloading InstructBlip Processor...')
+# try:
+#     InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
+# except Exception:
+#     pass
 
-print('4/4: Downloading LAION streaming builder...')
-try:
-    load_dataset('laion/relaion400m', split='train', streaming=True, token='$HF_TOKEN')
-    print('LAION pre-download successful!')
-except Exception as e:
-    print(f'LAION pre-download failed: {e}')
-"
+# print('4/4: Downloading LAION streaming builder...')
+# try:
+#     load_dataset('laion/relaion400m', split='train', streaming=True, token='$HF_TOKEN')
+#     print('LAION pre-download successful!')
+# except Exception as e:
+#     print(f'LAION pre-download failed: {e}')
+# "
 
 # --- Build the command with phase-appropriate args ---
 echo "Starting Optuna hyperparameter sweep: phase=$PHASE, trials=$N_TRIALS"

@@ -54,10 +54,10 @@ from torch.optim.lr_scheduler import LambdaLR
 
 # ======== Hyperparameters & Setup ========
 HYPERPARAMS = {
-    "CLIP_EPOCHS": 10,
-    "PRIOR_EPOCHS": 10,
-    "SAM_DECODER_EPOCHS": 3,
-    "TEACHER_STUDENT_EPOCHS": 10,
+    "CLIP_EPOCHS": 3,
+    "PRIOR_EPOCHS": 2,
+    "SAM_DECODER_EPOCHS": 1,
+    "TEACHER_STUDENT_EPOCHS": 2,
     "CLIP_LR": 0.002,
     "PRIOR_LR": 0.0005,
     "DECODER_LR": 0.0001, # For SAM Decoder training
@@ -93,7 +93,7 @@ device = get_device()
 def setup_ddp():
     dist.init_process_group(
         backend="nccl",
-        timeout=datetime.timedelta(minutes=90)
+        timeout=datetime.timedelta(hours=4)
     )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 

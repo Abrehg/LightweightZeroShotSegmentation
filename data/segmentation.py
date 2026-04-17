@@ -45,6 +45,10 @@ def get_cached_caption(cache_key, caption_idx):
 
 def SAM_adaptive_collate(batch):
     images, masks, texts = zip(*batch)
+    images = [
+        img.float().div(255.0) if img.dtype == torch.uint8 else img
+        for img in images
+    ]
     return list(images), list(masks), list(texts)
 
 class DummyCaptionGenerator:
@@ -219,15 +223,19 @@ class StreamingBaseTarDataset(IterableDataset):
  
     def _get_worker_shard(self):
         worker_info = torch.utils.data.get_worker_info()
-        num_workers = worker_info.num_workers if worker_info else 1
-        worker_id = worker_info.id if worker_info else 0
-        
-        dist_world_size = int(os.environ.get("WORLD_SIZE", 1)) if "LOCAL_RANK" in os.environ else 1
-        dist_rank = int(os.environ.get("RANK", 0)) if "LOCAL_RANK" in os.environ else 0
+        num_dl_workers = worker_info.num_workers if worker_info else 1
+        dl_worker_id   = worker_info.id          if worker_info else 0
  
-        total_shards = num_workers * dist_world_size
-        global_worker_id = (dist_rank * num_workers) + worker_id
+        node_rank     = int(os.environ.get("SLURM_NODEID",     0))
+        num_nodes     = int(os.environ.get("SLURM_NNODES",     1))
+        local_rank    = int(os.environ.get("LOCAL_RANK",       0))
+        gpus_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
  
+        workers_per_node = gpus_per_node * num_dl_workers
+        node_worker_id   = local_rank * num_dl_workers + dl_worker_id
+        global_worker_id = node_rank * workers_per_node + node_worker_id
+ 
+        total_shards = num_nodes * workers_per_node
         shard = [f for i, f in enumerate(self.file_list) if i % total_shards == global_worker_id]
         return shard, global_worker_id
     
@@ -260,7 +268,7 @@ class SA1BDataset(StreamingBaseTarDataset):
     def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None, skip_tars=0):
         super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count, skip_tars=skip_tars)
         self.device = device
-        self.transform = transforms.Compose([transforms.ToTensor()])
+        self.transform = transforms.PILToTensor()
         self.caption_generator = None
         load_caption_cache()
  
@@ -354,7 +362,7 @@ class SAVDataset(StreamingBaseTarDataset):
     def __init__(self, file_list, cache_dir, device='cpu', split='train', val_tar_count=1, val_sample_count=None, skip_tars=0):
         super().__init__(file_list, cache_dir, split, val_tar_count=val_tar_count, skip_tars=skip_tars)
         self.device = device
-        self.transform = transforms.Compose([transforms.ToTensor()])
+        self.transform = transforms.PILToTensor()
         self.caption_generator = None
         self.sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir))
         load_caption_cache()
@@ -472,7 +480,7 @@ class StaticSA1BDataset(Dataset):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.file_list = file_list[:val_tar_count]
-        self.transform = transforms.Compose([transforms.ToTensor()])
+        self.transform = transforms.PILToTensor()
         
         # How many tar files we want
         target_count = val_tar_count
@@ -582,7 +590,7 @@ class StaticSAVDataset(Dataset):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.file_list = file_list[:val_tar_count]
-        self.transform = transforms.Compose([transforms.ToTensor()])
+        self.transform = transforms.PILToTensor()
         self.sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir))
         
         target_count = val_tar_count

@@ -227,6 +227,7 @@ def objective_clip(trial, hf_token):
         raise optuna.exceptions.TrialPruned()
     
     gpu_cleanup()
+    scaler = torch.cuda.amp.GradScaler()
     train_loader, val_loader = get_laion_loaders(hf_token, batch_size)
     
     text_encoder = create_text_encoder(num_layers=num_layers).to(device)
@@ -243,15 +244,14 @@ def objective_clip(trial, hf_token):
             images = images.to(device)
             texts = texts.to(device)
             optimizer.zero_grad()
-            
-            text_features, image_features, logit_scale = model(texts, images)
-            
-            logits_per_image = logit_scale * image_features @ text_features.t()
-            logits_per_text = logit_scale * text_features @ image_features.t()
-            loss = clip_contrastive_loss(logits_per_image, logits_per_text)
-
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                text_features, image_features, logit_scale = model(texts, images)
+                logits_per_image = logit_scale * image_features @ text_features.t()
+                logits_per_text  = logit_scale * text_features  @ image_features.t()
+                loss = clip_contrastive_loss(logits_per_image, logits_per_text)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
         model.eval()
         val_loss = 0
@@ -261,12 +261,12 @@ def objective_clip(trial, hf_token):
                 images, texts = batch
                 images = images.to(device)
                 texts = texts.to(device)
-            
-                text_features, image_features, logit_scale = model(texts, images)
-            
-                logits_per_image = logit_scale * image_features @ text_features.t()
-                logits_per_text = logit_scale * text_features @ image_features.t()
-                val_loss += clip_contrastive_loss(logits_per_image, logits_per_text).item()
+
+                with torch.cuda.amp.autocast():
+                    text_features, image_features, logit_scale = model(texts, images)
+                    logits_per_image = logit_scale * image_features @ text_features.t()
+                    logits_per_text  = logit_scale * text_features  @ image_features.t()
+                    val_loss += clip_contrastive_loss(logits_per_image, logits_per_text).item()
                 
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
@@ -278,15 +278,16 @@ def objective_clip(trial, hf_token):
 # ======================== PHASE 2: Prior ========================
 # Depends on: trained CLIP text encoder (frozen).
 def objective_prior(trial, hf_token, args):
-    batch_size = 128
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     num_layers = trial.suggest_int("num_layers", 1, 24)
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     
     estimated_mem_factor = batch_size * num_layers
-    if estimated_mem_factor > 2048:
+    if estimated_mem_factor > 1024:
         raise optuna.exceptions.TrialPruned()
 
     gpu_cleanup()
+    scaler = torch.cuda.amp.GradScaler()
     train_loader, val_loader = get_laion_loaders(hf_token, batch_size=batch_size)
     
     # Load trained text encoder from CLIP phase (frozen)
@@ -306,15 +307,15 @@ def objective_prior(trial, hf_token, args):
             texts = texts.to(device)
             optimizer.zero_grad()
             
-            with torch.no_grad():
-                text_emb = text_encoder(texts)
-                target_grid = teacher(images)
-            
-            prior_grid = prior(text_emb)
-            loss = PriorLoss(prior_grid, target_grid)
-            
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                with torch.no_grad():
+                    text_emb    = text_encoder(texts)
+                    target_grid = teacher(images)
+                prior_grid = prior(text_emb)
+                loss = PriorLoss(prior_grid, target_grid)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
         prior.eval()
         val_loss = 0
@@ -326,11 +327,11 @@ def objective_prior(trial, hf_token, args):
                 images = images.to(device)
                 texts = texts.to(device)
             
-                text_emb = text_encoder(texts)
-                target_grid = teacher(images)
-            
-                prior_grid = prior(text_emb)
-                val_loss += PriorLoss(prior_grid, target_grid).item()
+                with torch.cuda.amp.autocast():
+                    text_emb    = text_encoder(texts)
+                    target_grid = teacher(images)
+                    prior_grid  = prior(text_emb)
+                    val_loss   += PriorLoss(prior_grid, target_grid).item()
                 
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
@@ -344,15 +345,18 @@ def objective_prior(trial, hf_token, args):
 def objective_decoder(trial, args):
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
-    max_memory_length = trial.suggest_int("Max Memory Length", 1, 20)
-    num_layers = trial.suggest_int("num layers", 1, 20)
+    batch_size = trial.suggest_categorical("batch_size", [1])
+    max_memory_length = trial.suggest_int("Max Memory Length", 1, 3)
+    enc_num_layers = trial.suggest_int("encoder num layers", 1, 4)
+    dec_num_layers = trial.suggest_int("decoder num layers", 1, 4)
     
-    estimated_mem_factor = batch_size * num_layers
-    if estimated_mem_factor > 2048:  # e.g. 128*16 or 256*8
+    if max_memory_length > 3:
+        raise optuna.exceptions.TrialPruned()
+    if batch_size > 4:
         raise optuna.exceptions.TrialPruned()
 
     gpu_cleanup()
+    scaler = torch.cuda.amp.GradScaler()
     train_loader, val_loader = get_sam_loaders(batch_size)
     
     # Load trained components from previous phases (frozen)
@@ -360,7 +364,9 @@ def objective_decoder(trial, args):
     prior = load_trained_prior(args)
     
     # SAM decoder is what we're tuning — fresh init
-    sam_decoder = create_SAM(max_memory_length=max_memory_length, num_layers=num_layers).to(device)
+    sam_decoder = create_SAM(max_memory_length=max_memory_length, 
+                             enc_num_layers=enc_num_layers, 
+                             dec_num_layers=dec_num_layers).to(device)
 
     class TeacherModel(torch.nn.Module):
         def __init__(self):
@@ -369,12 +375,15 @@ def objective_decoder(trial, args):
             self.prior = prior
             self.sam_decoder = sam_decoder
 
-        def forward(self, x, text_tokens):
+        def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
+                text_emb  = self.text_encoder(text_tokens)
                 prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
+            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+            return mask, new_memory
+ 
+        def init_memory(self, B, device):
+            return self.sam_decoder.init_memory(B, device)
 
     teacher = TeacherModel().to(device)
 
@@ -392,9 +401,15 @@ def objective_decoder(trial, args):
                 img = img.to(device)
                 txt = txt.to(device)
 
-                pred_mask = teacher.forward(img, txt)
-                loss = iou_loss(pred_mask, mask)
-                loss.backward()
+                T = img.shape[1]
+                memory = teacher.init_memory(img.shape[0], device)
+
+                for t in range(T):
+                    with torch.cuda.amp.autocast():
+                        pred_mask, new_memory = teacher.forward_frame(img, txt, memory, t)
+                        loss = iou_loss(pred_mask, mask[:, t])
+                    scaler.scale(loss).backward()
+                    memory = new_memory.detach()
             optimizer.step()
             
         sam_decoder.eval()
@@ -408,8 +423,13 @@ def objective_decoder(trial, args):
                     img = img.to(device)
                     txt = txt.to(device)
 
-                    pred_mask = teacher.forward(img, txt)
-                    val_loss += iou_loss(pred_mask, mask).item()
+                    T = img.shape[1]
+                    memory = teacher.init_memory(img.shape[0], device)
+
+                    for t in range(T):
+                        with torch.cuda.amp.autocast():
+                            pred_mask, memory = teacher.forward_frame(img, txt, memory, t)
+                            val_loss += iou_loss(pred_mask, mask[:, t])
                     
         trial.report(val_loss, epoch)
         if trial.should_prune(): raise optuna.exceptions.TrialPruned()
@@ -443,9 +463,14 @@ def warmup_teacher(teacher, train_loader, warmup_epochs, lr=1e-4):
                 img = img.to(device)
                 txt = txt.to(device)
 
-                pred_mask = teacher(img, txt)
-                loss = iou_loss(pred_mask, mask)
-                loss.backward()
+                T = img.shape[1]
+                memory = teacher.init_memory(img.shape[0], device)
+
+                for t in range(T):
+                    pred_mask, new_memory = teacher.forward_frame(img, txt, memory, t)
+                    loss = iou_loss(pred_mask, mask[:, t])
+                    loss.backward()
+                    memory = new_memory.detach()
             
             optimizer.step()
             epoch_loss += loss.item()
@@ -482,12 +507,15 @@ def get_warmed_teacher_components(args):
             self.prior = _frozen_prior
             self.sam_decoder = sam_decoder
 
-        def forward(self, x, text_tokens):
+        def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
+                text_emb  = self.text_encoder(text_tokens)
                 prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
+            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+            return mask, new_memory
+ 
+        def init_memory(self, B, device):
+            return self.sam_decoder.init_memory(B, device)
 
     teacher = TeacherModel().to(device)
     
@@ -504,12 +532,18 @@ def get_warmed_teacher_components(args):
 def objective_student(trial, args):
     teacher_lr = trial.suggest_float("teacher_lr", 1e-5, 1e-2, log=True)
     student_lr = trial.suggest_float("student_lr", 1e-5, 1e-2, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
-    input_layers = trial.suggest_int("input layers", 1, 20)
+    batch_size = trial.suggest_categorical("batch_size", [1])
+    input_layers = trial.suggest_int("input layers", 1, 10)
+    num_encoder_layers = trial.suggest_int("num_encoder_layers", 1, 8)
     num_decoder_layers = trial.suggest_int("num_decoder_layers", 1, 8)
     max_memory_length = trial.suggest_int("Max Memory Length", 1, 20)
 
+    if batch_size * (input_layers + num_decoder_layers) > 256:
+        raise optuna.exceptions.TrialPruned()
+
     gpu_cleanup()
+    scaler_teacher = torch.cuda.amp.GradScaler()
+    scaler_student = torch.cuda.amp.GradScaler()
     train_loader, val_loader = get_sam_loaders(batch_size)
 
     # Get cached components (warm-up runs only on first trial)
@@ -517,7 +551,9 @@ def objective_student(trial, args):
 
     # Build a fresh teacher with warmed SAM weights for this trial
     sam_decoder = create_SAM(
-        max_memory_length=args.sam_memory, num_layers=args.sam_layers
+        max_memory_length=args.sam_memory, 
+        enc_num_layers=args.sam_enc_layers, 
+        dec_num_layers=args.sam_dec_layers
     ).to(device)
     sam_decoder.load_state_dict(warmed_sam_state)
 
@@ -528,18 +564,22 @@ def objective_student(trial, args):
             self.prior = prior
             self.sam_decoder = sam_decoder
 
-        def forward(self, x, text_tokens):
+        def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
+                text_emb  = self.text_encoder(text_tokens)
                 prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
+            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+            return mask, new_memory
+ 
+        def init_memory(self, B, device):
+            return self.sam_decoder.init_memory(B, device)
 
     teacher = TeacherModel().to(device)
 
     student = create_Student(
         text_transformer_layers=input_layers, 
         max_memory_length=max_memory_length,
+        num_encoder_layers=num_encoder_layers,
         num_decoder_layers=num_decoder_layers
     ).to(device)
 
@@ -563,22 +603,30 @@ def objective_student(trial, args):
                 img = img.to(device)
                 txt = txt.to(device)
 
-                teacher_out = teacher(img, txt)
-                student_out = student(img, txt)
+                T = img.shape[1]
+                mem_t = teacher.init_memory(img.shape[0], device)
+                mem_s = student.init_memory(img.shape[0], device)
+
+                for t in range(T):
+                    with torch.cuda.amp.autocast():
+                        teacher_out, mem_t_new = teacher.forward_frame(img, txt, mem_t, t)
+                        student_out, mem_s_new = student.forward(img, txt, mem_s, t)
                 
-                with torch.no_grad():
-                    teacher_out_for_student = teacher_out.detach()
+                        with torch.no_grad():
+                            teacher_out_for_student = teacher_out.detach()
 
-                teacher_loss = iou_loss(teacher_out, mask)
-                student_loss = student.compute_distill_loss(
-                    student_out, teacher_out_for_student, mask
-                )
-
-                teacher_loss.backward(retain_graph=True)
-                student_loss.backward()
-                    
-            optimizer_teacher.step()
-            optimizer_student.step()
+                        teacher_loss = iou_loss(teacher_out, mask[:, t])
+                        student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask[:, t])
+               
+                    scaler_teacher.scale(teacher_loss).backward(retain_graph=True)
+                    scaler_student.scale(student_loss).backward()
+                    mem_t = mem_t_new.detach()
+                    mem_s = mem_s_new.detach()
+ 
+            scaler_teacher.step(optimizer_teacher)
+            scaler_teacher.update()
+            scaler_student.step(optimizer_student)
+            scaler_student.update()
 
         teacher.sam_decoder.eval()
         student.eval()
@@ -592,11 +640,17 @@ def objective_student(trial, args):
                     v_img = v_img.to(device)
                     v_txt = v_txt.to(device)
 
-                    t_out = teacher(v_img, v_txt)
-                    s_out = student(v_img, v_txt)
-                            
-                    val_t_loss += iou_loss(t_out, v_mask).item()
-                    val_s_loss += student.compute_distill_loss(s_out, t_out, v_mask).item()
+                    T = img.shape[1]
+                    mem_t = teacher.init_memory(img.shape[0], device)
+                    mem_s = student.init_memory(img.shape[0], device)
+
+                    for t in range(T):
+                        with torch.cuda.amp.autocast():
+                            teacher_out, mem_t = teacher.forward_frame(img, txt, mem_t, t)
+                            student_out, mem_s = student.forward(img, txt, mem_s, t)
+
+                            val_t_loss += iou_loss(teacher_out, mask[:, t])
+                            val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t])
 
         val_loss = val_t_loss + val_s_loss
         trial.report(val_loss, epoch)

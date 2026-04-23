@@ -29,6 +29,37 @@ def iou_loss(pred_masks, true_masks):
     iou = (intersection + 1e-6) / (union + 1e-6)
     return (1.0 - iou.mean()) + bce
 
+class PatchVisionEncoder(nn.Module):
+    def __init__(self, image_feature_dim=128, patch_size=16,
+                 num_transformer_layers=2, num_heads=4):
+        super().__init__()
+        self.patch_size = patch_size
+        self.patch_embed = nn.Conv2d(
+            3, image_feature_dim,
+            kernel_size=patch_size, stride=patch_size
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=image_feature_dim,
+            nhead=num_heads,
+            dim_feedforward=image_feature_dim * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_transformer_layers
+        )
+ 
+    def forward(self, x):
+        # x: [B, 3, H, W]
+        x = self.patch_embed(x)
+        B, C, Hp, Wp = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.transformer(x)
+        x = x.transpose(1, 2).reshape(B, C, Hp, Wp)
+        return x
+
 class DistilledMemoryStudent(nn.Module):
     def __init__(self,
                  vocab_size=49408,
@@ -36,11 +67,11 @@ class DistilledMemoryStudent(nn.Module):
                  text_embed_dim=128,
                  text_transformer_layers=2,
                  text_transformer_heads=4,
-                 image_input_channels=3,
                  image_feature_dim=128,
                  output_mask_channels=1, 
                  fixed_intermediate_spatial_size=(16, 16),
                  max_memory_length=10,
+                 num_encoder_layers=2,
                  num_decoder_layers=2):
         super().__init__()
 
@@ -67,21 +98,17 @@ class DistilledMemoryStudent(nn.Module):
         )
 
         # --- Image Encoder ---
-        self.image_encoder = nn.Sequential(
-            nn.Conv2d(image_input_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32), 
-            nn.GELU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(16, 64),
-            nn.GELU(),
-            nn.Conv2d(64, image_feature_dim, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(min(16, image_feature_dim // 4 if image_feature_dim >=4 else image_feature_dim), image_feature_dim), 
-            nn.GELU()
+        self.image_encoder = PatchVisionEncoder(
+            image_feature_dim=image_feature_dim,
+            patch_size=16,
+            num_transformer_layers=num_encoder_layers,
+            num_heads=max(1, image_feature_dim // 32)
         )
         self.adaptive_pool = nn.AdaptiveAvgPool2d(fixed_intermediate_spatial_size)
 
         # --- Mask Cross Attention ---
         fusion_dim = image_feature_dim
+        self.temporal_enc = nn.Embedding(512, fusion_dim)
         num_spatial_tokens = self.fixed_intermediate_H * self.fixed_intermediate_W
         self.spatial_pos_embed = nn.Parameter(
             torch.randn(1, num_spatial_tokens, fusion_dim) * 0.02
@@ -114,74 +141,71 @@ class DistilledMemoryStudent(nn.Module):
             nn.GELU(),
             nn.Conv2d(32, output_mask_channels, kernel_size=1)
         )
+    
+    def init_memory(self, batch_size, device):
+        return torch.zeros(
+            batch_size, 0, self.image_feature_dim,
+            self.fixed_intermediate_H, self.fixed_intermediate_W,
+            device=device
+        )
         
-    def forward(self, images, text_tokens):
-        # Handle single image input by adding time dimension
-        if images.ndim == 4: 
-            images = images.unsqueeze(1)
+    def forward(self, image, text_tokens, memory_queue=None, frame_idx=0):
+        if image.ndim == 5:
+            assert image.shape[1] == 1, "Iterate T in the caller; pass one frame at a time."
+            image = image.squeeze(1)
         
-        B, T, C, H, W = images.shape
-        device = images.device
+        B, C, H, W = image.shape
+        device = image.device
 
-        # --- Process Text ---
+        if memory_queue is None:
+            self.init_memory(B, device)
+        fusion_dim = self.image_feature_dim
+
+        # 1. Process Text
         text_embeds = self.token_embed(text_tokens)
         text_embeds = text_embeds + self.pos_embed[:, :text_tokens.size(1), :]
-        
-        # Transformer encoding
         text_features_seq = self.text_transformer(text_embeds)
 
-        # --- Initialize Memory Queue ---
-        fusion_dim = self.image_feature_dim
-        
+        # 2. Process Frame
+        img_feats_raw = self.image_encoder(image)
+        img_feats_pooled = self.adaptive_pool(img_feats_raw)
+        img_tokens = img_feats_pooled.flatten(2).transpose(1, 2)
+        img_tokens = img_tokens + self.spatial_pos_embed
+ 
+        # 3. Combine and Generate Mask 
+        fused_tokens = self.fusion_decoder(
+            tgt=img_tokens,
+            memory=text_features_seq
+        )
+        fused_tokens = self.fusion_norm(fused_tokens)
+        fused_spatial = fused_tokens.transpose(1, 2).view(
+            B, fusion_dim, self.fixed_intermediate_H, self.fixed_intermediate_W
+        )
+        t_id = torch.clamp(torch.tensor([frame_idx], device=device), 0, 511)
+        t_emb = self.temporal_enc(t_id)
+        t_emb = t_emb.view(1, fusion_dim, 1, 1).expand(B, -1,
+                    self.fixed_intermediate_H, self.fixed_intermediate_W)
+        fused_spatial = fused_spatial + t_emb
+
         if self.max_memory_length > 0:
-            memory_queue = torch.zeros(
-                B, self.max_memory_length, fusion_dim, 
-                self.fixed_intermediate_H, self.fixed_intermediate_W
-            ).to(device)
-        
-        output_masks = []
-
-        # --- Process Frames ---
-        for t in range(T):
-            current_frame = images[:, t]
-
-            img_feats_raw = self.image_encoder(current_frame) 
-            img_feats_pooled = self.adaptive_pool(img_feats_raw)
-
-            img_tokens = img_feats_pooled.flatten(2).transpose(1, 2)  # (B, H'*W', img_dim)
-            img_tokens = img_tokens + self.spatial_pos_embed
- 
-            # Cross-attention: image tokens (tgt) attend to text tokens (memory)
-            fused_tokens = self.fusion_decoder(
-                tgt=img_tokens,
-                memory=text_features_seq
-            )  # (B, H'*W', fusion_dim)
-            fused_tokens = self.fusion_norm(fused_tokens)
- 
-            # Reshape back to spatial feature map
-            fused_spatial = fused_tokens.transpose(1, 2).view(
-                B, fusion_dim, self.fixed_intermediate_H, self.fixed_intermediate_W
+            memory_queue = torch.cat(
+                [memory_queue, fused_spatial.unsqueeze(1)], dim=1
             )
+            if memory_queue.shape[1] > self.max_memory_length:
+                memory_queue = memory_queue[:, -self.max_memory_length:]
+            features_for_decoder = memory_queue.mean(dim=1)
+        else:
+            features_for_decoder = fused_spatial
 
-            if self.max_memory_length > 0:
-                memory_queue = torch.cat((memory_queue[:, 1:], fused_spatial.unsqueeze(1)), dim=1)
-                features_for_decoder = memory_queue.mean(dim=1)
-            else:
-                features_for_decoder = fused_spatial
-
-            mask_logits = self.mask_decoder(features_for_decoder)
-            mask_final = F.interpolate(
-                mask_logits, 
-                size=(H, W), 
-                mode='bilinear', 
-                align_corners=False
-            )
-            
-            output_masks.append(mask_final)
-
-        final_masks = torch.stack(output_masks, dim=1)
+        mask_logits = self.mask_decoder(features_for_decoder)
+        mask_final = F.interpolate(
+            mask_logits, 
+            size=(H, W), 
+            mode='bilinear', 
+            align_corners=False
+        )
         
-        return final_masks.squeeze(2)
+        return mask_final.squeeze(1), memory_queue
             
     def compute_distill_loss(self, student_masks, teacher_masks, true_masks):
         # Distillation

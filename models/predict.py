@@ -15,6 +15,8 @@ class TeacherModel(torch.nn.Module):
         text_tokens = CLIPTokenize(text)
         text_emb = self.text_encoder(text_tokens)
         prior_emb = self.prior(text_emb)
+        
+
         result = self.sam_decoder(images, prior_emb)
         return result
     

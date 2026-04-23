@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-def create_SAM(max_memory_length=10, num_layers = 2):
+def create_SAM(max_memory_length=10, enc_num_layers = 2, dec_num_layers = 2):
     return VideoSAM(
         max_memory_length=max_memory_length,
-        num_layers=num_layers
+        enc_num_layers=enc_num_layers,
+        dec_num_layers=dec_num_layers
         )
 
 # Loss for overall model (Binary Cross Entropy + IoU Loss)
@@ -56,40 +57,27 @@ class UnifiedPositionalEncoding(nn.Module):
 
         return x + spatial_encoding + temporal_encoding
 
-class AdaptiveVisionEncoder(nn.Module):
-    def __init__(self, embed_dim=512, base_channels=64):
+class PatchVisionEncoder(nn.Module):
+    def __init__(self, embed_dim=768, patch_size=16, num_layers = 2, num_heads = 8):
         super().__init__()
-        self.embed_dim = embed_dim
-        
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, base_channels, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, base_channels),
-            nn.GELU()
+        self.patch_size = patch_size
+        self.patch_embed = nn.Conv2d(
+            3, embed_dim,
+            kernel_size=patch_size, stride=patch_size
         )
-        
-        self.block1 = self._make_conv_block(base_channels, base_channels * 2, stride=2)
-        self.block2 = self._make_conv_block(base_channels * 2, base_channels * 4, stride=2)
-        self.block3 = self._make_conv_block(base_channels * 4, embed_dim, stride=1)
-        
-        self.feature_projection = nn.Conv2d(embed_dim, embed_dim, kernel_size=1)
-
-    def _make_conv_block(self, in_c, out_c, stride):
-        return nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=3, stride=stride, padding=1),
-            nn.GroupNorm(min(16, out_c // (out_c // 16 if out_c >=16 else 1) ), out_c),
-            nn.GELU(),
-            nn.Conv2d(out_c, out_c, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(min(16, out_c // (out_c // 16 if out_c >=16 else 1) ), out_c),
-            nn.GELU()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            batch_first=True, norm_first=True
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    #Input needs to be of form [B, 3, H, W]
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.feature_projection(x)
+    def forward(self, x):
+        x = self.patch_embed(x)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.transformer(x)
+        x = x.transpose(1, 2).reshape(B, C, H, W)
         return x
 
 class FrameTransformerDecoder(nn.Module):
@@ -160,72 +148,69 @@ class VideoSAM(nn.Module):
                  mem_size=1,
                  max_memory_length=10,
                  fixed_encoder_size=(14, 14),
-                 num_layers = 2):
+                 dec_num_layers = 2,
+                 enc_num_layers = 2):
         super().__init__()
         self.embed_dim = embed_dim
         self.mem_size = mem_size
         self.max_memory_length = max_memory_length
         self.fixed_encoder_size = fixed_encoder_size
 
-        self.image_encoder = AdaptiveVisionEncoder(embed_dim=embed_dim)
+        self.image_encoder = PatchVisionEncoder(embed_dim=embed_dim, num_layers=enc_num_layers, num_heads = max(1, embed_dim // 96))
         
         if embed_dim == prior_dim:
             self.prior_proj = nn.Identity()
         else:
             self.prior_proj = nn.Linear(prior_dim, embed_dim)
         
-        self.adaptive_pool = nn.AdaptiveAvgPool2d(fixed_encoder_size)
         self.pos_enc = UnifiedPositionalEncoding(embed_dim=embed_dim)
-        
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(fixed_encoder_size)
+
         self.object_queries = nn.Parameter(torch.randn(1, mem_size, embed_dim))
-        self.decoder = FrameTransformerDecoder(embed_dim=embed_dim, num_layers=num_layers)
+        self.decoder = FrameTransformerDecoder(embed_dim=embed_dim, num_layers=dec_num_layers)
 
-    def forward(self, images: torch.Tensor, prior_grid: torch.Tensor):
-        if images.ndim == 4:
-            images = images.unsqueeze(1) 
+    def init_memory(self, batch_size, device):
+        return torch.zeros(batch_size, 0, self.embed_dim, device=device)
+
+    def forward(self, image: torch.Tensor, prior_grid: torch.Tensor, memory_queue=None, frame_idx=0):
+        if image.ndim == 5:
+            assert image.shape[1] == 1, "Iterate T in the caller; pass one frame at a time."
+            image = image.squeeze(1)
             
-        B, T, C, H, W = images.shape
-        device = images.device
+        B, C, H, W = image.shape
+        device = image.device
 
+        if memory_queue is None:
+            memory_queue = self.init_memory(B, device)
+
+        # 1. Process Prior grid
         prior_embed = self.prior_proj(prior_grid)
-        
         H_grid, W_grid = self.fixed_encoder_size
         prior_spatial = prior_embed.transpose(1, 2).reshape(B, self.embed_dim, H_grid, W_grid)
 
-        # 2. Initialize Memory
-        memory_queue = torch.zeros(B, 0, self.embed_dim, device=device)
-        output_masks = []
+        # 2. Process Frame
+        img_enc = F.interpolate(image, size=(256,256), mode='bilinear', align_corners=False)
+        img_feat = self.image_encoder(img_enc)
+        img_feat = self.adaptive_pool(img_feat)
+            
+        # 3. Combine and generate mask
+        conditioned_feat = img_feat + prior_spatial
+        encoded_context = self.pos_enc(conditioned_feat, frame_idx)
+        mask_logits, updated_query = self.decoder(
+            current_image_features=encoded_context,
+            memory_queue=memory_queue,
+            object_queries=self.object_queries.expand(B, -1, -1),
+            original_size=(H, W)
+        )
 
-        # 3. Process Frames
-        for t in range(T):
-            current_img = images[:, t] 
-            
-            img_feat = self.image_encoder(current_img) 
-            img_feat = self.adaptive_pool(img_feat)    
-            
-            conditioned_feat = img_feat + prior_spatial
-            
-            encoded_context = self.pos_enc(conditioned_feat, t)
-            
-            mask_logits, updated_query = self.decoder(
-                current_image_features=encoded_context,
-                memory_queue=memory_queue,
-                object_queries=self.object_queries.expand(B, -1, -1),
-                original_size=(H, W)
-            )
-            
-            output_masks.append(mask_logits)
-
-            if self.max_memory_length > 0:
-                current_mem = updated_query 
-                memory_queue = torch.cat([memory_queue, current_mem], dim=1)
-                
-                if memory_queue.shape[1] > self.max_memory_length * self.mem_size:
-                    memory_queue = memory_queue[:, -self.max_memory_length * self.mem_size:, :]
-        
-        final_output = torch.cat(output_masks, dim=1)
-            
-        return final_output
+        # 4. Update memory
+        if self.max_memory_length > 0:
+            memory_queue = torch.cat([memory_queue, updated_query], dim=1)
+            cap = self.max_memory_length * self.mem_size
+            if memory_queue.shape[1] > cap:
+                memory_queue = memory_queue[:, -cap:]
+         
+        return mask_logits.squeeze(1), memory_queue
     
     def load_weights(self, filename):
         state_dict = torch.load(filename)

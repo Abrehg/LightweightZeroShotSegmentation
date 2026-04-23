@@ -117,7 +117,7 @@ def get_latest_epoch_checkpoint(directory, prefix):
     for f_path in files:
         filename = os.path.basename(f_path)
         
-        match_complete = re.search(rf"{prefix}_epoch_(\d+)_complete", filename)
+        match_complete = re.search(rf"{prefix}_epoch_(\d+)_complete_([0-9]+(?:\.[0-9]+)?)", filename)
         if match_complete:
             ep = int(match_complete.group(1))
             ba = float('inf')
@@ -157,6 +157,12 @@ def get_best_weights_checkpoint(directory, prefix):
     
     for f_path in files:
         filename = os.path.basename(f_path)
+        match_complete = re.search(rf"{prefix}_epoch_(\d+)_complete_([0-9]+(?:\.[0-9]+)?)", filename)
+        if match_complete:
+            ep, loss = int(match_new.group(1)), float(match_new.group(2))
+            if loss < best_loss:
+                best_loss, best_file, best_epoch, best_batch = loss, f_path, ep, 0
+
         match_new = re.search(rf"{prefix}_epoch_(\d+)_batch_(\d+)_([0-9]+(?:\.[0-9]+)?)", filename)
         if match_new:
             ep, ba, loss = int(match_new.group(1)), int(match_new.group(2)), float(match_new.group(3))
@@ -325,13 +331,38 @@ def train_clip(chunk_manager:ChunkedLAIONManager, text_start_weights, img_start_
 
         if is_main_process():
             avg_epoch_loss = total_loss / max(1, global_batch_idx)
-            print(f"CLIP Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}")
+            print(f"CLIP Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}, "
+                  f"LR: {scheduler.get_last_lr()[0]:.2e}")
+            clip_model.eval()
+            val_loss = 0.0
+            iters = 0
+            with torch.no_grad():
+                for v_batch in val_loader:
+                    if v_batch is None: continue
+                    v_images, v_texts = v_batch
+
+                    v_images = v_images.to(device)
+                    v_texts = v_texts.to(device)
+            
+                    # Forward pass
+                    text_features, image_features, v_scale = clip_model(v_texts, v_images)
+            
+                    # Contrastive loss
+                    v_logits_per_image = v_scale * image_features @ text_features.t()
+                    v_logits_per_text = v_scale * text_features @ image_features.t()
+                    loss = clip_contrastive_loss(v_logits_per_image, v_logits_per_text)
+            
+                    # Backprop
+                    val_loss += loss.item()
+                    iters += 1
+                        
+            avg_val = val_loss / iters if iters > 0 else 999.9
             clip_model.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"],
-                f"clip_text_epoch_{epoch+1}_complete",
-                f"clip_image_epoch_{epoch+1}_complete",
-                f"clip_wrapper_epoch_{epoch+1}_complete")
-
+                f"clip_text_epoch_{epoch+1}_complete_{avg_val:.4f}",
+                f"clip_image_epoch_{epoch+1}_complete_{avg_val:.4f}",
+                f"clip_wrapper_epoch_{epoch+1}_complete_{avg_val:.4f}")
+            print(f"Saved CLIP epoch {epoch+1}(Val Loss: {avg_val:.4f})")
     chunk_manager.shutdown()
     print("CLIP training completed.")
 
@@ -349,8 +380,10 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
     text_encoder.load_weights(best_clip_text_ckpt)
     
     for param in text_encoder.parameters(): param.requires_grad_(False)
+    text_encoder.half()
     text_encoder.eval()
     for param in prior_teacher.parameters(): param.requires_grad_(False)
+    prior_teacher.half()
     prior_teacher.eval()
 
     prior_model = create_prior().to(local_device)
@@ -479,11 +512,33 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
 
         if is_main_process():
             avg_epoch_loss = total_loss / max(1, global_batch_idx)
-            print(f"Prior Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}")
+            print(f"Prior Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.4f}, "
+                  f"LR: {scheduler.get_last_lr()[0]:.2e}")
+            prior.eval()
+            val_loss = 0.0
+            iters = 0
+            with torch.no_grad():
+                for v_batch in val_loader:
+                    if v_batch is None: continue
+
+                    v_images, v_texts = v_batch
+
+                    v_texts = v_texts.to(local_device)
+                    v_images = v_images.to(local_device)
+
+                    v_text_emb = text_encoder(v_texts)
+                    v_target_grid = prior_teacher(v_images)
+                    v_prior_grid = prior(v_text_emb)
+
+                    val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
+
+                    iters += 1
+                
+            avg_val = val_loss / iters if iters > 0 else 999.9
             prior.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
-                f"prior_epoch_{epoch+1}_complete")
-            
+                f"prior_epoch_{epoch+1}_complete_{avg_val:.4f}")
+            print(f"Saved Prior epoch {epoch+1} (Val Loss: {avg_val:.4f})")
     chunk_manager.shutdown()   
     print("Prior training completed.\n")
 
@@ -522,18 +577,23 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
             self.prior = prior
             self.sam_decoder = sam_decoder
 
-        def forward(self, x, text_tokens):
+        def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
+                text_emb  = self.text_encoder(text_tokens)
                 prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
+            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+            return mask, new_memory
+ 
+        def init_memory(self, B, device):
+            return self.sam_decoder.init_memory(B, device)
 
     teacher = TeacherModel().to(local_device)
 
     for param in teacher.text_encoder.parameters(): param.requires_grad_(False)
     for param in teacher.prior.parameters(): param.requires_grad_(False)
+    teacher.text_encoder.half()
     teacher.text_encoder.eval()
+    teacher.prior.half()
     teacher.prior.eval()
             
     print("[Teacher Training] Training SAM decoder...")
@@ -573,12 +633,16 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                 mask = mask.to(local_device).float()
                 img = img.to(local_device)
                 txt = txt.to(local_device)
+                T = img.shape[1]
+                memory = teacher.init_memory(img.shape[0], device)
 
-                pred_mask = teacher.forward(img, txt)
-                loss = iou_loss(pred_mask, mask)
-                loss.backward()
+                for t in range(T):
+                    pred_mask, new_memory = teacher.forward_frame(img, txt, memory, t)
+                    loss = iou_loss(pred_mask, mask[:, t])
+                    loss.backward()
+                    memory = new_memory.detach()
                 
-                current_batch_loss_sum += loss.item()
+                    current_batch_loss_sum += loss.item()
                 num_samples_in_batch += 1
         
             optimizer_sam_decoder.step()
@@ -612,9 +676,12 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                             v_img = v_img.to(local_device)
                             v_txt = v_txt.to(local_device)
 
-                            v_pred = teacher.forward(v_img, v_txt)
+                            T = img.shape[1]
+                            memory = teacher.init_memory(img.shape[0], device)
 
-                            val_loss += iou_loss(v_pred, v_mask).item()
+                            for t in range(T):
+                                v_pred, memory = teacher.forward_frame(v_img, v_txt, memory, t)
+                                val_loss += iou_loss(v_pred, v_mask[:,t]).item()
                             num_val_samples += 1
                         
                 avg_val = val_loss / num_val_samples if num_val_samples > 0 else 999.9
@@ -628,13 +695,34 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
         if is_main_process():
             avg_epoch_loss = total_loss / batch_count if batch_count > 0 else 0
             print(f"SAM Decoder Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
+            teacher.sam_decoder.eval()
+            val_loss = 0.0
+            num_val_samples = 0
+            with torch.no_grad():
+                for v_batch in val_dataloader:
+                    if v_batch is None: continue
+                    v_images, v_true_masks, v_texts = v_batch
 
+                    for v_img, v_mask, v_txt in zip(v_images, v_true_masks, v_texts):
+                        v_mask = v_mask.to(local_device).float()
+                        v_img = v_img.to(local_device)
+                        v_txt = v_txt.to(local_device)
+
+                        T = img.shape[1]
+                        memory = teacher.init_memory(img.shape[0], device)
+
+                        for t in range(T):
+                            v_pred, memory = teacher.forward_frame(v_img, v_txt, memory, t)
+                            val_loss += iou_loss(v_pred, v_mask[:,t]).item()
+
+                        num_val_samples += 1
+                        
+            avg_val = val_loss / num_val_samples if num_val_samples > 0 else 999.9
             teacher.sam_decoder.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
-                f"sam_decoder_epoch_{epoch+1}_complete"
+                f"sam_decoder_epoch_{epoch+1}_complete_{avg_val:.4f}"
             )
-            print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
-
+            print(f"Saved SAM Decoder epoch {epoch+1} (Val Loss: {avg_val:.4f})")
     print("SAM Decoder training completed.\n")
 
 # ======== SAM Student Training ========
@@ -662,8 +750,10 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
     sam_decoder.load_weights(best_sam_decoder_ckpt)
 
     for param in text_encoder.parameters(): param.requires_grad_(False)
+    text_encoder.half()
     text_encoder.eval()
     for param in prior.parameters(): param.requires_grad_(False)
+    prior.half()
     prior.eval()
 
     sam_decoder = DDP(sam_decoder, device_ids=[int(os.environ["LOCAL_RANK"])])
@@ -675,12 +765,15 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
             self.prior = prior
             self.sam_decoder = sam_decoder
 
-        def forward(self, x, text_tokens):
+        def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
-                text_emb = self.text_encoder(text_tokens)
+                text_emb  = self.text_encoder(text_tokens)
                 prior_emb = self.prior(text_emb)
-            result = self.sam_decoder(x, prior_emb)
-            return result
+            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+            return mask, new_memory
+ 
+        def init_memory(self, B, device):
+            return self.sam_decoder.init_memory(B, device)
 
     teacher = TeacherModel().to(local_device)
     student = create_Student().to(local_device)
@@ -746,20 +839,28 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 img = img.to(local_device)
                 txt = txt.to(local_device)
 
-                teacher_out = teacher(img, txt)
-                student_out = student(img, txt)
+                T = img.shape[1]
+                mem_t = teacher.init_memory(img.shape[0], device)
+                mem_s = student.init_memory(img.shape[0], device)
+
+                for t in range(T):
+                    teacher_out, mem_t_new = teacher.forward_frame(img, txt, mem_t, t)
+                    student_out, mem_s_new = student.forward(img, txt, mem_s, t)
                 
-                with torch.no_grad():
-                    teacher_out_for_student = teacher(img, txt).detach()
+                    with torch.no_grad():
+                        teacher_out_for_student = teacher.forward_frame(img, txt, mem_t, t).detach()
 
-                teacher_loss = iou_loss(teacher_out, mask)
-                student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask)
+                    teacher_loss = iou_loss(teacher_out, mask[:, t])
+                    student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask[:, t])
 
-                teacher_loss.backward(retain_graph=True)
-                student_loss.backward()
+                    teacher_loss.backward(retain_graph=True)
+                    student_loss.backward()
 
-                current_batch_teacher_loss_sum += teacher_loss.item()
-                current_batch_student_loss_sum += student_loss.item()
+                    current_batch_teacher_loss_sum += teacher_loss.item()
+                    current_batch_student_loss_sum += student_loss.item()
+
+                    mem_t = mem_t_new.detach()
+                    mem_s = mem_s_new.detach()
                 num_samples_in_batch += 1
                     
             optimizer_teacher_finetune.step()
@@ -800,11 +901,16 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                             v_img = v_img.to(local_device)
                             v_txt = v_txt.to(local_device)
 
-                            t_out = teacher(v_img, v_txt)
-                            s_out = student(v_img, v_txt)
-                            
-                            val_t_loss += iou_loss(t_out, v_mask).item()
-                            val_s_loss += student.module.compute_distill_loss(s_out, t_out, v_mask).item()
+                            T = img.shape[1]
+                            mem_t = teacher.init_memory(img.shape[0], device)
+                            mem_s = student.init_memory(img.shape[0], device)
+
+                            for t in range(T):
+                                teacher_out, mem_t = teacher.forward_frame(img, txt, mem_t, t)
+                                student_out, mem_s = student.forward(img, txt, mem_s, t)
+
+                                val_t_loss += iou_loss(teacher_out, mask[:, t]).item()
+                                val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t]).item()
 
                             num_val_samples += 1
                         
@@ -817,7 +923,7 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 student.module.store_weights(
                     HYPERPARAMS["CHECKPOINT_DIR"], 
                     f"student_phase_student_epoch_{epoch+1}_batch_{batch_idx}_{avg_s_val:.4f}")
-                print(f"Saved Joint Phase partial epoch {epoch+1} batch {batch_idx}")
+                print(f"Saved Joint Phase partial epoch {epoch+1} batch {batch_idx}(Teacher Val Loss: {avg_t_val:.4f}, Student Val Loss: {avg_s_val:.4f})")
                 
                 teacher.sam_decoder.train()
                 student.train()
@@ -826,14 +932,41 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
             avg_epoch_teacher_loss = total_teacher_loss / batch_count if batch_count > 0 else 0
             avg_epoch_student_loss = total_student_loss / batch_count if batch_count > 0 else 0
             print(f"Student Epoch {epoch+1} Avg Losses - Teacher: {avg_epoch_teacher_loss:.4f}, Student: {avg_epoch_student_loss:.4f}")
+            teacher.sam_decoder.eval()
+            student.eval()
+            val_t_loss, val_s_loss = 0.0, 0.0
+            num_val_samples = 0
+            with torch.no_grad():
+                for v_batch in val_dataloader:
+                    if v_batch is None: continue
+                    v_images, v_true_masks, v_texts = v_batch
+                    for v_img, v_mask, v_txt in zip(v_images, v_true_masks, v_texts):
+                        v_mask = v_mask.to(local_device).float()
+                        v_img = v_img.to(local_device)
+                        v_txt = v_txt.to(local_device)
 
+                        T = img.shape[1]
+                        mem_t = teacher.init_memory(img.shape[0], device)
+                        mem_s = student.init_memory(img.shape[0], device)
+
+                        for t in range(T):
+                            teacher_out, mem_t = teacher.forward_frame(img, txt, mem_t, t)
+                            student_out, mem_s = student.forward(img, txt, mem_s, t)
+
+                            val_t_loss += iou_loss(teacher_out, mask[:, t]).item()
+                            val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t]).item()
+
+                        num_val_samples += 1
+                        
+            avg_t_val = val_t_loss / num_val_samples if num_val_samples > 0 else 999.9
+            avg_s_val = val_s_loss / num_val_samples if num_val_samples > 0 else 999.9
             teacher.sam_decoder.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
-                f"student_phase_teacher_epoch_{epoch+1}_complete")
+                f"student_phase_teacher_epoch_{epoch+1}_complete_{avg_t_val:.4f}")
             student.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
-                f"student_phase_student_epoch_{epoch+1}_complete")
-            print(f"Epoch {epoch+1} fully complete. Saved complete flag checkpoints.")
+                f"student_phase_student_epoch_{epoch+1}_complete_{avg_s_val:.4f}")
+            print(f"Saved Joint Phase partial epoch {epoch+1} batch {batch_idx}(Teacher Val Loss: {avg_t_val:.4f}, Student Val Loss: {avg_s_val:.4f})")
     print("Student training completed.\n")
 
 def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_count=None, skip_tars=0):

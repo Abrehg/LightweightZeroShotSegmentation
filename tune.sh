@@ -48,7 +48,8 @@ WEIGHTS_DIR="$PROJECT_DIR/models/trained"
 # Update these after each phase completes with the best trial values.
 TXT_ENC_LAYERS=6
 PRIOR_LAYERS=8
-SAM_LAYERS=2
+SAM_ENC_LAYERS=2
+SAM_DEC_LAYERS=2
 SAM_MEMORY=10
 TEACHER_WARMUP_EPOCHS=3
 
@@ -175,7 +176,8 @@ fi
 
 if [ "$PHASE" = "student" ]; then
     CMD="$CMD \
-    --sam_layers $SAM_LAYERS \
+    --sam_enc_layers $SAM_ENC_LAYERS \
+    --sam_dec_layers $SAM_DEC_LAYERS \
     --sam_memory $SAM_MEMORY \
     --teacher_warmup_epochs $TEACHER_WARMUP_EPOCHS"
 fi

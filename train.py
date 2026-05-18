@@ -67,6 +67,8 @@ HYPERPARAMS = {
     "MIN_LR_RATIO": 0.01,
     "LAION_VAL_SIZE": 10000,
     "LAION_BATCH_SIZE": 128,
+    "CLIP_BATCH_SIZE":128,
+    "PRIOR_BATCH_SIZE":64,
     "LAION_CACHE_SAMPLES": 200000,
     "LAION_CHUNK_SIZE": 10000,
     "SA_VAL_TAR_COUNT": 1,  
@@ -74,6 +76,7 @@ HYPERPARAMS = {
     "SAV_VAL_TAR_COUNT": 1,
     "SAV_VAL_SAMPLE_COUNT": 5000,
     "SAM_BATCH_SIZE": 512,
+    "STUDENT_BATCH_SIZE": 512,
     "EST_SAMPLES_PER_TAR": 10000,
     "SAVE_FREQ": 50,
     "CHECKPOINT_DIR": "weights",
@@ -189,7 +192,8 @@ def create_lr_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps, min_
 
 # ======== CLIP Training ========
 def train_clip(chunk_manager:ChunkedLAIONManager, text_start_weights, img_start_weights, wrapper_start_weights, run: wandb, start_epoch = 0, start_batch = 0):
-    print("\n=== Training CLIP ===")
+    if is_main_process():
+        print("\n=== Training CLIP ===")
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
     text_encoder = create_text_encoder().to(local_device)
@@ -364,11 +368,13 @@ def train_clip(chunk_manager:ChunkedLAIONManager, text_start_weights, img_start_
                 f"clip_wrapper_epoch_{epoch+1}_complete_{avg_val:.4f}")
             print(f"Saved CLIP epoch {epoch+1}(Val Loss: {avg_val:.4f})")
     chunk_manager.shutdown()
-    print("CLIP training completed.")
+    if is_main_process():
+        print("CLIP training completed.")
 
 # ======== Prior Training ========
 def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, start_epoch = 0, start_batch = 0):
-    print("\n=== Training Prior ===")
+    if is_main_process():
+        print("\n=== Training Prior ===")
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
     text_encoder = create_text_encoder().to(local_device)
@@ -376,7 +382,8 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
     
     best_clip_text_ckpt, _, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
     if not best_clip_text_ckpt: raise FileNotFoundError("Latest CLIP text or image checkpoints not found. Train CLIP first.")
-    print(f"Text encoder weights: {best_clip_text_ckpt}")
+    if is_main_process():
+        print(f"Text encoder weights: {best_clip_text_ckpt}")
     text_encoder.load_weights(best_clip_text_ckpt)
     
     for param in text_encoder.parameters(): param.requires_grad_(False)
@@ -457,7 +464,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                 optimizer.zero_grad()
             
                 with torch.no_grad():
-                    text_emb = text_encoder(texts)
+                    text_emb = text_encoder(texts).float()
                     target_grid = prior_teacher(images)
             
                 prior_grid = prior(text_emb)
@@ -491,7 +498,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                             v_texts = v_texts.to(local_device)
                             v_images = v_images.to(local_device)
 
-                            v_text_emb = text_encoder(v_texts)
+                            v_text_emb = text_encoder(v_texts).float()
                             v_target_grid = prior_teacher(v_images)
                             v_prior_grid = prior(v_text_emb)
 
@@ -526,7 +533,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                     v_texts = v_texts.to(local_device)
                     v_images = v_images.to(local_device)
 
-                    v_text_emb = text_encoder(v_texts)
+                    v_text_emb = text_encoder(v_texts).float()
                     v_target_grid = prior_teacher(v_images)
                     v_prior_grid = prior(v_text_emb)
 
@@ -540,11 +547,13 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                 f"prior_epoch_{epoch+1}_complete_{avg_val:.4f}")
             print(f"Saved Prior epoch {epoch+1} (Val Loss: {avg_val:.4f})")
     chunk_manager.shutdown()   
-    print("Prior training completed.\n")
+    if is_main_process():
+        print("Prior training completed.\n")
 
 # ======== SAM Teacher Training ========
 def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wandb, start_epoch = 0, start_batch = 0):
-    print("\n=== Training SAM Decoder (Teacher Component) ===")
+    if is_main_process():
+        print("\n=== Training SAM Decoder (Teacher Component) ===")
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
     text_encoder = create_text_encoder().to(local_device)
@@ -553,12 +562,14 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
 
     best_clip_text_ckpt, _, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
     if not best_clip_text_ckpt: raise FileNotFoundError("CLIP text checkpoint not found for SAM Decoder training.")
-    print(f"Text encoder weights: {best_clip_text_ckpt}")
+    if is_main_process():
+        print(f"Text encoder weights: {best_clip_text_ckpt}")
     text_encoder.load_weights(best_clip_text_ckpt)
 
     best_prior_ckpt, _, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "prior")
     if not best_prior_ckpt: raise FileNotFoundError("Prior checkpoint not found for SAM Decoder training.")
-    print(f"Prior model weights: {best_prior_ckpt}")
+    if is_main_process():
+        print(f"Prior model weights: {best_prior_ckpt}")
     prior.load_weights(best_prior_ckpt)
 
     if start_epoch > 0:
@@ -580,12 +591,12 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
         def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
                 text_emb  = self.text_encoder(text_tokens)
-                prior_emb = self.prior(text_emb)
-            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+                prior_emb = self.prior(text_emb).float()
+            mask, new_memory = self.sam_decoder.module.forward(frame, prior_emb, memory, t)
             return mask, new_memory
  
         def init_memory(self, B, device):
-            return self.sam_decoder.init_memory(B, device)
+            return self.sam_decoder.module.init_memory(B, device)
 
     teacher = TeacherModel().to(local_device)
 
@@ -596,7 +607,6 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
     teacher.prior.half()
     teacher.prior.eval()
             
-    print("[Teacher Training] Training SAM decoder...")
     optimizer_sam_decoder = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["DECODER_LR"])
 
     estimated_total_steps = HYPERPARAMS["SAM_DECODER_EPOCHS"] * 2000
@@ -637,7 +647,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                 memory = teacher.init_memory(img.shape[0], device)
 
                 for t in range(T):
-                    pred_mask, new_memory = teacher.forward_frame(img, txt, memory, t)
+                    pred_mask, new_memory = teacher.forward_frame(img[:, t], txt, memory, t)
                     loss = iou_loss(pred_mask, mask[:, t])
                     loss.backward()
                     memory = new_memory.detach()
@@ -680,7 +690,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                             memory = teacher.init_memory(img.shape[0], device)
 
                             for t in range(T):
-                                v_pred, memory = teacher.forward_frame(v_img, v_txt, memory, t)
+                                v_pred, memory = teacher.forward_frame(v_img[:, t], v_txt, memory, t)
                                 val_loss += iou_loss(v_pred, v_mask[:,t]).item()
                             num_val_samples += 1
                         
@@ -712,7 +722,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                         memory = teacher.init_memory(img.shape[0], device)
 
                         for t in range(T):
-                            v_pred, memory = teacher.forward_frame(v_img, v_txt, memory, t)
+                            v_pred, memory = teacher.forward_frame(v_img[:, t], v_txt, memory, t)
                             val_loss += iou_loss(v_pred, v_mask[:,t]).item()
 
                         num_val_samples += 1
@@ -723,11 +733,13 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
                 f"sam_decoder_epoch_{epoch+1}_complete_{avg_val:.4f}"
             )
             print(f"Saved SAM Decoder epoch {epoch+1} (Val Loss: {avg_val:.4f})")
-    print("SAM Decoder training completed.\n")
+    if is_main_process():
+        print("SAM Decoder training completed.\n")
 
 # ======== SAM Student Training ========
 def train_student(train_dataloader, val_dataloader, teacher_start_weights, student_start_weights, run:wandb, start_epoch = 0, start_batch = 0):
-    print("\n=== Training Student (with Teacher Fine-tuning) ===")
+    if is_main_process():
+        print("\n=== Training Student (with Teacher Fine-tuning) ===")
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
     text_encoder = create_text_encoder().to(local_device)
@@ -742,11 +754,14 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
     if not best_prior_ckpt: raise FileNotFoundError("Prior ckpt not found for Student training.")
     if not best_sam_decoder_ckpt: raise FileNotFoundError("SAM Decoder ckpt not found for Student training.")
 
-    print(f"Text encoder weights: {best_clip_text_ckpt}")
+    if is_main_process():
+        print(f"Text encoder weights: {best_clip_text_ckpt}")
     text_encoder.load_weights(best_clip_text_ckpt)
-    print(f"Prior model weights: {best_prior_ckpt}")
+    if is_main_process():
+        print(f"Prior model weights: {best_prior_ckpt}")
     prior.load_weights(best_prior_ckpt)
-    print(f"SAM decoder weights: {best_sam_decoder_ckpt}")
+    if is_main_process():
+        print(f"SAM decoder weights: {best_sam_decoder_ckpt}")
     sam_decoder.load_weights(best_sam_decoder_ckpt)
 
     for param in text_encoder.parameters(): param.requires_grad_(False)
@@ -768,12 +783,12 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
         def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
                 text_emb  = self.text_encoder(text_tokens)
-                prior_emb = self.prior(text_emb)
-            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
+                prior_emb = self.prior(text_emb).float()
+            mask, new_memory = self.sam_decoder.module.forward(frame, prior_emb, memory, t)
             return mask, new_memory
  
         def init_memory(self, B, device):
-            return self.sam_decoder.init_memory(B, device)
+            return self.sam_decoder.module.init_memory(B, device)
 
     teacher = TeacherModel().to(local_device)
     student = create_Student().to(local_device)
@@ -810,7 +825,6 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
         if is_main_process():
             print("[Sync] All ranks ready. Starting joint training loop.")
 
-    print("[Joint Training] Starting joint training")
     for epoch in range(start_epoch, HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]):
         teacher.sam_decoder.train()
         student.train()
@@ -844,11 +858,12 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 mem_s = student.init_memory(img.shape[0], device)
 
                 for t in range(T):
-                    teacher_out, mem_t_new = teacher.forward_frame(img, txt, mem_t, t)
-                    student_out, mem_s_new = student.forward(img, txt, mem_s, t)
+                    teacher_out, mem_t_new = teacher.forward_frame(img[:, t], txt, mem_t, t)
+                    student_out, mem_s_new = student.forward(img[:, t], txt, mem_s, t)
                 
                     with torch.no_grad():
-                        teacher_out_for_student = teacher.forward_frame(img, txt, mem_t, t).detach()
+                        teacher_out_for_student = teacher_out.detach()
+                        #teacher_out_for_student = teacher.forward_frame(img[:, t], txt, mem_t, t).detach()
 
                     teacher_loss = iou_loss(teacher_out, mask[:, t])
                     student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask[:, t])
@@ -906,8 +921,8 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                             mem_s = student.init_memory(img.shape[0], device)
 
                             for t in range(T):
-                                teacher_out, mem_t = teacher.forward_frame(img, txt, mem_t, t)
-                                student_out, mem_s = student.forward(img, txt, mem_s, t)
+                                teacher_out, mem_t = teacher.forward_frame(img[:, t], txt, mem_t, t)
+                                student_out, mem_s = student.forward(img[:, t], txt, mem_s, t)
 
                                 val_t_loss += iou_loss(teacher_out, mask[:, t]).item()
                                 val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t]).item()
@@ -950,8 +965,8 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                         mem_s = student.init_memory(img.shape[0], device)
 
                         for t in range(T):
-                            teacher_out, mem_t = teacher.forward_frame(img, txt, mem_t, t)
-                            student_out, mem_s = student.forward(img, txt, mem_s, t)
+                            teacher_out, mem_t = teacher.forward_frame(img[:, t], txt, mem_t, t)
+                            student_out, mem_s = student.forward(img[:, t], txt, mem_s, t)
 
                             val_t_loss += iou_loss(teacher_out, mask[:, t]).item()
                             val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t]).item()
@@ -967,7 +982,8 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 HYPERPARAMS["CHECKPOINT_DIR"], 
                 f"student_phase_student_epoch_{epoch+1}_complete_{avg_s_val:.4f}")
             print(f"Saved Joint Phase partial epoch {epoch+1} batch {batch_idx}(Teacher Val Loss: {avg_t_val:.4f}, Student Val Loss: {avg_s_val:.4f})")
-    print("Student training completed.\n")
+    if is_main_process():
+        print("Student training completed.\n")
 
 def get_dataset(dataset_cls, file_list, split_name, val_tar_count, val_sample_count=None, skip_tars=0):
     base_dir = os.path.dirname(os.path.abspath(__file__))

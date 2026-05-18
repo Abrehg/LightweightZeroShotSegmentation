@@ -15,6 +15,14 @@ def create_SAM(max_memory_length=10, enc_num_layers = 2, dec_num_layers = 2):
 # true_masks -> masks in dataset
 def iou_loss(pred_masks, true_masks):
     true_masks = true_masks.float().view_as(pred_masks)
+    if true_masks.shape != pred_masks.shape:
+        B = pred_masks.shape[0]
+        H, W = pred_masks.shape[-2], pred_masks.shape[-1]
+        true_masks = F.interpolate(
+            true_masks.reshape(B, 1, *true_masks.shape[-2:]),
+            size=(H, W),
+            mode='nearest'
+        ).reshape_as(pred_masks)
     bce = F.binary_cross_entropy_with_logits(pred_masks, true_masks)
 
     pred_prob = torch.sigmoid(pred_masks)

@@ -66,17 +66,16 @@ HYPERPARAMS = {
     "WARMUP_STEPS": 1000,
     "MIN_LR_RATIO": 0.01,
     "LAION_VAL_SIZE": 10000,
-    "LAION_BATCH_SIZE": 128,
-    "CLIP_BATCH_SIZE":128,
-    "PRIOR_BATCH_SIZE":64,
+    "CLIP_BATCH_SIZE": 128,
+    "PRIOR_BATCH_SIZE": 64,
+    "DECODER_BATCH_SIZE": 64,
+    "STUDENT_BATCH_SIZE": 64,
     "LAION_CACHE_SAMPLES": 200000,
     "LAION_CHUNK_SIZE": 10000,
     "SA_VAL_TAR_COUNT": 1,  
     "SA_VAL_SAMPLE_COUNT": 5000,
     "SAV_VAL_TAR_COUNT": 1,
     "SAV_VAL_SAMPLE_COUNT": 5000,
-    "SAM_BATCH_SIZE": 512,
-    "STUDENT_BATCH_SIZE": 512,
     "EST_SAMPLES_PER_TAR": 10000,
     "SAVE_FREQ": 50,
     "CHECKPOINT_DIR": "weights",
@@ -378,13 +377,16 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
     local_device = torch.device(f'cuda:{int(os.environ["LOCAL_RANK"])}') if "LOCAL_RANK" in os.environ else device
 
     text_encoder = create_text_encoder().to(local_device)
-    prior_teacher = TeacherCLIP().to(local_device)
+    prior_teacher = create_image_encoder().to(local_device)
     
     best_clip_text_ckpt, _, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_text")
-    if not best_clip_text_ckpt: raise FileNotFoundError("Latest CLIP text or image checkpoints not found. Train CLIP first.")
+    best_clip_image_ckpt, _, _ = get_best_weights_checkpoint(HYPERPARAMS['CHECKPOINT_DIR'], "clip_image")
+    if not best_clip_text_ckpt or not best_clip_image_ckpt: raise FileNotFoundError("Latest CLIP text or image checkpoints not found. Train CLIP first.")
     if is_main_process():
         print(f"Text encoder weights: {best_clip_text_ckpt}")
+        print(f"Image encoder weights: {best_clip_image_ckpt}")
     text_encoder.load_weights(best_clip_text_ckpt)
+    prior_teacher.load_weights(best_clip_image_ckpt)
     
     for param in text_encoder.parameters(): param.requires_grad_(False)
     text_encoder.half()
@@ -465,7 +467,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
             
                 with torch.no_grad():
                     text_emb = text_encoder(texts).float()
-                    target_grid = prior_teacher(images)
+                    target_grid,_ = prior_teacher(images)
             
                 prior_grid = prior(text_emb)
                 loss = PriorLoss(prior_grid, target_grid)
@@ -499,7 +501,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                             v_images = v_images.to(local_device)
 
                             v_text_emb = text_encoder(v_texts).float()
-                            v_target_grid = prior_teacher(v_images)
+                            v_target_grid,_ = prior_teacher(v_images)
                             v_prior_grid = prior(v_text_emb)
 
                             val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
@@ -534,7 +536,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                     v_images = v_images.to(local_device)
 
                     v_text_emb = text_encoder(v_texts).float()
-                    v_target_grid = prior_teacher(v_images)
+                    v_target_grid,_ = prior_teacher(v_images)
                     v_prior_grid = prior(v_text_emb)
 
                     val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
@@ -1117,25 +1119,25 @@ def main(hf_token, wandb_key):
         train_dataset = ChainDataset([sa1b_train, sav_train])
         val_dataset = torch.utils.data.ConcatDataset([sa1b_val, sav_val])
  
-        train_dataloader = DataLoader(train_dataset, 
-                                      batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+        if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
+            print("Starting SAM Decoder Training Phase")
+            train_dataloader = DataLoader(train_dataset, 
+                                      batch_size=HYPERPARAMS["DECODER_BATCH_SIZE"], 
                                       shuffle=False, 
                                       num_workers=num_workers, 
                                       collate_fn=SAM_adaptive_collate, 
                                       pin_memory=True, 
                                       sampler=None)
         
-        val_sampler = DistributedSampler(val_dataset, shuffle=False) if "LOCAL_RANK" in os.environ else None
-        val_dataloader = DataLoader(val_dataset, 
-                                    batch_size=HYPERPARAMS["SAM_BATCH_SIZE"], 
+            val_sampler = DistributedSampler(val_dataset, shuffle=False) if "LOCAL_RANK" in os.environ else None
+            val_dataloader = DataLoader(val_dataset, 
+                                    batch_size=HYPERPARAMS["DECODER_BATCH_SIZE"], 
                                     shuffle=False, 
                                     num_workers=num_workers, 
                                     collate_fn=SAM_adaptive_collate, 
                                     pin_memory=True, 
                                     sampler=val_sampler)
- 
-        if sam_decoder_start_epoch < HYPERPARAMS["SAM_DECODER_EPOCHS"]:
-            print("Starting SAM Decoder Training Phase")
+            
             train_SAM_decoder(train_dataloader, 
                               val_dataloader, 
                               start_weights=sam_decoder_start_weights,
@@ -1147,6 +1149,22 @@ def main(hf_token, wandb_key):
  
         if student_start_epoch < HYPERPARAMS["TEACHER_STUDENT_EPOCHS"]:
             print("Starting Student Training Phase")
+            train_dataloader = DataLoader(train_dataset, 
+                                      batch_size=HYPERPARAMS["STUDENT_BATCH_SIZE"], 
+                                      shuffle=False, 
+                                      num_workers=num_workers, 
+                                      collate_fn=SAM_adaptive_collate, 
+                                      pin_memory=True, 
+                                      sampler=None)
+        
+            val_sampler = DistributedSampler(val_dataset, shuffle=False) if "LOCAL_RANK" in os.environ else None
+            val_dataloader = DataLoader(val_dataset, 
+                                    batch_size=HYPERPARAMS["STUDENT_BATCH_SIZE"], 
+                                    shuffle=False, 
+                                    num_workers=num_workers, 
+                                    collate_fn=SAM_adaptive_collate, 
+                                    pin_memory=True, 
+                                    sampler=val_sampler)
             train_student(train_dataloader, 
                           val_dataloader, 
                           teacher_start_weights=teacher_start_weights,

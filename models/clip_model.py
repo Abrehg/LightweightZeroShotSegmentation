@@ -26,10 +26,11 @@ def create_text_encoder(num_layers=6):
     )
 
 # Image encoder factory
-def create_image_encoder():
+def create_image_encoder(num_layers=4):
     return ImageEncoder(
         embed_dim=768,
-        input_channels=3
+        input_channels=3,
+        num_layers=num_layers
     )
 
 # Contrastive loss from CLIP paper
@@ -71,60 +72,58 @@ class TextEncoder(nn.Module):
 
 # Image input shape: (1, 3, Height, Width) (Height and Width can be any size greater than 16)
 # Output shape: (1, 768)
+ENCODER_INPUT_SIZE = (224, 224)
+ENCODER_PATCH_SIZE = 16
+ 
 class ImageEncoder(nn.Module):
-    def __init__(self, embed_dim, input_channels=3):
+    def __init__(self, embed_dim=768, input_channels=3, num_layers=4, num_heads=8):
         super().__init__()
-        self.cnn = nn.Sequential(
-            # Stem
-            nn.Conv2d(input_channels, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            
-            # ResNet-style blocks
-            ResBlock(64, 128, stride=2),
-            ResBlock(128, 256, stride=2),
-            ResBlock(256, 512, stride=2),
-            
-            # Final pooling and projection
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.LayerNorm(512),
-            nn.Linear(512, embed_dim),
-            nn.LayerNorm(embed_dim)
+        num_patches = (ENCODER_INPUT_SIZE[0] // ENCODER_PATCH_SIZE) ** 2 
+        
+        self.patch_embed = nn.Conv2d(
+            input_channels, embed_dim,
+            kernel_size=ENCODER_PATCH_SIZE, stride=ENCODER_PATCH_SIZE
         )
-
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
+ 
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.spatial_norm = nn.LayerNorm(embed_dim)
+ 
+        # Global pooling head — mean pool + project → single vector for contrastive loss
+        self.pool_norm = nn.LayerNorm(embed_dim)
+        self.pool_proj = nn.Linear(embed_dim, embed_dim)
+ 
     def forward(self, image):
-        return self.cnn(image)
-    
+        # Resize to fixed resolution so patch count is always 196
+        if image.shape[-2:] != ENCODER_INPUT_SIZE:
+            image = F.interpolate(image.float(), size=ENCODER_INPUT_SIZE,
+                                  mode='bilinear', align_corners=False)
+ 
+        x = self.patch_embed(image)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos_embed
+        x = self.transformer(x)
+        spatial_grid = self.spatial_norm(x)
+ 
+        global_vec = self.pool_proj(
+            self.pool_norm(spatial_grid.mean(dim=1))
+        )
+        return spatial_grid, global_vec
+ 
     def load_weights(self, filename):
         state_dict = torch.load(filename)
         self.load_state_dict(state_dict)
-
+ 
     def store_weights(self, path, filename):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
         torch.save(self.state_dict(), os.path.join(path, filename))
-
-class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, 1)
-        self.norm1 = nn.GroupNorm(8, out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1)
-        self.norm2 = nn.GroupNorm(8, out_channels)
-        
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride),
-                nn.GroupNorm(8, out_channels)
-            )
-
-    def forward(self, x):
-        residual = self.shortcut(x)
-        x = F.gelu(self.norm1(self.conv1(x)))
-        x = self.norm2(self.conv2(x))
-        return F.gelu(x + residual)
 
 # Helper class for training
 class CLIPWrapper(nn.Module):
@@ -141,8 +140,8 @@ class CLIPWrapper(nn.Module):
         x = x.mean(dim=1)
         x = self.final_ln(x)
         text_features = self.projection(x)
-        image_features = self.image_encoder(images)
-        return text_features, image_features, self.logit_scale.exp()
+        _, global_vec = self.image_encoder(images)
+        return text_features, global_vec, self.logit_scale.exp()
     
     def load_weights(self, wrapper_filename, img_filename, txt_filename):
         self.image_encoder.load_weights(img_filename)

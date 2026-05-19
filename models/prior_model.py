@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from transformers import CLIPVisionModel
 
 # Prior model factory
 def create_prior(num_layers=8):
@@ -54,19 +53,6 @@ class Prior(nn.Module):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
         torch.save(self.state_dict(), os.path.join(path, filename))
-
-class TeacherCLIP(nn.Module):
-    def __init__(self, model_name="openai/clip-vit-base-patch16"):
-        super().__init__()
-        self.vision_model = CLIPVisionModel.from_pretrained(model_name)
-        for param in self.vision_model.parameters():
-            param.requires_grad = False
-            
-    def forward(self, pixel_values):
-        with torch.no_grad():
-            outputs = self.vision_model(pixel_values=pixel_values)
-            features = outputs.last_hidden_state[:, 1:, :] 
-            return features
 
 def PriorLoss(predicted_grid, target_grid):
     loss = 1.0 - F.cosine_similarity(

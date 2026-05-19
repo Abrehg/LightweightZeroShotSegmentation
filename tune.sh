@@ -6,7 +6,7 @@
 #SBATCH --error=slurm-%j.err
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --qos=dcs-48hr
 
 # ============================================================
@@ -47,7 +47,8 @@ WEIGHTS_DIR="$PROJECT_DIR/models/trained"
 # Structural params from previous tuning results (must match saved weights).
 # Update these after each phase completes with the best trial values.
 TXT_ENC_LAYERS=6
-PRIOR_LAYERS=8
+IMG_ENC_LAYERS=10
+PRIOR_LAYERS=9
 SAM_ENC_LAYERS=2
 SAM_DEC_LAYERS=2
 SAM_MEMORY=10
@@ -93,69 +94,66 @@ export HTTPS_PROXY=http://proxy:8888
 ENV_BIN="/gpfs/u/home/ZSIS/ZSISsrtk/barn/miniconda3/envs/$VENV_NAME/bin"
 export PATH="$ENV_BIN:$PATH"
 
-export HF_HOME=/gpfs/u/barn/ZSIS/ZSISsrtk/.cache/huggingface
-export TRANSFORMERS_CACHE=$HF_HOME/hub
 export SAM_CACHE_DIR=/gpfs/u/barn/ZSIS/ZSISsrtk/.cache/sam_data
-mkdir -p "$HF_HOME/hub" "$SAM_CACHE_DIR"
+mkdir -p "$SAM_CACHE_DIR"
 
 echo "Python executable: $(which python)"
 echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
 
 cd "$PROJECT_DIR"
 
-# # --- Pre-download HuggingFace assets ---
-# echo "Pre-downloading HuggingFace cache..."
-# python -c "
-# import os, socket, requests
-# os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
-# socket.setdefaulttimeout(3600)
-
-# import datasets
-# datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
-# datasets.config.MAX_RETRIES = 10
-
-# _original_request = requests.Session.request
-# def _patched_request(self, method, url, **kwargs):
-#     kwargs['timeout'] = 3600
-#     return _original_request(self, method, url, **kwargs)
-# requests.Session.request = _patched_request
-
-# _original_send = requests.Session.send
-# def _patched_send(self, request, **kwargs):
-#     kwargs['timeout'] = 3600
-#     return _original_send(self, request, **kwargs)
-# requests.Session.send = _patched_send
-
-# from models.clip_model import create_text_encoder, create_image_encoder
-# from models.prior_model import TeacherCLIP
-# from transformers import InstructBlipProcessor
-# from datasets import load_dataset
-# import warnings
-# warnings.filterwarnings('ignore')
-
-# print('1/4: Downloading CLIP Base models...')
-# create_text_encoder()
-# create_image_encoder()
-
-# print('2/4: Downloading Teacher CLIP (Large)...')
-# TeacherCLIP()
-
-# print('3/4: Downloading InstructBlip Processor...')
-# try:
-#     InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
-# except Exception:
-#     pass
-
-# print('4/4: Downloading LAION streaming builder...')
-# try:
-#     load_dataset('laion/relaion400m', split='train', streaming=True, token='$HF_TOKEN')
-#     print('LAION pre-download successful!')
-# except Exception as e:
-#     print(f'LAION pre-download failed: {e}')
-# "
+# --- Pre-download HuggingFace assets ---
+echo "Pre-downloading HuggingFace cache..."
+python -c "
+import os, socket, requests
+os.environ['HF_HUB_HTTP_TIMEOUT'] = '3600'
+socket.setdefaulttimeout(3600)
+ 
+import datasets
+datasets.config.DOWNLOAD_DEFAULT_TIMEOUT = 3600
+datasets.config.MAX_RETRIES = 10
+ 
+_original_request = requests.Session.request
+def _patched_request(self, method, url, **kwargs):
+    kwargs['timeout'] = 3600
+    return _original_request(self, method, url, **kwargs)
+requests.Session.request = _patched_request
+ 
+_original_send = requests.Session.send
+def _patched_send(self, request, **kwargs):
+    kwargs['timeout'] = 3600
+    return _original_send(self, request, **kwargs)
+requests.Session.send = _patched_send
+ 
+from models.clip_model import create_text_encoder, create_image_encoder
+from models.prior_model import TeacherCLIP
+from transformers import InstructBlipProcessor
+from datasets import load_dataset
+import warnings
+warnings.filterwarnings('ignore')
+ 
+print('1/3: Downloading CLIP Base models...')
+create_text_encoder()
+create_image_encoder()
+ 
+print('2/3: Downloading InstructBlip Processor...')
+try:
+    InstructBlipProcessor.from_pretrained('Salesforce/instructblip-flan-t5-xl')
+except Exception:
+    pass
+ 
+print('3/3: Downloading LAION streaming builder...')
+try:
+    load_dataset('laion/relaion400m', split='train', streaming=True, token='$HF_TOKEN')
+    print('LAION pre-download successful!')
+except Exception as e:
+    print(f'LAION pre-download failed: {e}')
+"
 
 # --- Build the command with phase-appropriate args ---
 echo "Starting Optuna hyperparameter sweep: phase=$PHASE, trials=$N_TRIALS"
+
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 CMD="python $PYTHON_SCRIPT_PATH \
     --token $HF_TOKEN \
@@ -166,7 +164,8 @@ CMD="python $PYTHON_SCRIPT_PATH \
 if [ "$PHASE" != "clip" ]; then
     CMD="$CMD \
     --weights_dir $WEIGHTS_DIR \
-    --txt_enc_layers $TXT_ENC_LAYERS"
+    --txt_enc_layers $TXT_ENC_LAYERS \
+    --img_enc_layers $IMG_ENC_LAYERS"
 fi
 
 if [ "$PHASE" = "decoder" ] || [ "$PHASE" = "student" ]; then

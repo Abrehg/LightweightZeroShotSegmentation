@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import os
 
 # Prior model factory
-def create_prior(num_layers=8):
+def create_prior(num_layers=2):
     return Prior(num_layers=num_layers)
 
 # Input encoding shape: (1, seq_len, 768) (max seq_len is 77)

@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 import json
 from torch.utils.data import DataLoader, ConcatDataset
 from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
-from models.prior_model import create_prior, PriorLoss, TeacherCLIP
+from models.prior_model import create_prior, PriorLoss
 from models.SAM_model import iou_loss, create_SAM
 from models.distill_model import create_Student
 from data.custom400m import get_laion_test_dataset, adaptive_collate
@@ -250,6 +250,7 @@ def objective_clip(trial, hf_token):
     batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
     num_text_layers = trial.suggest_int("num_text_layers", 1, 24)
     num_image_layers = trial.suggest_int("num_image_layers", 1, 6)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
 
     if batch_size * (num_text_layers + num_image_layers) > PHASE_MEM_BUDGET["clip"]:
         raise optuna.exceptions.TrialPruned()
@@ -262,7 +263,7 @@ def objective_clip(trial, hf_token):
     image_encoder = create_image_encoder(num_layers=num_image_layers).to(device)
     model = CLIPWrapper(text_encoder, image_encoder).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     for epoch in range(TUNE_EPOCHS):
         model.train()
@@ -308,6 +309,7 @@ def objective_prior(trial, hf_token, args):
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     num_layers = trial.suggest_int("num_layers", 1, 24)
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
     
     if batch_size * num_layers > PHASE_MEM_BUDGET["prior"]:
         raise optuna.exceptions.TrialPruned()
@@ -320,7 +322,7 @@ def objective_prior(trial, hf_token, args):
     text_encoder, teacher = load_trained_encoders(args)
     
     prior = create_prior(num_layers=num_layers).to(device)
-    optimizer = torch.optim.Adam(prior.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(prior.parameters(), lr=lr, weight_decay=weight_decay)
 
     for epoch in range(TUNE_EPOCHS):
         prior.train()

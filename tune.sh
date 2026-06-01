@@ -36,7 +36,7 @@ PROJECT_DIR="/gpfs/u/home/ZSIS/ZSISsrtk/barn/research"
 PYTHON_SCRIPT_NAME="tune.py"
 VENV_NAME="visEnv"
 HF_TOKEN="_"
-N_TRIALS=40
+N_TRIALS=100
 
 # Current phase to tune (change per run)
 PHASE="decoder"

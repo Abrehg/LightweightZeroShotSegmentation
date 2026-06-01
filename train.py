@@ -44,7 +44,7 @@ from torch.utils.data import DataLoader, ChainDataset, DistributedSampler, Itera
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
-from models.prior_model import create_prior, PriorLoss, TeacherCLIP
+from models.prior_model import create_prior, PriorLoss
 from models.SAM_model import iou_loss, create_SAM
 from models.distill_model import create_Student
 from data.custom400m import get_laion_streaming_dataset, get_laion_test_dataset, adaptive_collate, ChunkedLAIONManager
@@ -63,10 +63,15 @@ HYPERPARAMS = {
     "DECODER_LR": 0.0001, # For SAM Decoder training
     "TEACHER_LR": 0.00001, # For teacher fine-tuning during student training
     "STUDENT_LR": 0.0001,
+    "CLIP_WEIGHT_DECAY": 0.0009239627275656261,
+    "PRIOR_WEIGHT_DECAY":   1e-4,
+    "DECODER_WEIGHT_DECAY": 1e-4,
+    "TEACHER_WEIGHT_DECAY": 1e-5,
+    "STUDENT_WEIGHT_DECAY": 1e-4,
     "WARMUP_STEPS": 1000,
     "MIN_LR_RATIO": 0.01,
     "LAION_VAL_SIZE": 10000,
-    "CLIP_BATCH_SIZE": 128,
+    "CLIP_BATCH_SIZE": 32,
     "PRIOR_BATCH_SIZE": 64,
     "DECODER_BATCH_SIZE": 64,
     "STUDENT_BATCH_SIZE": 64,
@@ -199,7 +204,7 @@ def train_clip(chunk_manager:ChunkedLAIONManager, text_start_weights, img_start_
     image_encoder = create_image_encoder().to(local_device)
 
     clip_model:CLIPWrapper = CLIPWrapper(text_encoder, image_encoder).to(local_device)
-    optimizer = torch.optim.Adam(clip_model.parameters(), lr=HYPERPARAMS["CLIP_LR"])
+    optimizer = torch.optim.Adam(clip_model.parameters(), lr=HYPERPARAMS["CLIP_LR"], weight_decay=HYPERPARAMS["CLIP_WEIGHT_DECAY"])
     
     if start_epoch > 0:
         if os.path.exists(text_start_weights) and os.path.exists(img_start_weights) and os.path.exists(wrapper_start_weights):
@@ -396,7 +401,7 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
     prior_teacher.eval()
 
     prior_model = create_prior().to(local_device)
-    optimizer = torch.optim.Adam(prior_model.parameters(), lr=HYPERPARAMS["PRIOR_LR"])
+    optimizer = torch.optim.Adam(prior_model.parameters(), lr=HYPERPARAMS["PRIOR_LR"], weight_decay=HYPERPARAMS["PRIOR_WEIGHT_DECAY"])
 
     if start_epoch > 0:
         if os.path.exists(start_weights):
@@ -467,7 +472,8 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
             
                 with torch.no_grad():
                     text_emb = text_encoder(texts).float()
-                    target_grid,_ = prior_teacher(images)
+                    target_grid, _ = prior_teacher(images.half())
+                    target_grid = target_grid.float()
             
                 prior_grid = prior(text_emb)
                 loss = PriorLoss(prior_grid, target_grid)
@@ -501,7 +507,8 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                             v_images = v_images.to(local_device)
 
                             v_text_emb = text_encoder(v_texts).float()
-                            v_target_grid,_ = prior_teacher(v_images)
+                            v_target_grid, _ = prior_teacher(v_images.half())
+                            v_target_grid = v_target_grid.float()
                             v_prior_grid = prior(v_text_emb)
 
                             val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
@@ -536,7 +543,8 @@ def train_prior(chunk_manager:ChunkedLAIONManager, start_weights, run: wandb, st
                     v_images = v_images.to(local_device)
 
                     v_text_emb = text_encoder(v_texts).float()
-                    v_target_grid,_ = prior_teacher(v_images)
+                    v_target_grid, _ = prior_teacher(v_images.half())
+                    v_target_grid = v_target_grid.float()
                     v_prior_grid = prior(v_text_emb)
 
                     val_loss += PriorLoss(v_prior_grid, v_target_grid).item()
@@ -609,7 +617,7 @@ def train_SAM_decoder(train_dataloader, val_dataloader, start_weights, run: wand
     teacher.prior.half()
     teacher.prior.eval()
             
-    optimizer_sam_decoder = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["DECODER_LR"])
+    optimizer_sam_decoder = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["DECODER_LR"], weight_decay=HYPERPARAMS["DECODER_WEIGHT_DECAY"])
 
     estimated_total_steps = HYPERPARAMS["SAM_DECODER_EPOCHS"] * 2000
     scheduler = create_lr_warmup_cosine_scheduler(
@@ -806,8 +814,8 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
     
     student = DDP(student, device_ids=[int(os.environ["LOCAL_RANK"])])
 
-    optimizer_teacher_finetune = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["TEACHER_LR"])
-    optimizer_student = torch.optim.Adam(student.parameters(), lr=HYPERPARAMS["STUDENT_LR"])
+    optimizer_teacher_finetune = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=HYPERPARAMS["TEACHER_LR"], weight_decay=HYPERPARAMS["TEACHER_WEIGHT_DECAY"])
+    optimizer_student = torch.optim.Adam(student.parameters(), lr=HYPERPARAMS["STUDENT_LR"], weight_decay=HYPERPARAMS["STUDENT_WEIGHT_DECAY"])
 
     estimated_total_steps = HYPERPARAMS["TEACHER_STUDENT_EPOCHS"] * 2000
     scheduler_teacher = create_lr_warmup_cosine_scheduler(
@@ -856,8 +864,8 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 txt = txt.to(local_device)
 
                 T = img.shape[1]
-                mem_t = teacher.init_memory(img.shape[0], device)
-                mem_s = student.init_memory(img.shape[0], device)
+                mem_t = teacher.init_memory(img.shape[0], local_device)
+                mem_s = student.module.init_memory(img.shape[0], local_device)
 
                 for t in range(T):
                     teacher_out, mem_t_new = teacher.forward_frame(img[:, t], txt, mem_t, t)
@@ -865,10 +873,9 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                 
                     with torch.no_grad():
                         teacher_out_for_student = teacher_out.detach()
-                        #teacher_out_for_student = teacher.forward_frame(img[:, t], txt, mem_t, t).detach()
 
                     teacher_loss = iou_loss(teacher_out, mask[:, t])
-                    student_loss = student.compute_distill_loss(student_out, teacher_out_for_student, mask[:, t])
+                    student_loss = student.module.compute_distill_loss(student_out, teacher_out_for_student, mask[:, t])
 
                     teacher_loss.backward(retain_graph=True)
                     student_loss.backward()
@@ -918,16 +925,16 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                             v_img = v_img.to(local_device)
                             v_txt = v_txt.to(local_device)
 
-                            T = img.shape[1]
-                            mem_t = teacher.init_memory(img.shape[0], device)
-                            mem_s = student.init_memory(img.shape[0], device)
+                            T = v_img.shape[1]
+                            mem_t = teacher.init_memory(v_img.shape[0], local_device)
+                            mem_s = student.module.init_memory(v_img.shape[0], local_device)
 
                             for t in range(T):
-                                teacher_out, mem_t = teacher.forward_frame(img[:, t], txt, mem_t, t)
-                                student_out, mem_s = student.forward(img[:, t], txt, mem_s, t)
+                                teacher_out, mem_t = teacher.forward_frame(v_img[:, t], v_txt, mem_t, t)
+                                student_out, mem_s = student.forward(v_img[:, t], v_txt, mem_s, t)
 
-                                val_t_loss += iou_loss(teacher_out, mask[:, t]).item()
-                                val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t]).item()
+                                val_t_loss += iou_loss(teacher_out, v_mask[:, t]).item()
+                                val_s_loss += student.module.compute_distill_loss(student_out, teacher_out, v_mask[:, t]).item()
 
                             num_val_samples += 1
                         
@@ -962,23 +969,23 @@ def train_student(train_dataloader, val_dataloader, teacher_start_weights, stude
                         v_img = v_img.to(local_device)
                         v_txt = v_txt.to(local_device)
 
-                        T = img.shape[1]
-                        mem_t = teacher.init_memory(img.shape[0], device)
-                        mem_s = student.init_memory(img.shape[0], device)
+                        T = v_img.shape[1]
+                        mem_t = teacher.init_memory(v_img.shape[0], local_device)
+                        mem_s = student.module.init_memory(v_img.shape[0], local_device)
 
                         for t in range(T):
-                            teacher_out, mem_t = teacher.forward_frame(img[:, t], txt, mem_t, t)
-                            student_out, mem_s = student.forward(img[:, t], txt, mem_s, t)
+                            teacher_out, mem_t = teacher.forward_frame(v_img[:, t], v_txt, mem_t, t)
+                            student_out, mem_s = student.forward(v_img[:, t], v_txt, mem_s, t)
 
-                            val_t_loss += iou_loss(teacher_out, mask[:, t]).item()
-                            val_s_loss += student.compute_distill_loss(student_out, teacher_out, mask[:, t]).item()
+                            val_t_loss += iou_loss(teacher_out, v_mask[:, t]).item()
+                            val_s_loss += student.module.compute_distill_loss(student_out, teacher_out, v_mask[:, t]).item()
 
                         num_val_samples += 1
                         
             avg_t_val = val_t_loss / num_val_samples if num_val_samples > 0 else 999.9
             avg_s_val = val_s_loss / num_val_samples if num_val_samples > 0 else 999.9
             teacher.sam_decoder.module.store_weights(
-                HYPERPARAMS["CHECKPOINT_DIR"], 
+                HYPERPARAMS["CHECKPOINT_DIR"],
                 f"student_phase_teacher_epoch_{epoch+1}_complete_{avg_t_val:.4f}")
             student.module.store_weights(
                 HYPERPARAMS["CHECKPOINT_DIR"], 
@@ -1177,6 +1184,10 @@ def main(hf_token, wandb_key):
     
     print("All training phases completed")
     run.finish()
+
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 # ======== Main ========
 if __name__ == "__main__":

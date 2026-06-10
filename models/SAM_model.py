@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-def create_SAM(max_memory_length=10, enc_num_layers = 2, dec_num_layers = 2):
+def create_SAM(max_memory_length=3, enc_num_layers = 1, dec_num_layers = 4):
     return VideoSAM(
         max_memory_length=max_memory_length,
         enc_num_layers=enc_num_layers,

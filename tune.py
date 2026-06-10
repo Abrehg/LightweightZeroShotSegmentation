@@ -20,7 +20,6 @@
 import torch
 import gc
 import os
-import copy
 import optuna
 import argparse
 import warnings
@@ -40,6 +39,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Micro-Sweep Configurations
 TUNE_EPOCHS = 1
 TUNE_TOTAL_SAMPLES = 2500
+MAX_TUNE_FRAMES = 8
 TUNE_VAL_RATIO = 0.2
 
 # Standard weight filenames (saved by store_weights in each model)
@@ -54,6 +54,7 @@ SAM_FILENAME = "SAMWeights"
 
 _laion_cache = {}
 _sam_cache = {}
+_decoder_frozen_cache = {}
 
 PHASE_BATCH_SIZES = {
     "clip":    [32, 64, 128],
@@ -242,7 +243,7 @@ def load_trained_sam(args):
     else:
         print(f"[Weights] WARNING: Trained SAM decoder not found at {sam_path}")
         print(f"  Using random initialization. Tuning results will approximate — retune after SAM training for best accuracy.")
-    return sam_decoder.half()
+    return sam_decoder
 
 # ======================== PHASE 1: CLIP ========================
 def objective_clip(trial, hf_token):
@@ -389,8 +390,12 @@ def objective_decoder(trial, args):
     train_loader, val_loader = get_sam_loaders(batch_size)
     
     # Load trained components from previous phases (frozen)
-    text_encoder = load_trained_text_encoder(args)
-    prior = load_trained_prior(args)
+    global _decoder_frozen_cache
+    if 'text_encoder' not in _decoder_frozen_cache:
+        _decoder_frozen_cache['text_encoder'] = load_trained_text_encoder(args)
+        _decoder_frozen_cache['prior']        = load_trained_prior(args)
+    text_encoder = _decoder_frozen_cache['text_encoder']
+    prior = _decoder_frozen_cache['prior']
     
     # SAM decoder is what we're tuning — fresh init
     sam_decoder = create_SAM(max_memory_length=max_memory_length, 
@@ -430,7 +435,7 @@ def objective_decoder(trial, args):
                 img = img.to(device)
                 txt = txt.to(device)
 
-                T = img.shape[1]
+                T = min(img.shape[1], MAX_TUNE_FRAMES)
                 memory = teacher.init_memory(img.shape[0], device)
 
                 for t in range(T):
@@ -453,7 +458,7 @@ def objective_decoder(trial, args):
                     img = img.to(device)
                     txt = txt.to(device)
 
-                    T = img.shape[1]
+                    T = min(img.shape[1], MAX_TUNE_FRAMES)
                     memory = teacher.init_memory(img.shape[0], device)
 
                     for t in range(T):
@@ -470,98 +475,13 @@ def objective_decoder(trial, args):
 
 # ======================== PHASE 4: Student (Co-Distillation) ========================
 # Depends on: full trained teacher pipeline (CLIP + Prior + SAM with 3 epochs).
-# The teacher is loaded from checkpoints, warmed up, then co-trained with the
-# student — the SAM decoder continues improving while the student distills from it.
-# Text encoder and prior remain frozen throughout.
-
-def warmup_teacher(teacher, train_loader, warmup_epochs, lr=1e-4):
-    print(f"[Teacher Warmup] Running {warmup_epochs} warm-up epoch(s) on SAM decoder...")
-    optimizer = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=lr)
-    
-    for epoch in range(warmup_epochs):
-        teacher.sam_decoder.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        for batch in train_loader:
-            if batch is None: continue
-            images, masks, texts = batch
-            optimizer.zero_grad()
-            
-            for img, mask, txt in zip(images, masks, texts):
-                mask = mask.to(device).float()
-                img = img.to(device)
-                txt = txt.to(device)
-
-                T = img.shape[1]
-                memory = teacher.init_memory(img.shape[0], device)
-
-                for t in range(T):
-                    pred_mask, new_memory = teacher.forward_frame(img[:, t], txt, memory, t)
-                    loss = iou_loss(pred_mask, mask[:, t])
-                    loss.backward()
-                    memory = new_memory.detach()
-            
-            optimizer.step()
-            epoch_loss += loss.item()
-            num_batches += 1
-        
-        avg_loss = epoch_loss / max(1, num_batches)
-        print(f"  Warmup epoch {epoch+1}/{warmup_epochs} -- avg loss: {avg_loss:.4f}")
-    
-    teacher.sam_decoder.eval()
-    print("[Teacher Warmup] Complete.")
-
-# Cache the warmed SAM decoder state_dict so warm-up runs once.
-# Each trial gets a fresh deep-copy (since co-distillation modifies the teacher).
-_warmed_sam_state = None
-_frozen_text_encoder = None
-_frozen_prior = None
-
-def get_warmed_teacher_components(args):
-    """Build the teacher, warm up SAM decoder once, cache the resulting
-    state_dict and frozen upstream components for reuse across trials."""
-    global _warmed_sam_state, _frozen_text_encoder, _frozen_prior
-    
-    if _warmed_sam_state is not None:
-        return _frozen_text_encoder, _frozen_prior, _warmed_sam_state
-    
-    _frozen_text_encoder = load_trained_text_encoder(args)
-    _frozen_prior = load_trained_prior(args)
-    sam_decoder = load_trained_sam(args)
-    
-    class TeacherModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.text_encoder = _frozen_text_encoder
-            self.prior = _frozen_prior
-            self.sam_decoder = sam_decoder
-
-        def forward_frame(self, frame, text_tokens, memory, t=0):
-            with torch.no_grad():
-                text_emb  = self.text_encoder(text_tokens)
-                prior_emb = self.prior(text_emb)
-            mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
-            return mask, new_memory
- 
-        def init_memory(self, B, device):
-            return self.sam_decoder.init_memory(B, device)
-
-    teacher = TeacherModel().to(device)
-    
-    if args.teacher_warmup_epochs > 0:
-        warmup_loader = get_sam_loaders(batch_size=64)[0]
-        warmup_teacher(teacher, warmup_loader, args.teacher_warmup_epochs)
-    
-    # Cache the warmed SAM weights (deep copy so later trials don't conflict)
-    _warmed_sam_state = copy.deepcopy(sam_decoder.state_dict())
-    
-    print("[Cache] Warmed SAM decoder state_dict cached for all student trials.")
-    return _frozen_text_encoder, _frozen_prior, _warmed_sam_state
+_student_frozen_cache = {}
 
 def objective_student(trial, args):
     teacher_lr = trial.suggest_float("teacher_lr", 1e-5, 1e-2, log=True)
     student_lr = trial.suggest_float("student_lr", 1e-5, 1e-2, log=True)
+    teacher_weight_decay = trial.suggest_float("teacher_weight_decay", 1e-6, 1e-2, log=True)
+    student_weight_decay = trial.suggest_float("student_weight_decay", 1e-6, 1e-2, log=True)
     batch_size = trial.suggest_categorical("batch_size", PHASE_BATCH_SIZES["student"])
     input_layers = trial.suggest_int("input layers", 1, 10)
     num_encoder_layers = trial.suggest_int("num_encoder_layers", 1, 8)
@@ -576,16 +496,24 @@ def objective_student(trial, args):
     scaler_student = torch.cuda.amp.GradScaler()
     train_loader, val_loader = get_sam_loaders(batch_size)
 
-    # Get cached components (warm-up runs only on first trial)
-    text_encoder, prior, warmed_sam_state = get_warmed_teacher_components(args)
-
-    # Build a fresh teacher with warmed SAM weights for this trial
+    # Get cached components
+    global _student_frozen_cache
+    if 'text_encoder' not in _student_frozen_cache:
+        _student_frozen_cache['text_encoder'] = load_trained_text_encoder(args)
+        _student_frozen_cache['prior']        = load_trained_prior(args)
+        _student_frozen_cache['decoder_state'] = {
+            k: v.float()
+            for k, v in load_trained_sam(args).state_dict().items()
+        }
+    text_encoder = _student_frozen_cache['text_encoder']
+    prior        = _student_frozen_cache['prior']
+ 
     sam_decoder = create_SAM(
-        max_memory_length=args.sam_memory, 
-        enc_num_layers=args.sam_enc_layers, 
-        dec_num_layers=args.sam_dec_layers
+        max_memory_length=args.sam_memory,
+        enc_num_layers=args.sam_enc_layers,
+        dec_num_layers=args.sam_dec_layers,
     ).to(device)
-    sam_decoder.load_state_dict(warmed_sam_state)
+    sam_decoder.load_state_dict(_student_frozen_cache['decoder_state'])
 
     class TeacherModel(torch.nn.Module):
         def __init__(self):
@@ -597,7 +525,7 @@ def objective_student(trial, args):
         def forward_frame(self, frame, text_tokens, memory, t=0):
             with torch.no_grad():
                 text_emb  = self.text_encoder(text_tokens)
-                prior_emb = self.prior(text_emb)
+                prior_emb = self.prior(text_emb).float()
             mask, new_memory = self.sam_decoder(frame, prior_emb, memory, t)
             return mask, new_memory
  
@@ -614,8 +542,8 @@ def objective_student(trial, args):
     ).to(device)
 
     # Co-distillation: both the teacher SAM decoder and student train jointly
-    optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=teacher_lr)
-    optimizer_student = torch.optim.Adam(student.parameters(), lr=student_lr)
+    optimizer_teacher = torch.optim.Adam(teacher.sam_decoder.parameters(), lr=teacher_lr, weight_decay=teacher_weight_decay)
+    optimizer_student = torch.optim.Adam(student.parameters(), lr=student_lr, weight_decay=student_weight_decay)
 
     for epoch in range(TUNE_EPOCHS):
         teacher.sam_decoder.train()
@@ -644,11 +572,8 @@ def objective_student(trial, args):
                 mem_t = teacher.init_memory(img.shape[0], device)
                 mem_s = student.init_memory(img.shape[0], device)
 
-                print(img.shape)
-
                 for t in range(T):
                     with torch.cuda.amp.autocast():
-                        print(img[:,t].shape())
                         teacher_out, mem_t_new = teacher.forward_frame(img[:, t], txt, mem_t, t)
                         student_out, mem_s_new = student.forward(img[:, t], txt, mem_s, t)
                 

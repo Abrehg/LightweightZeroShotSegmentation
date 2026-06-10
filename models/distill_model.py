@@ -3,11 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-def create_Student(text_transformer_layers=2, max_memory_length=10, output_layers=2):
+def create_Student(text_transformer_layers=7, max_memory_length=9, num_encoder_layers=3, num_decoder_layers=8):
     return DistilledMemoryStudent(
         text_transformer_layers=text_transformer_layers,
         max_memory_length=max_memory_length,
-        num_decoder_layers=output_layers
+        num_decoder_layers=num_decoder_layers,
+        num_encoder_layers=num_encoder_layers
     )
 
 # Loss for overall model (Binary Cross Entropy + IoU Loss)

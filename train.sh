@@ -80,49 +80,27 @@ export HF_HUB_HTTP_TIMEOUT=300
 export REQUESTS_TIMEOUT=300
 
 python -c "
-import os, socket, torch, warnings
+import os, socket, warnings
 os.environ['HF_HUB_HTTP_TIMEOUT'] = '300'
 socket.setdefaulttimeout(300)
 warnings.filterwarnings('ignore')
 
-from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize
+from models.clip_model import create_text_encoder, create_image_encoder
 from models.prior_model import TeacherCLIP
 
-print('1/3: Downloading CLIP Base models...')
+print('1/2: Downloading CLIP Base models...')
 create_text_encoder()
 create_image_encoder()
- 
-print('2/3: Downloading Teacher CLIP (Large)...')
+
+print('2/2: Downloading Teacher CLIP (Large)...')
 TeacherCLIP()
- 
-print('3/3: Pre-caching LAION validation set...')
-val_cache_path = 'data/cache/chunks/val_static.pt'
-os.makedirs('data/cache/chunks', exist_ok=True)
-if os.path.exists(val_cache_path) and os.path.getsize(val_cache_path) > 0:
-    samples = torch.load(val_cache_path, map_location='cpu')
-    print(f'  Val cache exists: {len(samples)} samples, skipping.')
-else:
-    from data.custom400m import StreamingLAIONDataset
-    num_val = 10000
-    stream = StreamingLAIONDataset(
-        HUGGINGFACE_TOKEN='$HF_TOKEN',
-        text_processor=CLIPTokenize,
-        split_mode='train',
-        val_size=0
-    )
-    samples = []
-    for sample in stream:
-        if sample is not None:
-            samples.append(sample)
-            if len(samples) % 500 == 0:
-                print(f'  Val: {len(samples)}/{num_val}...')
-            if len(samples) >= num_val:
-                break
-    torch.save(samples, val_cache_path)
-    print(f'  Val set cached: {len(samples)} samples to {val_cache_path}')
- 
+
 print('Pre-download complete.')
 "
+
+# LAION train/val data itself is handled by train.py at startup (one process per
+# node downloads its own full local copy to LAION_LOCAL_DEFAULT_DIR, see
+# data/custom400m.py, if it isn't already there) — nothing to pre-stage here.
 
 # --- Running the Training Script with torchrun ---
 echo "Starting distributed training script..."

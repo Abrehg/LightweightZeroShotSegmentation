@@ -26,11 +26,11 @@ import warnings
 warnings.filterwarnings('ignore')
 import json
 from torch.utils.data import DataLoader, ConcatDataset
-from models.clip_model import create_text_encoder, create_image_encoder, CLIPTokenize, CLIPWrapper, clip_contrastive_loss
+from models.clip_model import create_text_encoder, create_image_encoder, CLIPWrapper, clip_contrastive_loss
 from models.prior_model import create_prior, PriorLoss
 from models.SAM_model import iou_loss, create_SAM
 from models.distill_model import create_Student
-from data.custom400m import get_laion_test_dataset, adaptive_collate
+from data.custom400m import get_laion_dataset, adaptive_collate, LAION_LOCAL_DEFAULT_DIR
 from data.segmentation import SAM_adaptive_collate, StaticSA1BDataset, StaticSAVDataset
 
 # Hardware Setup (Single Node)
@@ -73,11 +73,11 @@ PHASE_MEM_BUDGET = {
 def _get_laion_datasets(hf_token):
     if 'train' not in _laion_cache:
         print(f"[Cache] Downloading {TUNE_TOTAL_SAMPLES} LAION samples (one-time)...")
-        full_dataset = get_laion_test_dataset(
-            hf_token, val_boundary=0, num_samples=TUNE_TOTAL_SAMPLES,
-            text_processor=CLIPTokenize, split="train"
+        full_dataset = get_laion_dataset(
+            split="train", data_dir=os.path.join(LAION_LOCAL_DEFAULT_DIR, "tune"),
+            hf_token=hf_token, total_samples=TUNE_TOTAL_SAMPLES, val_size=0,
         )
-        
+
         total = len(full_dataset)
         val_size = max(1, int(total * TUNE_VAL_RATIO))
         train_size = total - val_size

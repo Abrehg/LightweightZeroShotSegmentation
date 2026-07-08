@@ -1,263 +1,116 @@
-# precompute_captions.py
+# precomputeCaptions.py
 #
-# Pre-compute InstructBLIP captions for SA-1B and SA-V datasets.
-# Run this ONCE on a single GPU before distributed training.
-# Output is a small JSON file (~10-50MB) that all training ranks can read
-# without loading the 4GB InstructBLIP model.
+# Two-pass caption pipeline for the SA-1B/SA-V segmentation dataset built by
+# data/segmentation.py (train.json.gz / val.json.gz under SEG_LOCAL_DEFAULT_DIR).
 #
-# Usage:
-#   python precompute_captions.py
+# Each run does, in order:
+#   1) Tokenize: any caption slot holding raw text (written by a *previous* run) is
+#      tokenized and the text is deleted. This is the automatic "second pass".
+#   2) Generate: any caption slot still empty (None) gets 4 new raw-text captions
+#      from the InstructBLIP-based CaptionGenerator, one per persona.
 #
-# Output:
-#   data/cache/caption_cache.json
+# So: run this once -> captions appear as text in the JSON for you to inspect. Run
+# it again with no changes -> that text is tokenized and removed, replaced by token
+# ids; anything newly added in the meantime gets its own text captions in that same
+# run, ready to be tokenized on the run after that.
 #
-# This replaces on-the-fly caption generation during training, saving
-# ~4GB GPU memory per rank and eliminating per-sample inference latency.
+# Usage (from the repo root, so the `data` package's relative imports resolve):
+#   python -m data.precomputeCaptions [--data-dir PATH] [--device cuda]
 
 import os
-import json
-import tarfile
 import argparse
-from PIL import Image
 import torch
-from torchvision import transforms
-from pycocotools import mask as coco_mask
-from .segmentation import CaptionGenerator, download_tar_file
-from Helpers.sav_utils import SAVDatasetHelper
 
-NUM_PERSONAS = 4  # 4 caption styles per sample
+from .segmentation import SEG_LOCAL_DEFAULT_DIR, CaptionGenerator, decode_seg_image, decode_seg_mask, is_caption_raw
+from .custom400m import read_json_gz, write_json_gz
+from models.clip_model import CLIPTokenize
 
-def precompute_sa1b_captions(file_list, cache_dir, caption_generator, caption_cache, max_samples=None):
-    """Generate captions for all SA-1B samples across all tar files."""
-    transform = transforms.Compose([transforms.ToTensor()])
-    total = 0
-    
-    for filename, url in file_list:
-        dest_path = os.path.join(cache_dir, filename)
-        if not os.path.exists(dest_path):
-            print(f"  Downloading {filename}...")
-            if not download_tar_file(url, dest_path):
-                print(f"  Failed to download {filename}, skipping.")
-                continue
-        
-        tar_basename = os.path.basename(dest_path)
-        
-        try:
-            with tarfile.open(dest_path, "r") as tar:
-                members = tar.getmembers()
-                json_files = [m for m in members if m.name.endswith('.json')]
-                
-                for json_member in json_files:
-                    try:
-                        data = json.load(tar.extractfile(json_member))
-                        image_name = data['image']['file_name']
-                        image_member = next(
-                            (m for m in members if m.isfile() and os.path.basename(m.name) == image_name), 
-                            None
-                        )
-                        if not image_member:
-                            continue
-                        
-                        image = Image.open(tar.extractfile(image_member)).convert("RGB")
-                        image_tensor = transform(image)
-                        
-                        for ann_idx, ann in enumerate(data['annotations']):
-                            cache_key = f"{tar_basename}::{json_member.name}::{ann_idx}"
-                            
-                            if cache_key in caption_cache:
-                                continue  # Already cached
-                            
-                            try:
-                                rle = {
-                                    'counts': ann['segmentation']['counts'],
-                                    'size': ann['segmentation']['size']
-                                }
-                                mask_tensor = torch.from_numpy(coco_mask.decode(rle)).long()
-                                
-                                captions = []
-                                for persona_idx in range(NUM_PERSONAS):
-                                    caption = caption_generator.generate_all_captions(
-                                        image_tensor, mask_tensor, persona_idx
-                                    )
-                                    captions.append(caption)
-                                
-                                caption_cache[cache_key] = captions
-                                total += 1
-                                
-                                if total % 100 == 0:
-                                    print(f"  SA-1B: {total} samples captioned...")
-                                
-                                if max_samples and total >= max_samples:
-                                    return total
-                                    
-                            except Exception:
-                                continue
-                    except Exception:
-                        continue
-        except Exception:
+NUM_PERSONAS = 4
+
+
+def _tokenize_entry(text_entry):
+    return [CLIPTokenize(text).squeeze(0).tolist() for text in text_entry]
+
+
+def _iter_caption_slots(records):
+    """Yields (get_media, current_captions, set_captions) for every mask (image
+    records) / tracked object (video records) in the dataset."""
+    for rec in records:
+        if rec["type"] == "image":
+            for i in range(len(rec["masks"])):
+                def get_media(rec=rec, i=i):
+                    return decode_seg_image(rec["image"]), decode_seg_mask(rec["masks"][i])
+
+                def set_captions(value, rec=rec, i=i):
+                    rec["captions"][i] = value
+
+                yield get_media, rec["captions"][i], set_captions
+        else:
+            for obj in rec["objects"]:
+                def get_media(rec=rec, obj=obj):
+                    frame = rec["frames"][obj["rep_frame_idx"]]
+                    image = decode_seg_image(frame["image"])
+                    mask_b64 = next(m["mask"] for m in frame["masks"] if m["object_id"] == obj["object_id"])
+                    return image, decode_seg_mask(mask_b64)
+
+                def set_captions(value, obj=obj):
+                    obj["captions"] = value
+
+                yield get_media, obj["captions"], set_captions
+
+
+def _process_split(path, caption_generator_holder, device):
+    if not os.path.exists(path):
+        print(f"  {path} not found, skipping.")
+        return
+
+    records = read_json_gz(path)
+    tokenized_count, generated_count = 0, 0
+
+    # Pass 2 (of the *previous* run's output): tokenize any raw text, delete it.
+    for _, captions, set_captions in _iter_caption_slots(records):
+        if is_caption_raw(captions):
+            set_captions(_tokenize_entry(captions))
+            tokenized_count += 1
+
+    # Pass 1 (of *this* run): generate captions for anything still empty.
+    for get_media, captions, set_captions in _iter_caption_slots(records):
+        if captions is not None:
             continue
-    
-    return total
+        if caption_generator_holder[0] is None:
+            print(f"  Loading InstructBLIP captioning model on {device}...")
+            caption_generator_holder[0] = CaptionGenerator(device=device)
+        caption_generator = caption_generator_holder[0]
 
-def precompute_sav_captions(file_list, cache_dir, caption_generator, caption_cache, max_samples=None):
-    """Generate captions for all SA-V video samples."""
-    transform = transforms.Compose([transforms.ToTensor()])
-    sav_helper = SAVDatasetHelper(os.path.dirname(cache_dir))
-    total = 0
-    
-    for filename, url in file_list:
-        dest_path = os.path.join(cache_dir, filename)
-        if not os.path.exists(dest_path):
-            print(f"  Downloading {filename}...")
-            if not download_tar_file(url, dest_path):
-                print(f"  Failed to download {filename}, skipping.")
-                continue
-        
-        tar_basename = os.path.basename(dest_path)
-        
-        try:
-            with tarfile.open(dest_path, "r") as tar:
-                members = tar.getmembers()
-                mp4_files = [m for m in members if m.name.endswith('.mp4') and m.isfile()]
-                json_files = [m for m in members if m.name.endswith('.json') and m.isfile()]
-                
-                for video_member in mp4_files:
-                    video_id = os.path.splitext(os.path.basename(video_member.name))[0]
-                    cache_key = f"{tar_basename}::{video_id}"
-                    
-                    if cache_key in caption_cache:
-                        continue
-                    
-                    annot_member = next(
-                        (m for m in json_files 
-                         if f"{video_id}_manual.json" in m.name or f"{video_id}_auto.json" in m.name),
-                        None
-                    )
-                    if not annot_member:
-                        continue
-                    
-                    try:
-                        # Extract video to temp file for frame reading
-                        temp_path = os.path.join(cache_dir, f"precompute_tmp_{video_id}.mp4")
-                        with open(temp_path, 'wb') as f:
-                            f.write(tar.extractfile(video_member).read())
-                        
-                        frames = sav_helper.read_frames(temp_path)
-                        os.remove(temp_path)
-                        
-                        if not frames:
-                            continue
-                        
-                        data = json.load(tar.extractfile(annot_member))
-                        
-                        # Find first valid frame with a mask
-                        first_valid_frame, first_valid_mask = None, None
-                        for frame_idx, frame in enumerate(frames):
-                            if data and data.get('masklet') and len(data['masklet']) > frame_idx:
-                                frame_masks = []
-                                for ann in data['masklet'][frame_idx]:
-                                    rle = {'counts': ann['counts'], 'size': ann['size']}
-                                    frame_masks.append(torch.from_numpy(coco_mask.decode(rle)).long())
-                                if frame_masks:
-                                    first_valid_frame = transform(Image.fromarray(frame))
-                                    first_valid_mask = torch.stack(frame_masks).any(dim=0).float()
-                                    break
-                        
-                        if first_valid_frame is None:
-                            caption_cache[cache_key] = ["object"] * NUM_PERSONAS
-                        else:
-                            captions = []
-                            for persona_idx in range(NUM_PERSONAS):
-                                caption = caption_generator.generate_all_captions(
-                                    first_valid_frame, first_valid_mask, persona_idx
-                                )
-                                captions.append(caption)
-                            caption_cache[cache_key] = captions
-                        
-                        total += 1
-                        if total % 50 == 0:
-                            print(f"  SA-V: {total} videos captioned...")
-                        
-                        if max_samples and total >= max_samples:
-                            return total
-                    
-                    except Exception:
-                        continue
-        except Exception:
-            continue
-    
-    return total
+        image, mask = get_media()
+        captions_out = [caption_generator.generate_all_captions(image, mask, p) for p in range(NUM_PERSONAS)]
+        set_captions(captions_out)
+        generated_count += 1
+        if generated_count % 100 == 0:
+            print(f"  {os.path.basename(path)}: {generated_count} new caption sets generated...")
+
+    if tokenized_count or generated_count:
+        write_json_gz(path, records)
+    print(f"  {os.path.basename(path)}: tokenized {tokenized_count} previous entries, "
+          f"generated {generated_count} new caption sets.")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-compute captions for SA-1B and SA-V datasets")
-    parser.add_argument("--output", type=str, default="data/cache/caption_cache.json",
-                        help="Output path for the caption cache JSON")
-    parser.add_argument("--max_sa1b", type=int, default=None,
-                        help="Max SA-1B samples to caption (None = all)")
-    parser.add_argument("--max_sav", type=int, default=None,
-                        help="Max SA-V videos to caption (None = all)")
+    parser = argparse.ArgumentParser(description="Two-pass captioning for the SA-1B/SA-V segmentation dataset")
+    parser.add_argument("--data-dir", type=str, default=SEG_LOCAL_DEFAULT_DIR,
+                         help="Directory holding train.json.gz / val.json.gz (see data/segmentation.py)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    
-    cache_dir = os.path.dirname(args.output)
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # Load existing cache if present (supports incremental precomputation)
-    caption_cache = {}
-    if os.path.exists(args.output):
-        print(f"Loading existing cache from {args.output}...")
-        with open(args.output, 'r') as f:
-            caption_cache = json.load(f)
-        print(f"  {len(caption_cache)} entries already cached.")
-    
-    # Load file lists
-    def load_file_list(file_path):
-        try:
-            with open(file_path) as f:
-                return [line.strip().split('\t') for line in f.readlines()[1:]]
-        except FileNotFoundError:
-            return []
-    
-    sa1b_files = load_file_list("Datasets/SA-1B_dataset.txt")
-    sav_files = load_file_list("Datasets/SA-V_dataset.txt")
-    
-    print(f"\nFound {len(sa1b_files)} SA-1B tar files, {len(sav_files)} SA-V tar files")
-    
-    # Initialize caption generator (loaded once, used for all samples)
-    print(f"\nLoading InstructBLIP captioning model on {args.device}...")
-    caption_generator = CaptionGenerator(device=args.device)
-    print("Model loaded.\n")
-    
-    # Process SA-1B
-    if sa1b_files:
-        print("=== Processing SA-1B samples ===")
-        sa1b_count = precompute_sa1b_captions(
-            sa1b_files, cache_dir, caption_generator, caption_cache, args.max_sa1b
-        )
-        print(f"  SA-1B: {sa1b_count} new samples captioned.\n")
-    
-    # Save intermediate (in case SA-V fails)
-    with open(args.output, 'w') as f:
-        json.dump(caption_cache, f)
-    print(f"Intermediate save: {len(caption_cache)} total entries.")
-    
-    # Process SA-V
-    if sav_files:
-        print("\n=== Processing SA-V videos ===")
-        sav_count = precompute_sav_captions(
-            sav_files, cache_dir, caption_generator, caption_cache, args.max_sav
-        )
-        print(f"  SA-V: {sav_count} new videos captioned.\n")
-    
-    # Final save
-    with open(args.output, 'w') as f:
-        json.dump(caption_cache, f)
-    
-    cache_size_mb = os.path.getsize(args.output) / (1024 * 1024)
-    print(f"\nCaption cache saved: {args.output}")
-    print(f"  Total entries: {len(caption_cache)}")
-    print(f"  File size: {cache_size_mb:.1f} MB")
-    print(f"\nDone. You can now run training without the InstructBLIP model.")
+
+    caption_generator_holder = [None]  # lazy-loaded only if generation is actually needed
+
+    for split_file in ("train.json.gz", "val.json.gz"):
+        path = os.path.join(args.data_dir, split_file)
+        print(f"Processing {path}...")
+        _process_split(path, caption_generator_holder, args.device)
+
+    print("Done.")
+
 
 if __name__ == "__main__":
     main()

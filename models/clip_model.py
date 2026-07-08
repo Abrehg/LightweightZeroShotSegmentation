@@ -74,18 +74,18 @@ class TextEncoder(nn.Module):
 # Output shape: (1, 768)
 ENCODER_INPUT_SIZE = (224, 224)
 ENCODER_PATCH_SIZE = 16
- 
+
 class ImageEncoder(nn.Module):
     def __init__(self, embed_dim=768, input_channels=3, num_layers=4, num_heads=8):
         super().__init__()
-        num_patches = (ENCODER_INPUT_SIZE[0] // ENCODER_PATCH_SIZE) ** 2 
-        
+        num_patches = (ENCODER_INPUT_SIZE[0] // ENCODER_PATCH_SIZE) ** 2
+
         self.patch_embed = nn.Conv2d(
             input_channels, embed_dim,
             kernel_size=ENCODER_PATCH_SIZE, stride=ENCODER_PATCH_SIZE
         )
         self.pos_embed = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
- 
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads,
             dim_feedforward=embed_dim * 4,
@@ -93,24 +93,24 @@ class ImageEncoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.spatial_norm = nn.LayerNorm(embed_dim)
- 
+
         # Global pooling head — mean pool + project → single vector for contrastive loss
         self.pool_norm = nn.LayerNorm(embed_dim)
         self.pool_proj = nn.Linear(embed_dim, embed_dim)
- 
+
     def forward(self, image):
         # Resize to fixed resolution so patch count is always 196
         if image.shape[-2:] != ENCODER_INPUT_SIZE:
             image = F.interpolate(image.float(), size=ENCODER_INPUT_SIZE,
-                                  mode='bilinear', align_corners=False)
- 
+                                  mode='bilinear', align_corners=False).to(image.dtype)
+
         x = self.patch_embed(image)
         B, C, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
         x = x + self.pos_embed
         x = self.transformer(x)
         spatial_grid = self.spatial_norm(x)
- 
+
         global_vec = self.pool_proj(
             self.pool_norm(spatial_grid.mean(dim=1))
         )
